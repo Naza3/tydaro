@@ -12,6 +12,7 @@ use gpui_kit::{
         Disableable, Placement, Sizable, Theme, ThemeMode,
         button::{Button, ButtonVariants},
         dock::*,
+        input::{Input, InputEvent, InputState},
         menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     },
     prelude::*,
@@ -139,6 +140,9 @@ struct StockPanel {
     model: PanelModel,
     owner: u64,
     content: Entity<PanelContent>,
+    name_input: Entity<InputState>,
+    naming: bool,
+    name_error: Option<String>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -170,13 +174,37 @@ impl StockPanel {
                     });
                 }
                 ContentEvent::OrderSubmitted => cx.defer(refresh_market),
+                ContentEvent::ListChanged => {
+                    let id = this.model.id;
+                    let entity_id = cx.entity_id();
+                    cx.defer(move |cx| {
+                        if panel(id, cx).is_some_and(|p| p.entity_id() == entity_id) {
+                            changed(cx);
+                            record(cx);
+                            save_now(cx);
+                        }
+                    });
+                }
+            });
+            let name_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("组件名称（留空恢复默认）"));
+            let name_subscription = cx.subscribe(&name_input, |this, _, event, cx| match event {
+                InputEvent::PressEnter { .. } if this.naming => this.confirm_name(cx),
+                InputEvent::Change => {
+                    this.name_error = None;
+                    cx.notify();
+                }
+                _ => {}
             });
             Self {
                 model,
                 owner,
                 content,
+                name_input,
+                naming: false,
+                name_error: None,
                 focus: cx.focus_handle(),
-                _subscriptions: vec![sub],
+                _subscriptions: vec![sub, name_subscription],
             }
         });
         cx.global_mut::<Session>().next_id = cx.global::<Session>().next_id.max(id + 1);
@@ -190,6 +218,114 @@ impl StockPanel {
             model: self.model.clone(),
             content: self.content.read(cx).snapshot(cx),
         }
+    }
+
+    fn begin_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.naming = true;
+        self.name_error = None;
+        self.name_input.update(cx, |input, cx| {
+            input.set_value(self.model.title().to_owned(), window, cx);
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn cancel_name(&mut self, cx: &mut Context<Self>) {
+        self.naming = false;
+        self.name_error = None;
+        cx.notify();
+    }
+
+    fn confirm_name(&mut self, cx: &mut Context<Self>) {
+        if !self.naming {
+            return;
+        }
+        match PanelModel::normalize_name(&self.name_input.read(cx).value()) {
+            Ok(name) => {
+                self.model.custom_name = name;
+                self.cancel_name(cx);
+                let id = self.model.id;
+                let entity_id = cx.entity_id();
+                cx.defer(move |cx| {
+                    if panel(id, cx).is_some_and(|p| p.entity_id() == entity_id) {
+                        changed(cx);
+                        save_now(cx);
+                    }
+                });
+            }
+            Err(error) => {
+                self.name_error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn rename_item(owner: WeakEntity<Self>, id: u64) -> PopupMenuItem {
+        PopupMenuItem::new("重命名组件").on_click(move |_, window, cx| {
+            let owner = owner.clone();
+            // Menus restore trigger focus on close. Focus the editor afterward,
+            // and ignore a stale callback from a transferred/restored instance.
+            window.defer(cx, move |window, cx| {
+                if panel(id, cx).is_some_and(|p| p.entity_id() == owner.entity_id()) {
+                    let _ = owner.update(cx, |this, cx| this.begin_name(window, cx));
+                }
+            });
+        })
+    }
+
+    fn name_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let id = self.model.id;
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .p_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(rgb(0xe8ecf0))
+            .child(
+                Input::new(&self.name_input)
+                    .id(format!("panel-name-input-{id}"))
+                    .small()
+                    .w_full(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(format!("panel-name-confirm-{id}"))
+                            .label("确认")
+                            .small()
+                            .ghost()
+                            .text_color(rgb(0x009b9a))
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_name(cx))),
+                    )
+                    .child(
+                        Button::new(format!("panel-name-cancel-{id}"))
+                            .label("取消")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_name(cx))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(0x85909f))
+                            .child("留空恢复默认"),
+                    ),
+            )
+            .when_some(self.name_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0xef4770))
+                        .child(error),
+                )
+            })
+            .into_any_element()
     }
 }
 impl EventEmitter<PanelEvent> for StockPanel {}
@@ -233,7 +369,13 @@ impl BasePanel for StockPanel {
 }
 impl Panel for StockPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.model.kind.title()
+        let title = self.model.title().to_owned();
+        div()
+            .id(format!("panel-title-{}", self.model.id))
+            .aria_label(title.clone())
+            .test_support()
+            .truncate()
+            .child(title)
     }
     fn inner_padding(&self, _: &App) -> bool {
         false
@@ -286,6 +428,7 @@ impl Panel for StockPanel {
         let owner = self.owner;
         let locked = is_locked(owner, cx);
         menu = menu
+            .item(Self::rename_item(cx.weak_entity(), id))
             .item(
                 PopupMenuItem::new("弹出为独立窗口")
                     .disabled(locked)
@@ -345,6 +488,7 @@ impl Render for StockPanel {
         let id = self.model.id;
         let locked = is_locked(owner, cx);
         let focus = self.focus.clone();
+        let rename_owner = cx.weak_entity();
         // This is an application drag surface, separate from the native titlebar
         // (which moves the OS window and does not dispatch our docking events).
         let heading = div()
@@ -394,14 +538,31 @@ impl Render for StockPanel {
                             insertion_menu(menu, id, window, cx)
                         }),
                 )
-            });
+            })
+            .child(
+                Button::new(format!("panel-menu-{id}"))
+                    .label("⋯")
+                    .xsmall()
+                    .ghost()
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(Self::rename_item(rename_owner.clone(), id))
+                    }),
+            );
         div()
+            .id(format!("stock-panel-{id}"))
+            .test_support()
             .track_focus(&self.focus)
             .size_full()
             .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.naming && event.keystroke.key == "escape" {
+                    this.cancel_name(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 canvas(
                     move |bounds, window, cx| {
@@ -418,6 +579,7 @@ impl Render for StockPanel {
                 .size_full(),
             )
             .child(heading)
+            .when(self.naming, |this| this.child(self.name_editor(cx)))
             .child(
                 div()
                     .flex_1()
@@ -447,11 +609,18 @@ fn insertion_menu(
         .filter_map(WeakEntity::upgrade)
         .filter_map(|p| {
             let p = p.read(cx);
-            (p.model.id != source).then_some((p.owner, p.model.id, p.model.kind, p.model.symbol))
+            (p.model.id != source).then(|| {
+                (
+                    p.owner,
+                    p.model.id,
+                    p.model.title().to_owned(),
+                    p.model.symbol,
+                )
+            })
         })
         .collect();
     targets.sort_by_key(|(owner, id, _, _)| (*owner, *id));
-    for (owner, id, kind, symbol) in targets {
+    for (owner, id, name, symbol) in targets {
         let title = format!(
             "{} · {} {} #{}",
             if owner == 0 {
@@ -459,7 +628,7 @@ fn insertion_menu(
             } else {
                 format!("窗口 {owner}")
             },
-            kind.title(),
+            name,
             symbol.code(),
             id
         );
@@ -890,7 +1059,7 @@ pub(crate) fn add_panel(owner: u64, kind: PanelKind, cx: &mut App) -> anyhow::Re
     )
 }
 
-fn duplicate(id: u64, cx: &mut App) -> anyhow::Result<()> {
+pub(crate) fn duplicate(id: u64, cx: &mut App) -> anyhow::Result<()> {
     anyhow::ensure!(
         cx.global::<Session>()
             .panels
@@ -1855,6 +2024,7 @@ fn preserve_live_state(target: &mut WorkspaceFile, current: &WorkspaceFile) {
         {
             saved.model.symbol = live.model.symbol;
             saved.model.period = live.model.period;
+            saved.model.custom_name = live.model.custom_name.clone();
             saved.content = live.content.clone();
             *value = serde_json::to_value(saved).expect("saved panel is serializable");
         }
@@ -2207,10 +2377,10 @@ impl Render for Workspace {
         } else {
             let title = if let [model] = owned.as_slice() {
                 format!(
-                    "{} {} · {} · {} · Tydaro",
+                    "{} · {} {} · {} · Tydaro",
+                    model.title(),
                     model.symbol.code(),
                     model.symbol.name(),
-                    model.kind.title(),
                     board_name
                 )
             } else {
@@ -2241,7 +2411,7 @@ impl Render for Workspace {
             )
             .child(
                 Button::new("nav-watch")
-                    .label("☆  自选列表")
+                    .label("≡  股票列表")
                     .ghost()
                     .on_click(move |_, _, cx| {
                         cx.defer(move |cx| {
@@ -2690,6 +2860,7 @@ mod persistence_tests {
         let mut saved = payload(&changed);
         saved.model.symbol = Symbol::Msft;
         saved.model.period = Period::Week;
+        saved.model.custom_name = Some("趋势组".into());
         saved.content = serde_json::json!({"query": "MSFT", "chart": {"bars_visible": 40}});
         changed.windows[0].dock.center.children[0].info =
             PanelInfo::Panel(serde_json::to_value(saved).unwrap());
@@ -2713,6 +2884,7 @@ mod persistence_tests {
         saved.model.symbol = Symbol::Nvda;
         saved.model.period = Period::Day;
         saved.model.link_group = 3;
+        saved.model.custom_name = Some("科技趋势".into());
         saved.content = serde_json::json!({"quantity": "500", "chart": {"bars_visible": 120}});
         live.windows[0].dock.center.children[0].info =
             PanelInfo::Panel(serde_json::to_value(&saved).unwrap());
@@ -2724,6 +2896,7 @@ mod persistence_tests {
         assert_eq!(restored.model.symbol, Symbol::Nvda);
         assert_eq!(restored.model.period, Period::Day);
         assert_eq!(restored.model.link_group, 1);
+        assert_eq!(restored.model.custom_name, saved.model.custom_name);
         assert_eq!(restored.content, saved.content);
         assert!(historical.paused);
         assert_eq!(historical.next_id, 20);

@@ -154,6 +154,12 @@ fn validate_panel(
             .context("Invalid saved tydaro.panel payload")?;
         ensure!(saved.model.id <= MAX_STABLE_ID, "Invalid panel ID");
         ensure!(saved.model.link_group <= 3, "Invalid panel link group");
+        if let Some(name) = &saved.model.custom_name {
+            ensure!(
+                PanelModel::normalize_name(name)?.as_deref() == Some(name.as_str()),
+                "Invalid custom panel name"
+            );
+        }
         ensure!(
             ids.insert(saved.model.id),
             "Duplicate panel ID {}",
@@ -420,6 +426,65 @@ mod tests {
                     .then_some(path)
             })
             .collect()
+    }
+
+    #[test]
+    fn old_panel_payload_defaults_name_and_custom_names_survive_roundtrip() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let mut state = fixture();
+        let PanelInfo::Panel(value) = &mut state.windows[0].dock.center.info else {
+            panic!("fixture must contain a panel");
+        };
+        // An actual old payload has neither the new optional field nor a new
+        // enum spelling. Keep Watchlist as the persisted component identity.
+        value["model"]["kind"] = serde_json::json!("Watchlist");
+        value["model"]
+            .as_object_mut()
+            .unwrap()
+            .remove("custom_name");
+        let old: SavedPanel = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(old.model.kind, PanelKind::Watchlist);
+        assert_eq!(old.model.custom_name, None);
+        assert_eq!(old.model.title(), "股票列表");
+        assert!(
+            serde_json::to_value(&old).unwrap()["model"]
+                .get("custom_name")
+                .is_none()
+        );
+        write(&path, &state).unwrap();
+        let mut renamed = read(&path).unwrap();
+        let PanelInfo::Panel(value) = &mut renamed.windows[0].dock.center.info else {
+            panic!("saved fixture must contain a panel");
+        };
+        let mut saved: SavedPanel = serde_json::from_value(value.clone()).unwrap();
+        saved.model.custom_name = PanelModel::normalize_name("  科技观察  ").unwrap();
+        *value = serde_json::to_value(&saved).unwrap();
+        write(&path, &renamed).unwrap();
+        assert_eq!(
+            serde_json::to_value(read(&path).unwrap()).unwrap(),
+            serde_json::to_value(renamed).unwrap()
+        );
+        assert_eq!(saved.model.title(), "科技观察");
+        saved.model.custom_name = PanelModel::normalize_name("   ").unwrap();
+        assert_eq!(saved.model.title(), "股票列表");
+    }
+
+    #[test]
+    fn invalid_custom_names_cannot_replace_a_valid_layout() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let mut state = fixture();
+        write(&path, &state).unwrap();
+        let original = fs::read(&path).unwrap();
+        for name in [" ".to_owned(), "科技\n组".into(), "股".repeat(33)] {
+            let PanelInfo::Panel(value) = &mut state.windows[0].dock.center.info else {
+                panic!("fixture must contain a panel");
+            };
+            value["model"]["custom_name"] = serde_json::json!(name);
+            assert!(write(&path, &state).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
     }
 
     #[test]

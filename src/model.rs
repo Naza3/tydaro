@@ -31,7 +31,7 @@ impl PanelKind {
     ];
     pub fn title(self) -> &'static str {
         match self {
-            Self::Watchlist => "自选列表",
+            Self::Watchlist => "股票列表",
             Self::Chart => "行情图表",
             Self::Quote => "关键数据",
             Self::OrderBook => "买卖十档",
@@ -52,6 +52,8 @@ pub struct PanelModel {
     pub symbol: Symbol,
     pub period: Period,
     pub link_group: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
 }
 impl PanelModel {
     pub fn new(id: u64, kind: PanelKind) -> Self {
@@ -61,6 +63,21 @@ impl PanelModel {
             symbol: Symbol::Aapl,
             period: Period::Intraday,
             link_group: 1,
+            custom_name: None,
         }
+    }
+
+    pub fn title(&self) -> &str {
+        self.custom_name.as_deref().unwrap_or(self.kind.title())
+    }
+
+    pub fn normalize_name(name: &str) -> anyhow::Result<Option<String>> {
+        let name = name.trim();
+        anyhow::ensure!(
+            !name.chars().any(char::is_control),
+            "组件名称不能包含控制字符"
+        );
+        anyhow::ensure!(name.chars().count() <= 32, "组件名称最多 32 个字符");
+        Ok((!name.is_empty()).then(|| name.to_owned()))
     }
 }
