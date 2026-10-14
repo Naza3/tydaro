@@ -7,13 +7,15 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use gpui_kit::{
-    AnyWindowHandle, ClipboardItem, HeadlessAppContext, ScrollDelta,
+    AnyWindowHandle, AppContext as _, Bounds, ClipboardItem, Entity, HeadlessAppContext,
+    ScrollDelta, WindowBounds, WindowOptions,
     component::dock::{PanelInfo, PanelState},
-    point, px,
+    point, px, size,
     test::TestWindowExt,
 };
 
 use crate::{
+    chart::MarketChart,
     market::{self, Period, Symbol},
     model::PanelKind,
     storage::{self, SavedPanel, WorkspaceFile},
@@ -47,6 +49,17 @@ pub fn run(path: &str) -> Result<()> {
             kind.title()
         );
     }
+    ensure!(
+        initial_panels
+            .iter()
+            .filter(|panel| matches!(panel.model.kind, PanelKind::Chart | PanelKind::Quote))
+            .all(|panel| panel.model.symbol == Symbol::Yinli)
+            && initial_panels
+                .iter()
+                .filter(|panel| panel.model.kind == PanelKind::Watchlist)
+                .all(|panel| list_members(panel).is_ok_and(|members| members == Symbol::ALL)),
+        "The fresh workspace did not start with A-share charts and the expanded demo catalog"
+    );
 
     let screenshot = cx
         .capture_screenshot(handle)
@@ -163,6 +176,7 @@ pub fn run(path: &str) -> Result<()> {
     verify_stock_lists(&mut cx, output)?;
     verify_chart_inspection(&mut cx, output)?;
     verify_stock_import(&mut cx, output)?;
+    verify_fixed_intraday(&mut cx, output)?;
 
     println!(
         "PASS: native workspace {} × {}, {} panels; MSFT link group, 日 K, chart zoom; detach/return state, persistence/undo and demo order interactions. Screenshot: {}",
@@ -172,6 +186,211 @@ pub fn run(path: &str) -> Result<()> {
         output.display()
     );
     Ok(())
+}
+
+/// Drive the public chart component with the same market ticks used by the
+/// workspace clock. No private Session state or fake renderer is involved.
+fn verify_fixed_intraday(cx: &mut HeadlessAppContext, output: &Path) -> Result<()> {
+    let (handle, chart) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(40.), px(40.)),
+                    size(px(1040.), px(720.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |_, cx| cx.new(|cx| MarketChart::new(Symbol::Yinli, Period::Intraday, cx)),
+        )
+    })?;
+    let result = verify_intraday_clock_interactions(cx, handle, &chart, output);
+    let closed = cx.update_window(handle, |_, window, _| window.remove_window());
+    cx.run_until_parked();
+    result?;
+    closed?;
+    println!(
+        "PASS: fixed A-share intraday timeline, separate auction indications, empty future space, morning/lunch/afternoon/closing transitions, preserved opening trades and no post-close wrap; six-stock legacy layouts and A-share text imports"
+    );
+    Ok(())
+}
+
+fn verify_intraday_clock_interactions(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    chart: &Entity<MarketChart>,
+    output: &Path,
+) -> Result<()> {
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    verify_intraday_labels(cx, handle, "早盘交易", "10:00", "10:00")?;
+    save_chart_screenshot(cx, handle, output, "a-share-morning")?;
+    let viewport = cx.update(|cx| chart.read(cx).viewport());
+    let morning_time = click_intraday_fraction(cx, handle, 0.15)?
+        .context("The early A-share trade is not inspectable")?;
+    let early_bar = market::session_bars(Symbol::Yinli, 0)
+        .into_iter()
+        .find(|bar| bar.time == morning_time)
+        .context("The chart selected a nonexistent early trade")?;
+    ensure!(
+        morning_time.as_str() >= "09:30" && morning_time.as_str() <= "10:00",
+        "The initial chart mapped its early region outside the morning session"
+    );
+    cx.update_window(handle, |_, window, _| {
+        ensure!(
+            window
+                .find("chart-price-header")
+                .label()
+                .is_some_and(|label| { label.contains(&format!("{:.3}", early_bar.close)) }),
+            "The selected intraday header did not show the actual early trade price"
+        );
+        Ok::<_, anyhow::Error>(())
+    })??;
+    ensure!(
+        click_intraday_fraction(cx, handle, 0.02)?.is_none(),
+        "An indicative auction quote was presented as an executed trade"
+    );
+    ensure!(
+        click_intraday_fraction(cx, handle, 0.9)?.is_none(),
+        "The morning chart fabricated an afternoon trade in future space"
+    );
+    click_intraday_fraction(cx, handle, 0.15)?;
+    cx.update_window(handle, |_, window, cx| {
+        window.scroll("native-market-chart", ScrollDelta::Lines(point(0., 2.)), cx);
+        window.scroll("native-market-chart", ScrollDelta::Lines(point(2., 0.)), cx);
+        let bounds = window.find("native-market-chart").bounds();
+        let from = bounds.origin
+            + point(
+                px(55. + (bounds.size.width.as_f32() - 113.) * 0.15),
+                px(280.),
+            );
+        window.drag(from, from + point(px(80.), px(0.)), cx);
+    })?;
+    cx.update(|cx| chart.update(cx, |chart, cx| chart.zoom_step(true, cx)));
+    ensure!(
+        cx.update(|cx| chart.read(cx).viewport()) == viewport
+            && click_intraday_fraction(cx, handle, 0.15)?.as_deref() == Some(morning_time.as_str()),
+        "Intraday zoom or drag shifted its fixed market clock"
+    );
+
+    for (tick, phase, current_time, last_trade) in [
+        (90, "午间休市", "11:30", "11:30"),
+        (179, "午间休市", "12:59", "11:30"),
+        (180, "午盘交易", "13:00", "13:00"),
+        (297, "收盘竞价 · 不可撤单", "14:57", "14:57"),
+        (299, "收盘竞价 · 不可撤单", "14:59", "14:57"),
+    ] {
+        cx.update(|cx| {
+            chart.update(cx, |chart, cx| {
+                chart.set_market(Symbol::Yinli, Period::Intraday, tick, cx)
+            })
+        });
+        verify_intraday_labels(cx, handle, phase, current_time, last_trade)?;
+        ensure!(
+            click_intraday_fraction(cx, handle, 0.15)?.as_deref() == Some(morning_time.as_str()),
+            "Advancing to {current_time} moved or removed the same morning candle"
+        );
+        ensure!(
+            click_intraday_fraction(cx, handle, 1.)?.is_none(),
+            "The chart displayed a closing match before it happened at {current_time}"
+        );
+    }
+    cx.update(|cx| {
+        chart.update(cx, |chart, cx| {
+            chart.set_market(Symbol::Yinli, Period::Intraday, 300, cx)
+        })
+    });
+    verify_intraday_labels(cx, handle, "已收盘", "15:00", "15:00")?;
+    ensure!(
+        click_intraday_fraction(cx, handle, 1.)?.as_deref() == Some("15:00"),
+        "The completed closing auction has no inspectable executed match"
+    );
+    cx.update_window(handle, |_, window, cx| window.press("escape", cx))?;
+    let closing_header = cx.update_window(handle, |_, window, _| {
+        window.find("chart-price-header").label().map(str::to_owned)
+    })?;
+    save_chart_screenshot(cx, handle, output, "a-share-close")?;
+    cx.update(|cx| {
+        chart.update(cx, |chart, cx| {
+            chart.set_market(Symbol::Yinli, Period::Intraday, 600, cx)
+        })
+    });
+    verify_intraday_labels(cx, handle, "已收盘", "15:00", "15:00")?;
+    cx.update_window(handle, |_, window, _| {
+        ensure!(
+            window.find("chart-price-header").label() == closing_header.as_deref(),
+            "Advancing past close restarted or changed the frozen day's latest price"
+        );
+        Ok::<_, anyhow::Error>(())
+    })??;
+    ensure!(
+        click_intraday_fraction(cx, handle, 0.15)?.as_deref() == Some(morning_time.as_str()),
+        "The day's opening history disappeared after the session closed"
+    );
+    Ok(())
+}
+
+fn verify_intraday_labels(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    phase: &str,
+    current_time: &str,
+    last_trade: &str,
+) -> Result<()> {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        for (id, expected) in [
+            ("intraday-session-phase", phase),
+            ("intraday-session-time", current_time),
+            ("intraday-last-time", last_trade),
+        ] {
+            let actual = window.find(id);
+            ensure!(
+                actual.label() == Some(expected),
+                "The session clock did not display {id}={expected}: {:?}",
+                actual.label()
+            );
+        }
+        let timeline = window.find("intraday-timeline-label");
+        ensure!(
+            timeline.label().is_some_and(|label| [
+                "09:15",
+                "09:20",
+                "09:25",
+                "09:30",
+                "11:30 / 13:00",
+                "14:57",
+                "15:00"
+            ]
+            .iter()
+            .all(|mark| label.contains(mark))),
+            "The A-share intraday timeline lost an auction, lunch or closing boundary"
+        );
+        Ok::<_, anyhow::Error>(())
+    })??;
+    Ok(())
+}
+
+fn click_intraday_fraction(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    fraction: f32,
+) -> Result<Option<String>> {
+    cx.update_window(handle, |_, window, cx| {
+        let width = window
+            .find("native-market-chart")
+            .bounds()
+            .size
+            .width
+            .as_f32();
+        window.click_at(
+            "native-market-chart",
+            point(px(55. + (width - 113.) * fraction), px(280.)),
+            cx,
+        );
+        window
+            .try_find("chart-selected-time")
+            .and_then(|selected| selected.label().map(str::to_owned))
+    })
 }
 
 /// Previewing pasted text must be read-only until confirmation. Imported
@@ -233,9 +452,9 @@ fn verify_stock_import_interactions(cx: &mut HeadlessAppContext, output: &Path) 
         stock_import_value(cx, id)?.is_empty(),
         "Reopening import retained its cancelled draft"
     );
-    let text = "AAPL 苹果\r\n00700 腾讯控股\r\naapl\r\nTSLA\t特斯拉\n09988 阿里巴巴\n600519 贵州茅台\nGOOG";
+    let text = "AAPL 苹果\r\n00700 腾讯控股\r\naapl\r\nTSLA\t特斯拉\n09988 阿里巴巴\nSH603598 引力传媒\n001318 阳光乳业\n603598.SH\n600519 贵州茅台\nGOOG";
     paste_stock_import(cx, id, text)?;
-    expect_import_summary(cx, id, "可添加 3 支 · 已有 1 支 · 重复 1 次 · 未收录 2 项")?;
+    expect_import_summary(cx, id, "可添加 5 支 · 已有 1 支 · 重复 2 次 · 未收录 2 项")?;
     ensure!(
         current_panel(cx, id)?.content == before.content
             && current_panel(cx, id)?.model == before.model,
@@ -252,7 +471,14 @@ fn verify_stock_import_interactions(cx: &mut HeadlessAppContext, output: &Path) 
 
     click_list_control(cx, id, "stock-import-confirm")?;
     let imported = current_panel(cx, id)?;
-    let members = [Symbol::Tencent, Symbol::Aapl, Symbol::Tsla, Symbol::Alibaba];
+    let members = [
+        Symbol::Tencent,
+        Symbol::Aapl,
+        Symbol::Tsla,
+        Symbol::Alibaba,
+        Symbol::Yinli,
+        Symbol::Yangguang,
+    ];
     let mut expected_content = before.content.clone();
     expected_content["members"] = serde_json::to_value(members)?;
     ensure!(
@@ -271,12 +497,12 @@ fn verify_stock_import_interactions(cx: &mut HeadlessAppContext, output: &Path) 
                 .within(format!("stock-panel-{id}"))
                 .find("stock-import-message")
                 .label()
-                == Some("已添加 3 支股票到当前列表"),
+                == Some("已添加 5 支股票到当前列表"),
             "Successful import did not report how many stocks were added"
         );
         Ok::<_, anyhow::Error>(())
     })??;
-    expect_import_summary(cx, id, "可添加 0 支 · 已有 4 支 · 重复 1 次 · 未收录 2 项")?;
+    expect_import_summary(cx, id, "可添加 0 支 · 已有 6 支 · 重复 2 次 · 未收录 2 项")?;
     // Disabled button metadata is not supplied by GPUI Button; exercise the
     // actual click and observe that a repeated confirmation is harmless.
     click_list_control(cx, id, "stock-import-confirm")?;
@@ -845,6 +1071,9 @@ fn verify_stock_list_interactions(cx: &mut HeadlessAppContext, output: &Path) ->
     );
     rename_panel(cx, tech_id, "科技股")?;
     rename_panel(cx, chart.model.id, "联动行情")?;
+    // The fixture deliberately exercises USD symbols; new components now
+    // start on an A-share, so select AAPL through the real linked list first.
+    click_list_control(cx, tech_id, "symbol-AAPL")?;
 
     // Remove the selected stock as well as all other rows. Removing a child
     // action must not bubble to the row and emit an unintended symbol change.
@@ -870,8 +1099,26 @@ fn verify_stock_list_interactions(cx: &mut HeadlessAppContext, output: &Path) ->
         );
         Ok::<_, anyhow::Error>(())
     })??;
-    // A real restore must distinguish explicit [] from the legacy missing
-    // member field, whose default is the complete demo catalog.
+    // A pre-grouping layout keeps its original six members and saved symbol;
+    // introducing new A-share fixtures must not silently enlarge old lists.
+    let mut legacy = empty.clone();
+    let mut stripped = false;
+    for window in &mut legacy.windows {
+        stripped |= remove_legacy_members(&mut window.dock.center, hk_id)?;
+    }
+    ensure!(
+        stripped,
+        "The legacy stock-list fixture had no member field"
+    );
+    cx.update(|cx| workspace::restore(legacy, cx))?;
+    render_workspace_windows(cx)?;
+    ensure!(
+        list_members(&current_panel(cx, hk_id)?)? == Symbol::LEGACY_DEFAULTS
+            && current_panel(cx, hk_id)?.model.symbol == Symbol::Aapl
+            && list_members(&current_panel(cx, tech_id)?)? == Symbol::ALL,
+        "Restoring an old list changed its saved symbol or replaced its six legacy members"
+    );
+    // Explicit [] must still remain empty, unlike that legacy missing field.
     cx.update(|cx| workspace::restore(empty, cx))?;
     render_workspace_windows(cx)?;
     ensure!(
@@ -910,10 +1157,13 @@ fn verify_stock_list_interactions(cx: &mut HeadlessAppContext, output: &Path) ->
             && current_panel(cx, hk_id)?.model.symbol == Symbol::Aapl,
         "Catalog add duplicated a member or unexpectedly selected the added stock"
     );
-    for symbol in [Symbol::Tsla, Symbol::Tencent, Symbol::Alibaba] {
+    let technology = [Symbol::Aapl, Symbol::Msft, Symbol::Nvda];
+    for symbol in Symbol::ALL
+        .into_iter()
+        .filter(|symbol| !technology.contains(symbol))
+    {
         click_list_control(cx, tech_id, &format!("stock-list-remove-{}", symbol.code()))?;
     }
-    let technology = [Symbol::Aapl, Symbol::Msft, Symbol::Nvda];
     ensure!(
         list_members(&current_panel(cx, tech_id)?)? == technology,
         "The technology list did not retain its own membership"
@@ -1112,6 +1362,29 @@ fn panel_window(cx: &mut HeadlessAppContext, id: u64) -> Result<AnyWindowHandle>
 fn list_members(panel: &SavedPanel) -> Result<Vec<Symbol>> {
     serde_json::from_value(panel.content["members"].clone())
         .context("The stock-list snapshot has no valid member list")
+}
+
+fn remove_legacy_members(state: &mut PanelState, id: u64) -> Result<bool> {
+    if let PanelInfo::Panel(value) = &mut state.info
+        && state.panel_name == "tydaro.panel"
+    {
+        let mut panel: SavedPanel = serde_json::from_value(value.clone())?;
+        if panel.model.id == id {
+            let removed = panel
+                .content
+                .as_object_mut()
+                .context("The legacy fixture has no component content")?
+                .remove("members")
+                .is_some();
+            *value = serde_json::to_value(panel)?;
+            return Ok(removed);
+        }
+    }
+    let mut removed = false;
+    for child in &mut state.children {
+        removed |= remove_legacy_members(child, id)?;
+    }
+    Ok(removed)
 }
 
 fn begin_panel_rename(cx: &mut HeadlessAppContext, id: u64) -> Result<()> {

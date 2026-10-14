@@ -189,6 +189,19 @@ fn known(symbol: Symbol, is_name: bool) -> Candidate {
     }
 }
 
+fn canonical_code(key: String) -> Candidate {
+    let symbol = key.split_once(':').and_then(|(market, code)| {
+        Symbol::ALL
+            .into_iter()
+            .find(|symbol| symbol.market() == market && symbol.code() == code)
+    });
+    Candidate {
+        key,
+        symbol,
+        is_name: false,
+    }
+}
+
 fn identify(raw: &str) -> Option<Candidate> {
     let upper = raw.to_ascii_uppercase();
     for symbol in Symbol::ALL {
@@ -214,14 +227,7 @@ fn identify(raw: &str) -> Option<Candidate> {
         } else {
             code.to_string()
         };
-        let symbol = Symbol::ALL
-            .into_iter()
-            .find(|symbol| symbol.market() == market && symbol.code() == code);
-        return Some(Candidate {
-            key: format!("{market}:{code}"),
-            symbol,
-            is_name: false,
-        });
+        return Some(canonical_code(format!("{market}:{code}")));
     }
 
     if raw.bytes().all(|b| b.is_ascii_digit()) {
@@ -238,11 +244,7 @@ fn identify(raw: &str) -> Option<Candidate> {
             7 if raw.starts_with('1') => format!("SH:{}", &raw[1..]),
             _ => return None,
         };
-        return Some(Candidate {
-            key,
-            symbol: None,
-            is_name: false,
-        });
+        return Some(canonical_code(key));
     }
 
     // Unknown bare English prose is not assumed to be a ticker. Uppercase
@@ -265,6 +267,8 @@ fn aliases(symbol: Symbol) -> &'static [&'static str] {
         Symbol::Tsla => &["Tesla"],
         Symbol::Tencent => &["腾讯", "腾讯控股有限公司", "Tencent"],
         Symbol::Alibaba => &["阿里", "阿里巴巴集团", "阿里巴巴-SW", "Alibaba"],
+        Symbol::Yinli => &["引力传媒股份有限公司"],
+        Symbol::Yangguang => &["江西阳光乳业股份有限公司"],
     }
 }
 
@@ -343,7 +347,7 @@ mod tests {
             &[Symbol::Msft],
         )
         .unwrap();
-        assert_eq!(result.recognized, Symbol::ALL);
+        assert_eq!(result.recognized, Symbol::LEGACY_DEFAULTS);
         assert_eq!(
             result.additions,
             [
@@ -419,6 +423,56 @@ mod tests {
             ["SH:00700", "SH:600519", "SZ:000001", "US:GOOG", "HK:01234"]
         );
         assert_eq!(result.duplicates, 7);
+    }
+
+    #[test]
+    fn mainland_samples_match_all_code_formats_and_names_as_the_same_security() {
+        let result = parse(
+            "603598\nSH603598\n603598.SH\n1603598\n引力传媒\n001318\nSZ001318\n001318.SZ\n0001318\n阳光乳业",
+            &[Symbol::Yinli],
+        )
+        .unwrap();
+        assert_eq!(result.recognized, [Symbol::Yinli, Symbol::Yangguang]);
+        assert_eq!(result.additions, [Symbol::Yangguang]);
+        assert_eq!(result.already_present, 1);
+        assert_eq!(result.duplicates, 8);
+        assert!(result.unknown.is_empty());
+
+        let table = parse(
+            "603598\t引力传媒\t21.91\t+9.99%\t123456\n001318\t阳光乳业\t15.43\t10.00%\t50000",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(table.recognized, [Symbol::Yinli, Symbol::Yangguang]);
+        assert_eq!(table.duplicates, 0);
+        assert!(table.unknown.is_empty());
+    }
+
+    #[test]
+    fn mainland_market_qualifiers_do_not_match_a_different_exchange() {
+        let result = parse(
+            "SH001318 SZ603598 603598.HK US:001318 1001318 0603598 600519",
+            &[],
+        )
+        .unwrap();
+        assert!(result.recognized.is_empty());
+        assert_eq!(
+            result.unknown,
+            [
+                "SH:001318",
+                "SZ:603598",
+                "HK:603598",
+                "US:001318",
+                "SH:600519"
+            ]
+        );
+        assert_eq!(result.duplicates, 2);
+        let known = parse("AAPL,340.30,603598,0001318", &[]).unwrap();
+        assert_eq!(
+            known.recognized,
+            [Symbol::Aapl, Symbol::Yinli, Symbol::Yangguang]
+        );
+        assert!(known.unknown.is_empty());
     }
 
     #[test]

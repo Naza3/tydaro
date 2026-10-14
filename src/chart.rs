@@ -8,7 +8,7 @@ use gpui_kit::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::market::{self, Bar, HistoricalSession, Period, Symbol};
+use crate::market::{self, Bar, HistoricalSession, IndicativePoint, Period, SessionAxis, Symbol};
 
 const BLUE: u32 = 0x397AF6;
 const UP: u32 = 0xF0446D;
@@ -142,12 +142,15 @@ pub struct MarketChart {
     viewport: ChartViewport,
     bounds: Rc<Cell<Bounds<Pixels>>>,
     inspection: Option<Inspection>,
+    inspecting: bool,
     details: Option<CandleDetails>,
     drag: Option<DragState>,
     last_gesture_dragged: bool,
     focus: FocusHandle,
     reference_price: f64,
     historical: bool,
+    wall_minute: u16,
+    indicative: Vec<IndicativePoint>,
 }
 
 impl EventEmitter<ChartEvent> for MarketChart {}
@@ -165,12 +168,15 @@ impl MarketChart {
             viewport: ChartViewport::default(),
             bounds: Rc::new(Cell::new(Bounds::default())),
             inspection: None,
+            inspecting: false,
             details: None,
             drag: None,
             last_gesture_dragged: false,
             focus: cx.focus_handle(),
             reference_price: market::quote(symbol, 0).previous_close,
             historical: false,
+            wall_minute: market::session_state(symbol, 0).wall_minute,
+            indicative: market::auction_indicative(symbol, 0),
         }
     }
 
@@ -190,12 +196,11 @@ impl MarketChart {
         self.historical = true;
         self.period = Period::Intraday;
         self.data = session.bars.clone();
+        self.wall_minute = session.wall_minute;
+        self.indicative = session.indicative.clone();
         self.indicators = Indicators::new(&self.data);
         self.reference_price = session.previous_close;
-        self.viewport = ChartViewport {
-            bars_visible: self.data.len(),
-            offset_from_latest: 0,
-        };
+        self.viewport = ChartViewport::default();
         self.clear_inspection();
         cx.notify();
     }
@@ -219,6 +224,8 @@ impl MarketChart {
         self.period = period;
         self.tick = tick;
         self.data = market::bars(symbol, period, tick);
+        self.wall_minute = market::session_state(symbol, tick).wall_minute;
+        self.indicative = market::auction_indicative(symbol, tick);
         self.indicators = Indicators::for_market(symbol, period, tick, &self.data);
         self.reference_price = market::quote(symbol, tick).previous_close;
         // Re-find the exact time after a rolling update. Never move to a different date.
@@ -235,29 +242,30 @@ impl MarketChart {
     }
 
     pub fn restore_viewport(&mut self, viewport: ChartViewport, cx: &mut Context<Self>) {
-        self.viewport = viewport;
+        self.viewport = if self.period == Period::Intraday {
+            ChartViewport::default()
+        } else {
+            viewport
+        };
         cx.notify();
     }
 
     pub fn zoom_step(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
+        if self.period == Period::Intraday {
+            return;
+        }
         self.viewport.zoom(zoom_in, 1., self.data.len());
         cx.notify();
     }
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
-        self.viewport = if self.historical {
-            ChartViewport {
-                bars_visible: self.data.len(),
-                offset_from_latest: 0,
-            }
-        } else {
-            ChartViewport::default()
-        };
+        self.viewport = ChartViewport::default();
         self.clear_inspection();
         cx.notify();
     }
 
     fn clear_inspection(&mut self) {
+        self.inspecting = false;
         self.inspection = None;
         self.details = None;
         self.drag = None;
@@ -268,10 +276,29 @@ impl MarketChart {
         selected.index_in(&self.data)
     }
 
+    fn data_range(&self) -> Range<usize> {
+        if self.period == Period::Intraday {
+            0..self.data.len()
+        } else {
+            self.viewport.range(self.data.len())
+        }
+    }
+
+    fn pointer_index(&self, pointer: Point<Pixels>) -> Option<usize> {
+        let geometry = Geometry::new(self.bounds.get());
+        if self.period == Period::Intraday {
+            SessionTimeline::new(self.symbol).index(geometry, pointer, &self.data)
+        } else {
+            let range = self.data_range();
+            geometry
+                .index(pointer, range.len())
+                .map(|index| range.start + index)
+        }
+    }
+
     fn locate(&mut self, pointer: Point<Pixels>) -> Option<usize> {
         let geometry = Geometry::new(self.bounds.get());
-        let range = self.viewport.range(self.data.len());
-        let index = range.start + geometry.index(pointer, range.len())?;
+        let index = self.pointer_index(pointer)?;
         let on_volume = pointer.y.as_f32() >= geometry.volume_top;
         let (top, height) = if on_volume {
             (geometry.volume_top, geometry.bottom - geometry.volume_top)
@@ -279,6 +306,7 @@ impl MarketChart {
             (geometry.top, geometry.price_height)
         };
         let changed = self.selected_index() != Some(index);
+        self.inspecting = true;
         self.inspection = Some(Inspection {
             time: self.data[index].time.clone(),
             y_fraction: ((pointer.y.as_f32() - top) / height.max(1.)).clamp(0., 1.),
@@ -332,14 +360,16 @@ impl MarketChart {
         if let Some(inspection) = self.inspection.as_mut() {
             inspection.time = self.data[next].time.clone();
         }
-        self.viewport.reveal(next, self.data.len());
+        if self.period != Period::Intraday {
+            self.viewport.reveal(next, self.data.len());
+        }
         self.refresh_details();
     }
 }
 
 impl Render for MarketChart {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let range = self.viewport.range(self.data.len());
+        let range = self.data_range();
         let visible = self.data[range.clone()].to_vec();
         let indicators = self.indicators.slice(range.clone());
         let geometry = Geometry::new(self.bounds.get());
@@ -377,7 +407,26 @@ impl Render for MarketChart {
                     )
                 }
             })
+            .unwrap_or_else(|| format!("{}  等待成交", self.symbol.name()));
+        let phase = market::session_at(self.symbol, self.wall_minute)
+            .phase
+            .label()
+            .to_owned();
+        let time_label = market::minute_text(self.wall_minute);
+        let latest_time = self
+            .data
+            .last()
+            .map(|bar| bar.time.clone())
+            .unwrap_or_else(|| "尚未成交".into());
+        let timeline = intraday.then(|| SessionTimeline::new(self.symbol));
+        let timeline_label = timeline
+            .as_ref()
+            .map(SessionTimeline::legend)
             .unwrap_or_default();
+        let indicative = self.indicative.clone();
+        let selected_time = selection
+            .and_then(|index| visible.get(index))
+            .map(|bar| bar.time.clone());
         let selected_average = indicators.session.get(selected_index).copied();
         let bounds_cell = self.bounds.clone();
         let crosshair = selection.and_then(|index| {
@@ -414,23 +463,80 @@ impl Render for MarketChart {
                     .text_size(px(10.))
                     .text_color(rgb(MUTED))
                     .overflow_hidden()
-                    .child(div().flex_shrink_0().text_color(rgb(BLUE)).child(header))
+                    .child(
+                        div()
+                            .id("chart-price-header")
+                            .test_support()
+                            .aria_label(header.clone())
+                            .flex_shrink_0()
+                            .text_color(rgb(BLUE))
+                            .child(header),
+                    )
                     .when(intraday, |row| {
                         row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(rgb(VWAP))
-                                .child(format!("均价 {:.3}", selected_average.unwrap_or_default())),
+                            div().flex_shrink_0().text_color(rgb(VWAP)).child(
+                                selected_average
+                                    .map(|value| format!("均价 {value:.3}"))
+                                    .unwrap_or_else(|| "均价 —".into()),
+                            ),
                         )
                     }),
             )
+            .when(intraday, |chart| {
+                chart.child(
+                    div()
+                        .h(px(22.))
+                        .flex_shrink_0()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child(
+                            div()
+                                .id("intraday-session-phase")
+                                .test_support()
+                                .aria_label(phase.clone())
+                                .flex_shrink_0()
+                                .text_color(rgb(BLUE))
+                                .child(phase),
+                        )
+                        .child(
+                            div()
+                                .id("intraday-session-time")
+                                .test_support()
+                                .aria_label(time_label.clone())
+                                .flex_shrink_0()
+                                .child(time_label),
+                        )
+                        .child(div().flex_shrink_0().child("最近成交"))
+                        .child(
+                            div()
+                                .id("intraday-last-time")
+                                .test_support()
+                                .aria_label(latest_time.clone())
+                                .flex_shrink_0()
+                                .child(latest_time),
+                        )
+                        .child(
+                            div()
+                                .id("intraday-timeline-label")
+                                .test_support()
+                                .aria_label(timeline_label.clone())
+                                .truncate()
+                                .child(timeline_label),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("native-market-chart")
                     .test_support()
                     .track_focus(&self.focus)
                     .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
-                        if this.inspection.is_none() {
+                        if !this.inspecting {
                             return;
                         }
                         match event.keystroke.key.as_str() {
@@ -453,7 +559,7 @@ impl Render for MarketChart {
                                     let dx = event.position.x.as_f32() - drag.origin.x.as_f32();
                                     let dy = event.position.y.as_f32() - drag.origin.y.as_f32();
                                     drag.moved |= dx.hypot(dy) > 4.;
-                                    if drag.moved {
+                                    if drag.moved && this.period != Period::Intraday {
                                         let geometry = Geometry::new(this.bounds.get());
                                         let count = drag.viewport.range(this.data.len()).len();
                                         this.viewport = drag.viewport;
@@ -469,7 +575,14 @@ impl Render for MarketChart {
                                 }
                                 this.drag = None;
                             }
-                            if this.inspection.is_some() && this.locate(event.position).is_some() {
+                            if this.inspecting {
+                                if this.locate(event.position).is_none()
+                                    && this.period == Period::Intraday
+                                {
+                                    // Empty future/auction/pause positions are not aliases for the latest trade.
+                                    this.inspection = None;
+                                    this.details = None;
+                                }
                                 cx.notify();
                             }
                         }),
@@ -477,11 +590,7 @@ impl Render for MarketChart {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &gpui_kit::MouseDownEvent, window, cx| {
-                            let geometry = Geometry::new(this.bounds.get());
-                            if geometry
-                                .index(event.position, this.viewport.range(this.data.len()).len())
-                                .is_some()
-                            {
+                            if this.pointer_index(event.position).is_some() {
                                 this.focus.focus(window, cx);
                                 this.drag = Some(DragState {
                                     origin: event.position,
@@ -489,6 +598,9 @@ impl Render for MarketChart {
                                     moved: false,
                                     click_count: event.click_count,
                                 });
+                            } else if this.period == Period::Intraday {
+                                this.clear_inspection();
+                                cx.notify();
                             }
                         }),
                     )
@@ -523,6 +635,10 @@ impl Render for MarketChart {
                     }))
                     .on_scroll_wheel(cx.listener(
                         |this, event: &gpui_kit::ScrollWheelEvent, _, cx| {
+                            if this.period == Period::Intraday {
+                                cx.stop_propagation();
+                                return;
+                            }
                             let (x, y) = match event.delta {
                                 ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
                                 ScrollDelta::Lines(p) => (p.x * 24., p.y * 24.),
@@ -550,6 +666,8 @@ impl Render for MarketChart {
                                     &visible,
                                     &indicators,
                                     intraday,
+                                    timeline.as_ref(),
+                                    &indicative,
                                     reference_price,
                                     latest,
                                     crosshair,
@@ -561,7 +679,19 @@ impl Render for MarketChart {
                         )
                         .size_full(),
                     )
-                    .children(details_card),
+                    .children(details_card)
+                    .children(selected_time.map(|time| {
+                        div()
+                            .id("chart-selected-time")
+                            .test_support()
+                            .aria_label(time.clone())
+                            .absolute()
+                            .top_0()
+                            .right(px(58.))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(time)
+                    })),
             )
     }
 }
@@ -780,6 +910,225 @@ impl Geometry {
     }
 }
 
+/// Fixed market-clock coordinates. Empty future minutes and breaks keep their
+/// positions even though they have no trade bar yet.
+struct SessionTimeline {
+    axis: SessionAxis,
+}
+
+impl SessionTimeline {
+    fn new(symbol: Symbol) -> Self {
+        Self {
+            axis: market::session_axis(symbol),
+        }
+    }
+
+    fn cash_start(&self) -> u16 {
+        self.axis
+            .opening_auction
+            .map_or(self.axis.start, |(_, end)| end + 5)
+    }
+
+    fn auction_width(&self, geometry: Geometry) -> f32 {
+        if self.axis.opening_auction.is_some() {
+            (geometry.width * 0.14)
+                .clamp(32., 100.)
+                .min(geometry.width * 0.28)
+        } else {
+            0.
+        }
+    }
+
+    fn opening_gap(&self) -> f32 {
+        if self.axis.opening_auction.is_some() {
+            8.
+        } else {
+            0.
+        }
+    }
+    fn lunch_gap(&self) -> f32 {
+        if self.axis.lunch.is_some() { 8. } else { 0. }
+    }
+
+    fn cash_minutes(&self) -> u16 {
+        self.axis.end - self.cash_start() - self.axis.lunch.map_or(0, |(start, end)| end - start)
+    }
+
+    fn cash_width(&self, geometry: Geometry) -> f32 {
+        (geometry.width - self.auction_width(geometry) - self.opening_gap() - self.lunch_gap())
+            .max(1.)
+    }
+
+    fn x(&self, minute: u16, geometry: Geometry) -> f32 {
+        let auction_width = self.auction_width(geometry);
+        if let Some((start, end)) = self.axis.opening_auction {
+            if minute <= end {
+                return geometry.left
+                    + auction_width * minute.saturating_sub(start) as f32
+                        / (end - start).max(1) as f32;
+            }
+            if minute < self.cash_start() {
+                return geometry.left
+                    + auction_width
+                    + self.opening_gap() * (minute - end) as f32
+                        / (self.cash_start() - end) as f32;
+            }
+        }
+        let cash_left = geometry.left + auction_width + self.opening_gap();
+        let mut elapsed = minute.saturating_sub(self.cash_start());
+        let mut break_offset = 0.;
+        if let Some((start, end)) = self.axis.lunch {
+            if minute >= end {
+                elapsed -= end - start;
+                break_offset = self.lunch_gap();
+            } else if minute > start {
+                elapsed = start - self.cash_start();
+                break_offset = self.lunch_gap() * (minute - start) as f32 / (end - start) as f32;
+            }
+        }
+        cash_left
+            + self.cash_width(geometry) * elapsed as f32 / self.cash_minutes().max(1) as f32
+            + break_offset
+    }
+
+    fn index(&self, geometry: Geometry, pointer: Point<Pixels>, bars: &[Bar]) -> Option<usize> {
+        if pointer.x.as_f32() < geometry.left
+            || pointer.x.as_f32() > geometry.right()
+            || pointer.y.as_f32() < geometry.top
+            || pointer.y.as_f32() > geometry.bottom
+        {
+            return None;
+        }
+        let x = pointer.x.as_f32();
+        // A matched auction is painted as a 3 px dot. Give that actual dot a
+        // finite hit target even when its clock coordinate is between device pixels.
+        if let Some((_, end)) = self.axis.opening_auction
+            && (x - self.x(end, geometry)).abs() <= 1.5
+            && let Some(index) = bars
+                .iter()
+                .position(|bar| market::bar_wall_minute(bar) == end)
+        {
+            return Some(index);
+        }
+        // Exclude wall-clock regions before nearest-point hit testing. In an
+        // ultrawide chart a minute's hit radius can be wider than a compressed break.
+        if let Some((_, end)) = self.axis.opening_auction {
+            let matched = self.x(end, geometry);
+            if x < matched || (x > matched && x < self.x(self.cash_start(), geometry)) {
+                return None;
+            }
+        }
+        if let Some((start, end)) = self.axis.lunch
+            && x > self.x(start, geometry)
+            && x < self.x(end, geometry)
+        {
+            return None;
+        }
+        if let Some((start, end)) = self.axis.closing_auction
+            && x > self.x(start, geometry)
+            && x < self.x(end, geometry)
+        {
+            return None;
+        }
+        let latest_x = self.x(market::bar_wall_minute(bars.last()?), geometry);
+        if x > latest_x + 0.01 {
+            return None;
+        }
+        let tolerance =
+            (self.cash_width(geometry) / self.cash_minutes().max(1) as f32 * 0.51).max(0.25);
+        bars.iter()
+            .enumerate()
+            .filter_map(|(index, bar)| {
+                let distance =
+                    (self.x(market::bar_wall_minute(bar), geometry) - pointer.x.as_f32()).abs();
+                (distance <= tolerance).then_some((index, distance))
+            })
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(index, _)| index)
+    }
+
+    fn legend(&self) -> String {
+        if self.axis.opening_auction.is_some() {
+            "09:15 集合竞价 · 09:20 禁止撤单 · 09:25 撮合 · 09:30 开盘 · 11:30 / 13:00 午休 · 14:57 收盘竞价 · 15:00 收盘".into()
+        } else if let Some((start, end)) = self.axis.lunch {
+            format!(
+                "{} 开盘 · {} / {} 午休 · {} 收盘",
+                market::minute_text(self.axis.start),
+                market::minute_text(start),
+                market::minute_text(end),
+                market::minute_text(self.axis.end)
+            )
+        } else {
+            format!(
+                "{} 开盘 · {} 收盘 · 固定全天",
+                market::minute_text(self.axis.start),
+                market::minute_text(self.axis.end)
+            )
+        }
+    }
+
+    fn markers(&self) -> Vec<(u16, String)> {
+        if self.axis.opening_auction.is_some() {
+            [
+                (555, "09:15"),
+                (560, "09:20"),
+                (565, "09:25"),
+                (570, "09:30"),
+                (600, "10:00"),
+                (630, "10:30"),
+                (660, "11:00"),
+                (690, "11:30 / 13:00"),
+                (810, "13:30"),
+                (840, "14:00"),
+                (870, "14:30"),
+                (900, "15:00"),
+            ]
+            .into_iter()
+            .map(|(minute, text)| (minute, text.into()))
+            .collect()
+        } else {
+            let mut markers = vec![(self.axis.start, market::minute_text(self.axis.start))];
+            for minute in (self.axis.start + 30..self.axis.end).step_by(60) {
+                if self
+                    .axis
+                    .lunch
+                    .is_none_or(|(start, end)| minute < start || minute > end)
+                {
+                    markers.push((minute, market::minute_text(minute)));
+                }
+            }
+            if let Some((start, end)) = self.axis.lunch {
+                markers.push((
+                    start,
+                    format!(
+                        "{} / {}",
+                        market::minute_text(start),
+                        market::minute_text(end)
+                    ),
+                ));
+            }
+            markers.push((self.axis.end, market::minute_text(self.axis.end)));
+            markers.sort_by_key(|(minute, _)| *minute);
+            markers
+        }
+    }
+}
+
+fn session_segments(bars: &[Bar]) -> Vec<Range<usize>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for index in 1..bars.len() {
+        if market::bar_wall_minute(&bars[index]) != market::bar_wall_minute(&bars[index - 1]) + 1 {
+            segments.push(start..index);
+            start = index;
+        }
+    }
+    if start < bars.len() {
+        segments.push(start..bars.len());
+    }
+    segments
+}
+
 /// Compute indicators against the full history, then slice them with the bars.
 /// Panning or zooming must not restart an MA or a session average at the edge.
 struct Indicators {
@@ -824,6 +1173,8 @@ fn paint_chart(
     bars: &[Bar],
     indicators: &Indicators,
     intraday: bool,
+    timeline: Option<&SessionTimeline>,
+    indicative: &[IndicativePoint],
     reference_price: f64,
     latest: Option<f64>,
     crosshair: Option<Crosshair>,
@@ -831,15 +1182,32 @@ fn paint_chart(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if bars.is_empty() || bounds.size.width < px(150.) || bounds.size.height < px(80.) {
+    if (!intraday && bars.is_empty())
+        || bounds.size.width < px(150.)
+        || bounds.size.height < px(80.)
+    {
         return;
     }
     let g = Geometry::new(bounds);
-    let (minimum, maximum) = price_extent(bars, indicators, intraday, reference_price);
+    let (mut minimum, mut maximum) = price_extent(bars, indicators, intraday, reference_price);
+    if intraday {
+        let distance = indicative
+            .iter()
+            .map(|point| (point.price - reference_price).abs() * 1.12)
+            .fold((maximum - reference_price).abs(), f64::max);
+        minimum = reference_price - distance;
+        maximum = reference_price + distance;
+    }
+    let bar_x = |index: usize| {
+        timeline.map_or_else(
+            || g.x(index, bars.len()),
+            |timeline| timeline.x(market::bar_wall_minute(&bars[index]), g),
+        )
+    };
     let y = |price: f64| g.top + ((maximum - price) / (maximum - minimum)) as f32 * g.price_height;
     let selected = crosshair
         .map(|crosshair| crosshair.index)
-        .unwrap_or(bars.len() - 1);
+        .unwrap_or(bars.len().saturating_sub(1));
     let origin_x = bounds.origin.x.as_f32();
     let price_color = |price: f64| {
         if (price - reference_price).abs() < 0.000_001 {
@@ -850,6 +1218,56 @@ fn paint_chart(
             DOWN
         }
     };
+
+    if let Some(timeline) = timeline {
+        if let Some((start, end)) = timeline.axis.opening_auction {
+            let left = timeline.x(start, g);
+            let right = timeline.x(end, g);
+            rect(left, g.top, right - left, g.price_height, 0xF5F2FC, window);
+            rect(
+                left,
+                g.volume_top,
+                right - left,
+                g.bottom - g.volume_top,
+                0xF5F2FC,
+                window,
+            );
+            let open = timeline.x(timeline.cash_start(), g);
+            rect(
+                right,
+                g.top,
+                open - right,
+                g.bottom - g.top,
+                0xF3F5F8,
+                window,
+            );
+        }
+        if let Some((start, end)) = timeline.axis.lunch {
+            let left = timeline.x(start, g);
+            let right = timeline.x(end, g);
+            rect(
+                left,
+                g.top,
+                right - left,
+                g.bottom - g.top,
+                0xEEF2F7,
+                window,
+            );
+        }
+        if let Some((start, end)) = timeline.axis.closing_auction {
+            let left = timeline.x(start, g);
+            let right = timeline.x(end, g);
+            rect(left, g.top, right - left, g.price_height, 0xF5F2FC, window);
+            rect(
+                left,
+                g.volume_top,
+                right - left,
+                g.bottom - g.volume_top,
+                0xF5F2FC,
+                window,
+            );
+        }
+    }
 
     let row_count = if intraday && g.price_height > 300. {
         8
@@ -884,10 +1302,49 @@ fn paint_chart(
         }
     }
 
-    // Price and volume share a timeline and vertical grid, as in a trading terminal.
-    for i in 0..=4 {
-        let fraction = i as f32 / 4.;
-        let column = g.left + g.width * fraction;
+    // Both panes use the same fixed clock coordinates, including blank future time.
+    let markers: Vec<_> = if let Some(timeline) = timeline {
+        timeline
+            .markers()
+            .into_iter()
+            .map(|(minute, text)| (timeline.x(minute, g), text, Some(minute)))
+            .collect()
+    } else {
+        (0..=4)
+            .map(|i| {
+                let fraction = i as f32 / 4.;
+                let index = ((bars.len() - 1) as f32 * fraction).round() as usize;
+                (g.left + g.width * fraction, bars[index].time.clone(), None)
+            })
+            .collect()
+    };
+    let is_important = |minute: Option<u16>, text: &str| {
+        text.contains('/')
+            || minute.is_some_and(|minute| {
+                timeline.is_some_and(|timeline| {
+                    minute == timeline.cash_start() || minute == timeline.axis.end
+                })
+            })
+    };
+    let display_text = |text: &str| {
+        if g.width < 260. && text.contains('/') {
+            "午休".to_owned()
+        } else {
+            text.to_owned()
+        }
+    };
+    let text_bounds = |column: f32, text: &str| {
+        let width = text.chars().count() as f32 * 5.4;
+        let left = (column - width / 2.).clamp(g.left, (g.right() - width).max(g.left));
+        (left, left + width)
+    };
+    let reserved: Vec<_> = markers
+        .iter()
+        .filter(|(_, text, minute)| is_important(*minute, text))
+        .map(|(column, text, _)| text_bounds(*column, &display_text(text)))
+        .collect();
+    let mut last_label_right = f32::NEG_INFINITY;
+    for (column, text, minute) in markers {
         stroke(
             &[(column, g.top), (column, g.price_bottom())],
             1.,
@@ -902,10 +1359,25 @@ fn paint_chart(
             true,
             window,
         );
-        let index = ((bars.len() - 1) as f32 * fraction).round() as usize;
-        let text_x = (column - 18.).clamp(g.left, (g.right() - 43.).max(g.left));
+        // The opening match is annotated inside its distinct strip; 09:30 owns the axis below.
+        if timeline.is_some_and(|timeline| timeline.axis.opening_auction.is_some())
+            && minute == Some(565)
+        {
+            continue;
+        }
+        let important = is_important(minute, &text);
+        let text = display_text(&text);
+        let (text_x, text_right) = text_bounds(column, &text);
+        if !important
+            && (text_x < last_label_right + 5.
+                || reserved
+                    .iter()
+                    .any(|(left, right)| text_x < *right + 5. && text_right > *left - 5.))
+        {
+            continue;
+        }
         label(
-            bars[index].time.clone(),
+            text,
             text_x,
             g.bottom + 4.,
             10.,
@@ -913,6 +1385,7 @@ fn paint_chart(
             window,
             cx,
         );
+        last_label_right = text_right;
     }
 
     if intraday {
@@ -924,39 +1397,87 @@ fn paint_chart(
             false,
             window,
         );
-        let points: Vec<_> = bars
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (g.x(i, bars.len()), y(b.close)))
-            .collect();
-        let mut area = PathBuilder::fill();
-        area.move_to(point(px(points[0].0), px(g.price_bottom())));
-        for &(x, y) in &points {
-            area.line_to(point(px(x), px(y)));
+        for segment in session_segments(bars) {
+            let points: Vec<_> = segment
+                .clone()
+                .map(|i| (bar_x(i), y(bars[i].close)))
+                .collect();
+            if points.len() > 1 {
+                let mut area = PathBuilder::fill();
+                area.move_to(point(px(points[0].0), px(g.price_bottom())));
+                for &(x, y) in &points {
+                    area.line_to(point(px(x), px(y)));
+                }
+                area.line_to(point(px(points[points.len() - 1].0), px(g.price_bottom())));
+                area.close();
+                if let Ok(path) = area.build() {
+                    window.paint_path(path, rgba(0x397AF60B));
+                }
+                stroke(&points, 1.4, BLUE, false, window);
+                let means: Vec<_> = segment
+                    .map(|i| (bar_x(i), y(indicators.session[i])))
+                    .collect();
+                stroke(&means, 1.2, VWAP, false, window);
+            } else if let Some(&(x, y)) = points.first() {
+                rect(x - 1.5, y - 1.5, 3., 3., BLUE, window);
+            }
         }
-        area.line_to(point(px(points[points.len() - 1].0), px(g.price_bottom())));
-        area.close();
-        if let Ok(path) = area.build() {
-            window.paint_path(path, rgba(0x397AF60B));
+        if let Some(timeline) = timeline {
+            // Indicative auction prices are reference quotes, never matched volume or VWAP input.
+            for auction in [timeline.axis.opening_auction, timeline.axis.closing_auction]
+                .into_iter()
+                .flatten()
+            {
+                let points: Vec<_> = indicative
+                    .iter()
+                    .filter(|point| point.wall_minute >= auction.0 && point.wall_minute < auction.1)
+                    .map(|point| (timeline.x(point.wall_minute, g), y(point.price)))
+                    .collect();
+                stroke(&points, 1.1, 0x9270B0, true, window);
+            }
+            if timeline.axis.opening_auction.is_some() {
+                label(
+                    "竞价参考".into(),
+                    g.left + 3.,
+                    g.top + 5.,
+                    9.,
+                    rgb(0x9270B0).into(),
+                    window,
+                    cx,
+                );
+                label(
+                    "09:25 撮合".into(),
+                    g.left + 3.,
+                    g.top + 18.,
+                    9.,
+                    rgb(MUTED).into(),
+                    window,
+                    cx,
+                );
+            }
+            if timeline.axis.closing_auction.is_some() {
+                label(
+                    "14:57 收盘竞价".into(),
+                    g.right() - 78.,
+                    g.top + 5.,
+                    9.,
+                    rgb(0x9270B0).into(),
+                    window,
+                    cx,
+                );
+            }
         }
-        stroke(&points, 1.4, BLUE, false, window);
-        let mean_points: Vec<_> = indicators
-            .session
-            .iter()
-            .enumerate()
-            .map(|(i, mean)| (g.x(i, bars.len()), y(*mean)))
-            .collect();
-        stroke(&mean_points, 1.2, VWAP, false, window);
-        let bar = &bars[selected];
-        label(
-            format!("涨幅 {:+.2}%", change_percent(bar.close, reference_price)),
-            origin_x + 8.,
-            bounds.origin.y.as_f32() + 2.,
-            10.,
-            rgb(price_color(bar.close)).into(),
-            window,
-            cx,
-        );
+        if let Some(bar) = bars.get(selected) {
+            label(
+                format!("涨幅 {:+.2}%", change_percent(bar.close, reference_price)),
+                origin_x + 8.,
+                bounds.origin.y.as_f32() + 2.,
+                10.,
+                rgb(price_color(bar.close)).into(),
+                window,
+                cx,
+            );
+        }
         label(
             format!("昨收 {reference_price:.3}"),
             origin_x + 114.,
@@ -1037,11 +1558,15 @@ fn paint_chart(
             cx,
         );
     }
-    let column_width = (g.width / bars.len() as f32 * 0.58).clamp(1., 11.);
+    let column_width = if let Some(timeline) = timeline {
+        (timeline.cash_width(g) / timeline.cash_minutes().max(1) as f32 * 0.58).clamp(1., 11.)
+    } else {
+        (g.width / bars.len().max(1) as f32 * 0.58).clamp(1., 11.)
+    };
     for (i, bar) in bars.iter().enumerate() {
         let top = volume_y(bar.volume as f64);
         rect(
-            g.x(i, bars.len()) - column_width / 2.,
+            bar_x(i) - column_width / 2.,
             top,
             column_width,
             (g.bottom - top).max(1.),
@@ -1050,7 +1575,10 @@ fn paint_chart(
         );
     }
     let volume_legend_y = g.price_bottom() + 5.;
-    let volume_text = format!("成交量 {}", volume_label(bars[selected].volume));
+    let volume_text = format!(
+        "成交量 {}",
+        volume_label(bars.get(selected).map_or(0, |bar| bar.volume))
+    );
     label(
         volume_text,
         origin_x + 8.,
@@ -1105,7 +1633,7 @@ fn paint_chart(
 
     if let Some(crosshair) = crosshair {
         let index = crosshair.index;
-        let cross_x = g.x(index, bars.len());
+        let cross_x = bar_x(index);
         let on_volume = crosshair.on_volume;
         let cross_y = if on_volume {
             g.volume_top + crosshair.y_fraction * (g.bottom - g.volume_top)
@@ -1238,8 +1766,16 @@ fn price_extent(
     intraday: bool,
     reference_price: f64,
 ) -> (f64, f64) {
-    let mut minimum = f64::INFINITY;
-    let mut maximum = f64::NEG_INFINITY;
+    let mut minimum = if intraday {
+        reference_price
+    } else {
+        f64::INFINITY
+    };
+    let mut maximum = if intraday {
+        reference_price
+    } else {
+        f64::NEG_INFINITY
+    };
     for bar in bars {
         minimum = minimum.min(if intraday { bar.close } else { bar.low });
         maximum = maximum.max(if intraday { bar.close } else { bar.high });
@@ -1345,18 +1881,125 @@ mod tests {
     use crate::market::{self, Bar, Period, Symbol};
 
     #[test]
+    fn fixed_session_coordinates_keep_prices_volumes_and_future_minutes_in_place() {
+        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let geometry = super::Geometry::new(gpui_kit::Bounds::new(
+            gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)),
+            gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(600.)),
+        ));
+        let morning = market::bars(Symbol::Yinli, Period::Intraday, 0);
+        let afternoon = market::bars(Symbol::Yinli, Period::Intraday, 240);
+        let pointer = |minute| {
+            gpui_kit::point(
+                gpui_kit::px(timeline.x(minute, geometry)),
+                gpui_kit::px(100.),
+            )
+        };
+        let morning_index = timeline.index(geometry, pointer(600), &morning).unwrap();
+        let afternoon_index = timeline.index(geometry, pointer(600), &afternoon).unwrap();
+        assert_eq!(morning[morning_index], afternoon[afternoon_index]);
+        assert_eq!(morning[morning_index].time, "10:00");
+        assert_eq!(timeline.index(geometry, pointer(840), &morning), None);
+        assert_eq!(
+            afternoon[timeline.index(geometry, pointer(840), &afternoon).unwrap()].time,
+            "14:00"
+        );
+        assert!((timeline.x(900, geometry) - geometry.right()).abs() < 0.001);
+        assert!((timeline.x(780, geometry) - timeline.x(690, geometry) - 8.).abs() < 0.001);
+    }
+
+    #[test]
+    fn paused_and_indicative_regions_never_snap_to_trades_even_on_ultrawide_charts() {
+        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let all = market::bars(Symbol::Yinli, Period::Intraday, 300);
+        for width in [240., 1000., 4000., 8000.] {
+            let geometry = super::Geometry::new(gpui_kit::Bounds::new(
+                gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)),
+                gpui_kit::size(gpui_kit::px(width), gpui_kit::px(600.)),
+            ));
+            for minute in [560, 567, 720, 750, 898, 899] {
+                let pointer = gpui_kit::point(
+                    gpui_kit::px(timeline.x(minute, geometry)),
+                    gpui_kit::px(100.),
+                );
+                assert_eq!(
+                    timeline.index(geometry, pointer, &all),
+                    None,
+                    "width={width}, minute={minute}"
+                );
+            }
+            for minute in [565, 570, 690, 780, 897, 900] {
+                let pointer = gpui_kit::point(
+                    gpui_kit::px(timeline.x(minute, geometry)),
+                    gpui_kit::px(100.),
+                );
+                let index = timeline.index(geometry, pointer, &all).unwrap();
+                assert_eq!(market::bar_wall_minute(&all[index]), minute);
+            }
+        }
+    }
+
+    #[test]
+    fn the_opening_match_has_a_pixel_hit_target_without_making_the_wait_gap_a_trade() {
+        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let bars = market::bars(Symbol::Yinli, Period::Intraday, 0);
+        let geometry = super::Geometry::new(gpui_kit::Bounds::new(
+            gpui_kit::point(gpui_kit::px(0.4), gpui_kit::px(0.)),
+            gpui_kit::size(gpui_kit::px(613.3), gpui_kit::px(600.)),
+        ));
+        let match_x = timeline.x(565, geometry);
+        let integer_pointer = gpui_kit::point(gpui_kit::px(match_x.round()), gpui_kit::px(100.));
+        let selected = timeline.index(geometry, integer_pointer, &bars).unwrap();
+        assert_eq!(bars[selected].time, "09:25");
+        let wait_midpoint = gpui_kit::point(
+            gpui_kit::px((match_x + timeline.x(570, geometry)) / 2.),
+            gpui_kit::px(100.),
+        );
+        assert_eq!(timeline.index(geometry, wait_midpoint, &bars), None);
+        assert_eq!(timeline.index(geometry, integer_pointer, &[]), None);
+    }
+
+    #[test]
+    fn session_curve_never_connects_over_auction_or_lunch_gaps() {
+        let bars = market::bars(Symbol::Yinli, Period::Intraday, 300);
+        let segments = super::session_segments(&bars);
+        let endpoints: Vec<_> = segments
+            .iter()
+            .map(|segment| {
+                (
+                    bars[segment.start].time.as_str(),
+                    bars[segment.end - 1].time.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("09:25", "09:25"),
+                ("09:30", "11:30"),
+                ("13:00", "14:57"),
+                ("15:00", "15:00")
+            ]
+        );
+        assert_eq!(
+            segments.iter().map(|segment| segment.len()).sum::<usize>(),
+            bars.len()
+        );
+    }
+
+    #[test]
     fn inspection_tracks_the_time_identity_when_the_retained_tail_rolls() {
-        let initial = market::bars(Symbol::Aapl, Period::Intraday, 30);
+        let initial = market::bars(Symbol::Aapl, Period::Minute1, 30);
         let inspection = super::Inspection {
             time: initial[10].time.clone(),
             y_fraction: 0.5,
             on_volume: false,
         };
         assert_eq!(inspection.index_in(&initial), Some(10));
-        let rolled = market::bars(Symbol::Aapl, Period::Intraday, 35);
+        let rolled = market::bars(Symbol::Aapl, Period::Minute1, 35);
         assert_eq!(inspection.index_in(&rolled), Some(5));
         // Once that minute leaves retained history, clear rather than showing another bar.
-        let expired = market::bars(Symbol::Aapl, Period::Intraday, 50);
+        let expired = market::bars(Symbol::Aapl, Period::Minute1, 50);
         assert_eq!(inspection.index_in(&expired), None);
         let daily = market::bars(Symbol::Aapl, Period::Day, 0);
         let selected_day = super::Inspection {
@@ -1411,10 +2054,10 @@ mod tests {
     }
 
     #[test]
-    fn intraday_average_keeps_session_prefix_when_history_rolls() {
-        let bars = market::bars(Symbol::Aapl, Period::Intraday, 70);
+    fn minute_candle_average_keeps_session_prefix_when_history_rolls() {
+        let bars = market::bars(Symbol::Aapl, Period::Minute1, 70);
         let session = market::session_bars(Symbol::Aapl, 70);
-        let indicators = Indicators::for_market(Symbol::Aapl, Period::Intraday, 70, &bars);
+        let indicators = Indicators::for_market(Symbol::Aapl, Period::Minute1, 70, &bars);
         let session_means = session_averages(&session);
         let start = session.len() - bars.len();
         assert!(start > 0);

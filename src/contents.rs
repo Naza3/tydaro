@@ -82,13 +82,14 @@ struct DemoPosition {
     cost: f64,
 }
 
-/// Session-only accounting. US and HK demonstration balances are independent.
+/// Session-only accounting. Demonstration balances are independent by currency.
 #[derive(Clone)]
 struct DemoBroker {
     orders: Vec<DemoOrder>,
     positions: Vec<DemoPosition>,
     usd: f64,
     hkd: f64,
+    cny: f64,
     next_id: u64,
 }
 impl Global for DemoBroker {}
@@ -117,23 +118,24 @@ impl Default for DemoBroker {
             ],
             usd: 100_000.,
             hkd: 500_000.,
+            cny: 500_000.,
             next_id: 1002,
         }
     }
 }
 impl DemoBroker {
     fn available_cash(&self, symbol: Symbol) -> f64 {
-        let balance = if symbol.market() == "HK" {
-            self.hkd
-        } else {
-            self.usd
+        let balance = match symbol.currency() {
+            "HKD" => self.hkd,
+            "CNY" => self.cny,
+            _ => self.usd,
         };
         balance
             - self
                 .orders
                 .iter()
                 .filter(|o| {
-                    o.symbol.market() == symbol.market()
+                    o.symbol.currency() == symbol.currency()
                         && o.side == Side::Buy
                         && o.status == OrderStatus::Pending
                 })
@@ -207,10 +209,10 @@ impl DemoBroker {
         order.status = OrderStatus::Filled;
         let order = order.clone();
         let value = order.price * order.quantity as f64;
-        let balance = if order.symbol.market() == "HK" {
-            &mut self.hkd
-        } else {
-            &mut self.usd
+        let balance = match order.symbol.currency() {
+            "HKD" => &mut self.hkd,
+            "CNY" => &mut self.cny,
+            _ => &mut self.usd,
         };
         if order.side == Side::Buy {
             *balance -= value;
@@ -308,7 +310,7 @@ struct ContentSnapshot {
 }
 
 fn default_members() -> Vec<Symbol> {
-    Symbol::ALL.to_vec()
+    Symbol::LEGACY_DEFAULTS.to_vec()
 }
 
 fn read_members<'de, D: serde::Deserializer<'de>>(
@@ -465,7 +467,7 @@ impl PanelContent {
             import_loading: false,
             import_revision: 0,
             import_request: 0,
-            members: default_members(),
+            members: Symbol::ALL.to_vec(),
             price,
             quantity,
             side: Side::Buy,
@@ -1372,28 +1374,38 @@ impl PanelContent {
                         .test_support()
                     }))
                     .child(div().flex_1())
+                    .when(self.period != Period::Intraday, |view| {
+                        view.child(
+                            control("chart-zoom-out", "−", false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chart
+                                        .update(cx, |chart, cx| chart.zoom_step(false, cx));
+                                }))
+                                .test_support(),
+                        )
+                        .child(
+                            control("chart-zoom-in", "+", false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chart.update(cx, |chart, cx| chart.zoom_step(true, cx));
+                                }))
+                                .test_support(),
+                        )
+                    })
                     .child(
-                        control("chart-zoom-out", "−", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.chart
-                                    .update(cx, |chart, cx| chart.zoom_step(false, cx));
-                            }))
-                            .test_support(),
-                    )
-                    .child(
-                        control("chart-zoom-in", "+", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.chart.update(cx, |chart, cx| chart.zoom_step(true, cx));
-                            }))
-                            .test_support(),
-                    )
-                    .child(
-                        control("chart-reset", "复位", false)
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.chart.update(cx, |chart, cx| chart.reset(cx));
-                            }))
-                            .test_support(),
+                        control(
+                            "chart-reset",
+                            if self.period == Period::Intraday {
+                                "全天"
+                            } else {
+                                "复位"
+                            },
+                            false,
+                        )
+                        .flex_shrink_0()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.chart.update(cx, |chart, cx| chart.reset(cx));
+                        }))
+                        .test_support(),
                     ),
             )
             .when_some(self.feedback.as_ref(), |view, (message, _)| {
@@ -1414,6 +1426,8 @@ impl PanelContent {
                     .text_color(rgb(MUTED))
                     .child(if self.period == Period::Day {
                         "单击查看数据 · ← → 逐日定位 · 双击查看当日分时 · Esc 退出定位"
+                    } else if self.period == Period::Intraday {
+                        "当日分时 · 固定全天时轴 · 单击查看数据 · Esc 退出定位"
                     } else {
                         "单击查看数据 · 滚轮缩放 · 拖动平移 · Esc 退出定位"
                     }),
@@ -2489,9 +2503,9 @@ impl PanelContent {
 
     fn positions(&self, cx: &mut Context<Self>) -> AnyElement {
         let positions = cx.global::<DemoBroker>().positions.clone();
-        let (usd, hkd) = {
+        let (usd, hkd, cny) = {
             let broker = cx.global::<DemoBroker>();
-            (broker.usd, broker.hkd)
+            (broker.usd, broker.hkd, broker.cny)
         };
         div()
             .size_full()
@@ -2499,14 +2513,17 @@ impl PanelContent {
             .flex_col()
             .child(
                 div()
+                    .id("positions-balances")
                     .h(px(36.))
                     .px_3()
                     .flex()
                     .items_center()
                     .gap_4()
+                    .overflow_x_scroll()
                     .child(badge("模拟持仓"))
                     .child(format!("现金 {usd:.2} USD"))
-                    .child(div().text_color(rgb(MUTED)).child(format!("{hkd:.2} HKD"))),
+                    .child(div().text_color(rgb(MUTED)).child(format!("{hkd:.2} HKD")))
+                    .child(div().text_color(rgb(MUTED)).child(format!("{cny:.2} CNY"))),
             )
             .child(
                 div()
@@ -3204,6 +3221,31 @@ mod tests {
     }
 
     #[test]
+    fn shanghai_and_shenzhen_share_cny_without_spending_other_currencies() {
+        let mut broker = DemoBroker::default();
+        let id = broker
+            .submit(Symbol::Yinli, Side::Buy, 20., 10_000)
+            .unwrap();
+        assert_eq!(broker.available_cash(Symbol::Yangguang), 300_000.);
+        assert!(
+            broker
+                .submit(Symbol::Yangguang, Side::Buy, 15., 30_000)
+                .is_err()
+        );
+        assert_eq!(broker.available_cash(Symbol::Aapl), 100_000.);
+        assert_eq!(broker.available_cash(Symbol::Tencent), 500_000.);
+        broker.fill(id);
+        broker.fill(id);
+        assert_eq!(broker.cny, 300_000.);
+        assert_eq!(broker.available_shares(Symbol::Yinli), 10_000);
+        let sell = broker.submit(Symbol::Yinli, Side::Sell, 21., 100).unwrap();
+        broker.fill(sell);
+        assert_eq!(broker.cny, 302_100.);
+        assert_eq!(broker.usd, 100_000.);
+        assert_eq!(broker.hkd, 500_000.);
+    }
+
+    #[test]
     fn simulated_fills_update_positions_and_do_not_fill_twice() {
         let mut broker = DemoBroker::default();
         let id = broker.submit(Symbol::Aapl, Side::Sell, 340., 60).unwrap();
@@ -3230,7 +3272,7 @@ mod tests {
         assert!(!saved.order_filter.enabled);
         assert!(saved.order_filter.min_amount.is_empty());
         assert!(!saved.large_trades_only && !saved.book_queue);
-        assert_eq!(saved.members, Symbol::ALL);
+        assert_eq!(saved.members, Symbol::LEGACY_DEFAULTS);
     }
 
     #[test]

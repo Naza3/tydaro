@@ -60,7 +60,7 @@ impl PanelModel {
         Self {
             id,
             kind,
-            symbol: Symbol::Aapl,
+            symbol: Symbol::Yinli,
             period: Period::Intraday,
             link_group: 1,
             custom_name: None,
