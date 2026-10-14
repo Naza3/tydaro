@@ -232,6 +232,59 @@ impl DemoBroker {
     }
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct OrderFilterSnapshot {
+    enabled: bool,
+    min_amount: String,
+    max_amount: String,
+    min_quantity: String,
+    max_quantity: String,
+    direction: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrderRange {
+    min_amount: f64,
+    max_amount: f64,
+    min_quantity: f64,
+    max_quantity: f64,
+}
+impl OrderRange {
+    fn parse(saved: &OrderFilterSnapshot) -> Result<Self, &'static str> {
+        fn bound(value: &str, fallback: f64) -> Result<f64, &'static str> {
+            if value.trim().is_empty() {
+                return Ok(fallback);
+            }
+            value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.)
+                .ok_or("筛选值须为非负数字")
+        }
+        let range = Self {
+            min_amount: bound(&saved.min_amount, 0.)? * 10_000.,
+            max_amount: bound(&saved.max_amount, f64::MAX / 10_000.)? * 10_000.,
+            min_quantity: bound(&saved.min_quantity, 0.)?,
+            max_quantity: bound(&saved.max_quantity, f64::MAX)?,
+        };
+        if range.min_amount > range.max_amount || range.min_quantity > range.max_quantity {
+            return Err("最低值不能大于最高值");
+        }
+        if !range.min_amount.is_finite() || !range.max_amount.is_finite() {
+            return Err("筛选金额超出范围");
+        }
+        Ok(range)
+    }
+    fn contains(self, order: &market::MarketOrder) -> bool {
+        order.amount >= self.min_amount
+            && order.amount <= self.max_amount
+            && order.size as f64 >= self.min_quantity
+            && order.size as f64 <= self.max_quantity
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ContentSnapshot {
     query: String,
@@ -240,6 +293,12 @@ struct ContentSnapshot {
     side: Side,
     sort: u8,
     chart: ChartViewport,
+    #[serde(default)]
+    order_filter: OrderFilterSnapshot,
+    #[serde(default)]
+    large_trades_only: bool,
+    #[serde(default)]
+    book_queue: bool,
 }
 
 pub struct PanelContent {
@@ -253,6 +312,14 @@ pub struct PanelContent {
     quantity: Entity<InputState>,
     side: Side,
     sort: u8,
+    filter_enabled: bool,
+    filter_direction: u8,
+    min_amount: Entity<InputState>,
+    max_amount: Entity<InputState>,
+    min_quantity: Entity<InputState>,
+    max_quantity: Entity<InputState>,
+    large_trades_only: bool,
+    book_queue: bool,
     feedback: Option<(String, bool)>,
     expanded_news: Option<usize>,
     pending_price: Option<f64>,
@@ -277,16 +344,28 @@ impl PanelContent {
                 .default_value(format!("{:.2}", market::quote(symbol, 0).price))
         });
         let quantity = cx.new(|cx| InputState::new(window, cx).default_value("100"));
-        let subscriptions = [&query, &price, &quantity]
-            .into_iter()
-            .map(|input| {
-                cx.subscribe(input, |_, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        cx.notify();
-                    }
-                })
+        let min_amount = cx.new(|cx| InputState::new(window, cx).placeholder("最低"));
+        let max_amount = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
+        let min_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最低"));
+        let max_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
+        let subscriptions = [
+            &query,
+            &price,
+            &quantity,
+            &min_amount,
+            &max_amount,
+            &min_quantity,
+            &max_quantity,
+        ]
+        .into_iter()
+        .map(|input| {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
             })
-            .collect();
+        })
+        .collect();
         Self {
             kind,
             symbol,
@@ -298,6 +377,14 @@ impl PanelContent {
             quantity,
             side: Side::Buy,
             sort: 0,
+            filter_enabled: false,
+            filter_direction: 0,
+            min_amount,
+            max_amount,
+            min_quantity,
+            max_quantity,
+            large_trades_only: false,
+            book_queue: false,
             feedback: None,
             expanded_news: None,
             pending_price: None,
@@ -332,6 +419,9 @@ impl PanelContent {
             side: self.side,
             sort: self.sort,
             chart: self.chart.read(cx).viewport(),
+            order_filter: self.filter_snapshot(cx),
+            large_trades_only: self.large_trades_only,
+            book_queue: self.book_queue,
         })
         .unwrap_or(serde_json::Value::Null)
     }
@@ -351,6 +441,18 @@ impl PanelContent {
                 .update(cx, |input, cx| input.set_value(saved.quantity, window, cx));
             self.side = saved.side;
             self.sort = saved.sort.min(2);
+            self.filter_enabled = saved.order_filter.enabled;
+            self.filter_direction = saved.order_filter.direction.min(2);
+            self.large_trades_only = saved.large_trades_only;
+            self.book_queue = saved.book_queue;
+            for (input, value) in [
+                (&self.min_amount, saved.order_filter.min_amount),
+                (&self.max_amount, saved.order_filter.max_amount),
+                (&self.min_quantity, saved.order_filter.min_quantity),
+                (&self.max_quantity, saved.order_filter.max_quantity),
+            ] {
+                input.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
             self.chart
                 .update(cx, |chart, cx| chart.restore_viewport(saved.chart, cx));
             self.pending_price = None;
@@ -518,165 +620,171 @@ impl PanelContent {
     }
 
     fn chart(&self, cx: &mut Context<Self>) -> AnyElement {
-        let quote = market::quote(self.symbol, self.tick);
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(35.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(rgb(LINE))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                        "{}  {}",
-                        self.symbol.code(),
-                        self.symbol.name()
-                    )))
-                    .child(
-                        div()
-                            .text_color(movement(quote.change))
-                            .child(format!("{:.3}  {:+.2}%", quote.price, quote.change_pct)),
-                    )
-                    .child(div().flex_1())
-                    .child(badge("模拟行情")),
-            )
-            .child(div().flex_1().min_h_0().child(self.chart.clone()))
-            .child(
-                div()
-                    .h(px(34.))
-                    .px_2()
-                    .border_t_1()
-                    .border_color(rgb(LINE))
+                    .id("chart-periods")
+                    .h(px(31.))
+                    .flex_shrink_0()
+                    .px_1()
                     .flex()
                     .items_center()
                     .gap_1()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .overflow_x_scroll()
                     .children(Period::ALL.into_iter().map(|period| {
                         control(
                             SharedString::from(format!("period-{}", period.label())),
                             period.label(),
                             period == self.period,
                         )
+                        .flex_shrink_0()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_market(this.symbol, period, this.tick, cx);
                             cx.emit(ContentEvent::PeriodChanged(period));
                         }))
                         .test_support()
                     }))
-                    .child(div().flex_1()),
+                    .child(div().flex_1())
+                    .child(
+                        control("chart-zoom-out", "−", false)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chart
+                                    .update(cx, |chart, cx| chart.zoom_step(false, cx));
+                            }))
+                            .test_support(),
+                    )
+                    .child(
+                        control("chart-zoom-in", "+", false)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chart.update(cx, |chart, cx| chart.zoom_step(true, cx));
+                            }))
+                            .test_support(),
+                    )
+                    .child(
+                        control("chart-reset", "复位", false)
+                            .flex_shrink_0()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.chart.update(cx, |chart, cx| chart.reset(cx));
+                            }))
+                            .test_support(),
+                    ),
             )
+            .child(div().flex_1().min_h_0().child(self.chart.clone()))
             .into_any_element()
     }
 
     fn quote(&self) -> AnyElement {
         let q = market::quote(self.symbol, self.tick);
+        let price_color = |price| movement(price - q.previous_close);
         div()
             .id("quote-scroll")
             .size_full()
             .overflow_y_scroll()
-            .p_3()
             .child(
                 div()
+                    .px_2()
+                    .h(px(28.))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(14.))
-                            .child(self.symbol.name()),
-                    )
-                    .child(div().text_color(rgb(MUTED)).child(format!(
-                        "{} · {}",
-                        self.symbol.code(),
-                        self.symbol.market()
-                    ))),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .gap_3()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
                     .text_color(movement(q.change))
                     .child(
                         div()
-                            .text_size(px(31.))
-                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("{:.3}", q.price)),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(format!("{:+.3}", q.change))
-                            .child(format!("{:+.2}%", q.change_pct)),
-                    ),
+                    .child(format!("{:+.3}  {:+.2}%", q.change, q.change_pct)),
             )
             .child(
                 div()
-                    .mt_1()
-                    .mb_3()
-                    .text_size(px(10.))
-                    .text_color(rgb(MUTED))
-                    .child(format!(
-                        "{}模拟时段  ·  本地回放",
-                        if self.symbol.market() == "HK" {
-                            "港股"
-                        } else {
-                            "美股"
-                        }
+                    .px_2()
+                    .py_1()
+                    .child(metric_colored(
+                        "最高",
+                        format!("{:.3}", q.high),
+                        price_color(q.high),
+                        "开盘",
+                        format!("{:.3}", q.open),
+                        price_color(q.open),
+                    ))
+                    .child(metric_colored(
+                        "最低",
+                        format!("{:.3}", q.low),
+                        price_color(q.low),
+                        "昨收",
+                        format!("{:.3}", q.previous_close),
+                        rgb(INK),
+                    ))
+                    .child(metric(
+                        "成交量",
+                        compact(q.volume as f64),
+                        "成交额",
+                        compact(q.turnover),
+                    ))
+                    .child(metric(
+                        "量比",
+                        format!("{:.2}", q.volume_ratio),
+                        "换手率",
+                        format!("{:.2}%", q.turnover_rate),
+                    ))
+                    .child(metric(
+                        "振幅",
+                        format!("{:.2}%", (q.high - q.low) / q.previous_close * 100.),
+                        "均价",
+                        format!("{:.3}", q.turnover / q.volume.max(1) as f64),
+                    ))
+                    .child(metric("涨停", "—".into(), "跌停", "—".into()))
+                    .child(metric_colored(
+                        "主动买",
+                        compact(q.buy_volume as f64),
+                        rgb(RED),
+                        "主动卖",
+                        compact(q.sell_volume as f64),
+                        rgb(TEAL),
+                    ))
+                    .child(metric(
+                        "市盈(TTM)",
+                        format!("{:.2}", q.pe_ttm),
+                        "每股盈利",
+                        format!("{:.3}", q.price / q.pe_ttm),
+                    ))
+                    .child(metric(
+                        "总市值",
+                        compact(q.market_cap),
+                        "流通值",
+                        compact(q.float_market_cap),
+                    ))
+                    .child(metric(
+                        "总股本",
+                        compact(q.total_shares as f64),
+                        "流通股",
+                        compact(q.float_shares as f64),
                     )),
             )
-            .child(metric(
-                "今开",
-                format!("{:.3}", q.open),
-                "昨收",
-                format!("{:.3}", q.previous_close),
-            ))
-            .child(metric(
-                "最高",
-                format!("{:.3}", q.high),
-                "最低",
-                format!("{:.3}", q.low),
-            ))
-            .child(metric(
-                "成交量",
-                compact(q.volume as f64),
-                "成交额",
-                compact(q.turnover),
-            ))
-            .child(metric(
-                "振幅",
-                format!("{:.2}%", (q.high - q.low) / q.previous_close * 100.),
-                "总市值",
-                compact(q.market_cap),
-            ))
-            .child(metric(
-                "均价",
-                format!("{:.3}", q.turnover / q.volume.max(1) as f64),
-                "计价",
-                currency(self.symbol).into(),
-            ))
             .child(
                 div()
-                    .mt_3()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(0xf5f8fb))
-                    .text_size(px(11.))
+                    .px_2()
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(10.))
                     .text_color(rgb(MUTED))
-                    .child("本页展示确定性模拟行情，所有联动面板使用相同股票与回放时点。"),
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .child(format!("{} · 量 / 股本：股 · 模拟", currency(self.symbol))),
             )
             .into_any_element()
     }
 
-    fn order_book(&self) -> AnyElement {
+    fn order_book(&self, cx: &mut Context<Self>) -> AnyElement {
         let (bids, asks) = market::order_book(self.symbol, self.tick);
         let buy_total: u64 = bids.iter().map(|l| l.size).sum();
         let sell_total: u64 = asks.iter().map(|l| l.size).sum();
@@ -687,27 +795,132 @@ impl PanelContent {
             .map(|l| l.size)
             .max()
             .unwrap_or(1) as f32;
+        let pending: Vec<_> = market::market_orders(self.symbol, self.tick)
+            .into_iter()
+            .filter(|order| order.canceled_at.is_none())
+            .collect();
+        let q = market::quote(self.symbol, self.tick);
+        let mut depth = div()
+            .id("book-scroll")
+            .flex_1()
+            .min_h(px(40.))
+            .overflow_scroll();
+        if self.book_queue {
+            let max = pending.iter().map(|order| order.size).max().unwrap_or(1) as f32;
+            depth = depth
+                .child(dense_columns(
+                    &[
+                        ("方向", 36.),
+                        ("价格", 75.),
+                        ("委托量（股）", 95.),
+                        ("时间", 70.),
+                    ],
+                    true,
+                ))
+                .children(pending.iter().map(|order| {
+                    div()
+                        .h(px(20.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(rgb(0xf3f5f7))
+                        .child(
+                            div()
+                                .w(px(36.))
+                                .flex_shrink_0()
+                                .text_color(rgb(if order.buy { RED } else { TEAL }))
+                                .child(if order.buy { "买" } else { "卖" }),
+                        )
+                        .child(
+                            div()
+                                .w(px(75.))
+                                .flex_shrink_0()
+                                .child(format!("{:.3}", order.price)),
+                        )
+                        .child(amount_cell(
+                            order.size as f64,
+                            order.size as f32 / max,
+                            if order.buy { RED } else { TEAL },
+                            95.,
+                        ))
+                        .child(
+                            div()
+                                .w(px(70.))
+                                .text_right()
+                                .text_color(rgb(MUTED))
+                                .child(order.time.clone()),
+                        )
+                }));
+        } else {
+            depth = depth
+                .child(book_section("卖盘", TEAL))
+                .children(asks.iter().enumerate().map(|(index, level)| {
+                    book_row(
+                        format!("卖 {}", index + 1),
+                        level.price,
+                        level.size,
+                        max_size,
+                        TEAL,
+                    )
+                }))
+                .child(book_section("买盘", RED))
+                .children(bids.iter().enumerate().map(|(index, level)| {
+                    book_row(
+                        format!("买 {}", index + 1),
+                        level.price,
+                        level.size,
+                        max_size,
+                        RED,
+                    )
+                }));
+        }
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(32.))
-                    .px_3()
+                    .h(px(24.))
+                    .px_1()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(
+                        control("book-depth", "买卖十档", !self.book_queue)
+                            .py(px(2.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.book_queue = false;
+                                cx.notify();
+                            }))
+                            .test_support(),
+                    )
+                    .child(
+                        control("book-queue", "委托队列", self.book_queue)
+                            .py(px(2.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.book_queue = true;
+                                cx.notify();
+                            }))
+                            .test_support(),
+                    )
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(format!("{} 十档盘口", self.symbol.code())),
-                    )
-                    .child(badge("模拟")),
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(format!("股 · {}", currency(self.symbol))),
+                    ),
             )
             .child(
                 div()
-                    .px_3()
+                    .px_2()
+                    .h(px(18.))
+                    .items_center()
+                    .flex_shrink_0()
                     .flex()
                     .justify_between()
                     .text_size(px(11.))
@@ -724,10 +937,9 @@ impl PanelContent {
             )
             .child(
                 div()
-                    .mx_3()
-                    .mt_1()
-                    .mb_2()
-                    .h(px(3.))
+                    .mx_2()
+                    .h(px(2.))
+                    .flex_shrink_0()
                     .flex()
                     .bg(rgb(TEAL))
                     .child(div().h_full().w(relative(ratio)).bg(rgb(RED))),
@@ -735,10 +947,9 @@ impl PanelContent {
             .child(
                 div()
                     .id("best-bid-ask")
-                    .mx_3()
-                    .mb_1()
+                    .mx_2()
                     .flex_shrink_0()
-                    .h(px(27.))
+                    .h(px(20.))
                     .flex()
                     .items_center()
                     .child(
@@ -752,8 +963,7 @@ impl PanelContent {
                             .bg(rgb(0xffeff3))
                             .text_color(rgb(RED))
                             .child("买一")
-                            .child(format!("{:.3}", bids[0].price))
-                            .child(div().text_size(px(10.)).child(bids[0].size.to_string())),
+                            .child(format!("{:.3}", bids[0].price)),
                     )
                     .child(
                         div()
@@ -766,69 +976,73 @@ impl PanelContent {
                             .bg(rgb(0xe8f8f5))
                             .text_color(rgb(TEAL))
                             .child("卖一")
-                            .child(format!("{:.3}", asks[0].price))
-                            .child(div().text_size(px(10.)).child(asks[0].size.to_string())),
+                            .child(format!("{:.3}", asks[0].price)),
                     )
                     .test_support(),
             )
+            .when(!self.book_queue, |d| {
+                d.child(
+                    div()
+                        .h(px(20.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .text_color(rgb(MUTED))
+                        .border_b_1()
+                        .border_color(rgb(LINE))
+                        .child(div().w(px(36.)).child("档位"))
+                        .child(div().flex_1().text_right().child("价格"))
+                        .child(div().w(px(90.)).text_right().child("数量（股）")),
+                )
+            })
+            .child(depth)
             .child(
                 div()
-                    .h(px(24.))
-                    .px_3()
+                    .px_2()
+                    .h(px(18.))
+                    .items_center()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .flex_shrink_0()
+                    .text_size(px(11.))
                     .flex()
-                    .text_color(rgb(MUTED))
-                    .child(div().w(px(40.)).child("档位"))
-                    .child(div().flex_1().text_right().child("价格"))
-                    .child(div().w(px(90.)).text_right().child("数量")),
-            )
-            .child(
-                div()
-                    .id("book-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(asks.iter().enumerate().rev().map(|(index, level)| {
-                        book_row(
-                            format!("卖 {}", index + 1),
-                            level.price,
-                            level.size,
-                            max_size,
-                            TEAL,
-                        )
-                    }))
-                    .child(div().mx_3().my_1().border_t_1().border_color(rgb(LINE)))
-                    .children(bids.iter().enumerate().map(|(index, level)| {
-                        book_row(
-                            format!("买 {}", index + 1),
-                            level.price,
-                            level.size,
-                            max_size,
-                            RED,
-                        )
-                    })),
+                    .justify_between()
+                    .child(format!("均价 {:.3}", q.turnover / q.volume.max(1) as f64))
+                    .child(
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child(format!("挂单 {} 笔", pending.len())),
+                    ),
             )
             .into_any_element()
     }
 
     fn trades(&self) -> AnyElement {
-        let trades = market::trades(self.symbol, self.tick);
+        let q = market::quote(self.symbol, self.tick);
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(29.))
-                    .px_3()
+                    .h(px(20.))
+                    .px_2()
                     .flex()
                     .items_center()
+                    .flex_shrink_0()
                     .text_color(rgb(MUTED))
                     .border_b_1()
                     .border_color(rgb(LINE))
-                    .child(div().w(px(62.)).child("时间"))
-                    .child(div().flex_1().text_right().child("成交价"))
-                    .child(div().w(px(60.)).text_right().child("股数"))
-                    .child(div().w(px(45.)).text_right().child("方向")),
+                    .child(div().w(px(58.)).child("时间"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_right()
+                            .child(format!("价格 {}", currency(self.symbol))),
+                    )
+                    .child(div().w(px(62.)).text_right().child("量（股）"))
+                    .child(div().w(px(32.)).text_right().child("笔数")),
             )
             .child(
                 div()
@@ -836,29 +1050,336 @@ impl PanelContent {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(trades.into_iter().map(|trade| {
+                    .children(
+                        market::trades(self.symbol, self.tick)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, trade)| {
+                                div()
+                                    .h(px(20.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .bg(rgb(if index % 5 == 0 { 0xf5f8fb } else { 0xffffff }))
+                                    .child(
+                                        div().w(px(58.)).text_color(rgb(MUTED)).child(trade.time),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_right()
+                                            .text_color(movement(trade.price - q.previous_close))
+                                            .child(format!("{:.3}", trade.price)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(62.))
+                                            .text_right()
+                                            .text_color(rgb(if trade.buy { RED } else { TEAL }))
+                                            .child(trade.size.to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(32.))
+                                            .text_right()
+                                            .text_color(rgb(MUTED))
+                                            .child(trade.count.to_string()),
+                                    )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn trade_details(&self, cx: &mut Context<Self>) -> AnyElement {
+        let executions: Vec<_> = market::executions(self.symbol, self.tick)
+            .into_iter()
+            .filter(|trade| !self.large_trades_only || trade.amount >= 100_000.)
+            .collect();
+        let max = executions
+            .iter()
+            .map(|trade| {
+                trade
+                    .amount
+                    .max(trade.buy_order_amount)
+                    .max(trade.sell_order_amount)
+            })
+            .fold(1., f64::max);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(24.))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(
+                        control("flow-all", "全部成交", !self.large_trades_only)
+                            .py(px(2.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.large_trades_only = false;
+                                cx.notify();
+                            }))
+                            .test_support(),
+                    )
+                    .child(
+                        control("flow-large", "大单 ≥ 10万", self.large_trades_only)
+                            .py(px(2.))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.large_trades_only = true;
+                                cx.notify();
+                            }))
+                            .test_support(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("executions-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .child(
                         div()
-                            .h(px(26.))
-                            .px_3()
+                            .min_w(px(354.))
+                            .child(dense_columns(
+                                &[
+                                    ("时间", 64.),
+                                    ("价格", 66.),
+                                    ("金额", 76.),
+                                    ("买单", 66.),
+                                    ("卖单", 66.),
+                                ],
+                                true,
+                            ))
+                            .when(executions.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .p_3()
+                                        .text_color(rgb(MUTED))
+                                        .child("当前没有满足条件的成交"),
+                                )
+                            })
+                            .children(executions.iter().map(|trade| {
+                                div()
+                                    .h(px(20.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .border_b_1()
+                                    .border_color(rgb(0xf3f5f7))
+                                    .child(
+                                        div()
+                                            .w(px(64.))
+                                            .flex_shrink_0()
+                                            .text_color(rgb(MUTED))
+                                            .child(trade.time.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(66.))
+                                            .flex_shrink_0()
+                                            .text_right()
+                                            .text_color(rgb(if trade.buy { RED } else { TEAL }))
+                                            .child(format!("{:.3}", trade.price)),
+                                    )
+                                    .child(amount_cell(
+                                        trade.amount,
+                                        (trade.amount / max) as f32,
+                                        if trade.buy { RED } else { TEAL },
+                                        76.,
+                                    ))
+                                    .child(amount_cell(
+                                        trade.buy_order_amount,
+                                        (trade.buy_order_amount / max) as f32,
+                                        RED,
+                                        66.,
+                                    ))
+                                    .child(amount_cell(
+                                        trade.sell_order_amount,
+                                        (trade.sell_order_amount / max) as f32,
+                                        TEAL,
+                                        66.,
+                                    ))
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .child(format!(
+                        "{} · {} 笔 · 买单 / 卖单为对应委托金额",
+                        currency(self.symbol),
+                        executions.len()
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn filter_snapshot(&self, cx: &App) -> OrderFilterSnapshot {
+        OrderFilterSnapshot {
+            enabled: self.filter_enabled,
+            min_amount: self.min_amount.read(cx).value().to_string(),
+            max_amount: self.max_amount.read(cx).value().to_string(),
+            min_quantity: self.min_quantity.read(cx).value().to_string(),
+            max_quantity: self.max_quantity.read(cx).value().to_string(),
+            direction: self.filter_direction,
+        }
+    }
+
+    fn order_details(&self, cx: &mut Context<Self>) -> AnyElement {
+        let filter = self.filter_snapshot(cx);
+        let range = OrderRange::parse(&filter);
+        let orders: Vec<_> = market::market_orders(self.symbol, self.tick)
+            .into_iter()
+            .filter(|order| {
+                (filter.direction == 0 || (filter.direction == 1) == order.buy)
+                    && (!filter.enabled || range.as_ref().is_ok_and(|range| range.contains(order)))
+            })
+            .collect();
+        let pending: Vec<_> = orders
+            .iter()
+            .filter(|order| order.canceled_at.is_none())
+            .collect();
+        let canceled: Vec<_> = orders
+            .iter()
+            .filter(|order| order.canceled_at.is_some())
+            .collect();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("order-filter-toolbar")
+                    .px_1()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .flex_wrap()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(
+                        control(
+                            "market-filter-enabled",
+                            if self.filter_enabled {
+                                "☑ 筛选"
+                            } else {
+                                "☐ 筛选"
+                            },
+                            self.filter_enabled,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.filter_enabled = !this.filter_enabled;
+                            cx.notify();
+                        }))
+                        .test_support(),
+                    )
+                    .child(
+                        div()
+                            .px_1()
+                            .text_color(rgb(MUTED))
+                            .child(format!("金额（万 {}）", currency(self.symbol))),
+                    )
+                    .child(
+                        Input::new(&self.min_amount)
+                            .id("market-min-amount")
+                            .small()
+                            .w(px(66.)),
+                    )
+                    .child("–")
+                    .child(
+                        Input::new(&self.max_amount)
+                            .id("market-max-amount")
+                            .small()
+                            .w(px(66.)),
+                    )
+                    .child(div().px_1().text_color(rgb(MUTED)).child("数量（股）"))
+                    .child(
+                        Input::new(&self.min_quantity)
+                            .id("market-min-quantity")
+                            .small()
+                            .w(px(66.)),
+                    )
+                    .child("–")
+                    .child(
+                        Input::new(&self.max_quantity)
+                            .id("market-max-quantity")
+                            .small()
+                            .w(px(66.)),
+                    )
+                    .children([(0, "全部"), (1, "买单"), (2, "卖单")].into_iter().map(
+                        |(direction, label)| {
+                            control(
+                                SharedString::from(format!("market-direction-{direction}")),
+                                label,
+                                self.filter_direction == direction,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.filter_direction = direction;
+                                cx.notify();
+                            }))
+                            .test_support()
+                        },
+                    )),
+            )
+            .when(self.filter_enabled && range.is_err(), |d| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(RED))
+                        .child(range.as_ref().unwrap_err().to_string()),
+                )
+            })
+            .child(
+                div()
+                    .id("market-orders-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .h_full()
+                            .min_w(px(970.))
                             .flex()
-                            .items_center()
-                            .child(div().w(px(62.)).text_color(rgb(MUTED)).child(trade.time))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_right()
-                                    .text_color(rgb(if trade.buy { RED } else { TEAL }))
-                                    .child(format!("{:.3}", trade.price)),
-                            )
-                            .child(div().w(px(60.)).text_right().child(trade.size.to_string()))
-                            .child(
-                                div()
-                                    .w(px(45.))
-                                    .text_right()
-                                    .text_color(rgb(if trade.buy { RED } else { TEAL }))
-                                    .child(if trade.buy { "买 ↑" } else { "卖 ↓" }),
-                            )
-                    })),
+                            .child(order_detail_table(
+                                "pending-market-orders",
+                                "挂单",
+                                &pending,
+                                false,
+                            ))
+                            .child(order_detail_table(
+                                "canceled-market-orders",
+                                "撤单",
+                                &canceled,
+                                true,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("市场委托为模拟数据 · 本地账户委托请查看“当日订单”"),
             )
             .into_any_element()
     }
@@ -1320,8 +1841,10 @@ impl Render for PanelContent {
             PanelKind::Watchlist => self.watchlist(cx),
             PanelKind::Chart => self.chart(cx),
             PanelKind::Quote => self.quote(),
-            PanelKind::OrderBook => self.order_book(),
+            PanelKind::OrderBook => self.order_book(cx),
             PanelKind::Trades => self.trades(),
+            PanelKind::TradeDetails => self.trade_details(cx),
+            PanelKind::OrderDetails => self.order_details(cx),
             PanelKind::News => self.news(cx),
             PanelKind::OrderEntry => self.order_entry(cx),
             PanelKind::Orders => self.orders(cx),
@@ -1390,37 +1913,229 @@ fn compact(value: f64) -> String {
     }
 }
 fn metric(left: &'static str, left_value: String, right: &'static str, right_value: String) -> Div {
-    div()
-        .h(px(28.))
-        .flex()
-        .items_center()
-        .gap_3()
-        .child(
+    metric_colored(left, left_value, rgb(INK), right, right_value, rgb(INK))
+}
+fn metric_colored(
+    left: &'static str,
+    left_value: String,
+    left_color: Rgba,
+    right: &'static str,
+    right_value: String,
+    right_color: Rgba,
+) -> Div {
+    div().h(px(20.)).flex().items_center().gap_2().children(
+        [
+            (left, left_value, left_color),
+            (right, right_value, right_color),
+        ]
+        .into_iter()
+        .map(|(label, value, color)| {
             div()
                 .flex_1()
+                .min_w_0()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_1()
-                .child(div().text_color(rgb(MUTED)).child(left))
-                .child(left_value),
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(label))
+                .child(div().min_w_0().truncate().text_color(color).child(value))
+        }),
+    )
+}
+fn book_section(title: &'static str, color: u32) -> Div {
+    div()
+        .h(px(17.))
+        .px_2()
+        .flex()
+        .items_center()
+        .bg(rgb(0xf7f9fb))
+        .text_size(px(10.))
+        .text_color(rgb(color))
+        .border_t_1()
+        .border_color(rgb(LINE))
+        .child(title)
+}
+fn dense_columns(columns: &[(&'static str, f32)], right: bool) -> Div {
+    div()
+        .h(px(20.))
+        .px_2()
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .bg(rgb(0xf5f7fa))
+        .border_b_1()
+        .border_color(rgb(LINE))
+        .text_color(rgb(MUTED))
+        .children(columns.iter().enumerate().map(|(index, (title, width))| {
+            div()
+                .w(px(*width))
+                .flex_shrink_0()
+                .when(right && index > 0, |d| d.text_right())
+                .child(*title)
+        }))
+}
+fn amount_cell(amount: f64, ratio: f32, color: u32, width: f32) -> Div {
+    div()
+        .relative()
+        .w(px(width))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_end()
+        .px_1()
+        .child(
+            div()
+                .absolute()
+                .right_0()
+                .top(px(2.))
+                .bottom(px(2.))
+                .w(relative(ratio.clamp(0., 1.)))
+                .bg(rgb(color))
+                .opacity(0.10),
         )
         .child(
             div()
-                .flex_1()
+                .relative()
+                .text_color(rgb(color))
+                .child(if amount == 0. {
+                    "—".into()
+                } else {
+                    compact(amount)
+                }),
+        )
+}
+fn order_detail_table(
+    id: &'static str,
+    title: &'static str,
+    orders: &[&market::MarketOrder],
+    canceled: bool,
+) -> Div {
+    let max = orders.iter().map(|order| order.amount).fold(1., f64::max);
+    div()
+        .h_full()
+        .flex_1()
+        .min_w(px(480.))
+        .flex()
+        .flex_col()
+        .border_r_1()
+        .border_color(rgb(LINE))
+        .child(
+            div()
+                .h(px(22.))
+                .px_2()
                 .flex()
                 .items_center()
                 .justify_between()
-                .gap_1()
-                .child(div().text_color(rgb(MUTED)).child(right))
-                .child(right_value),
+                .flex_shrink_0()
+                .bg(rgb(0xf2f6fa))
+                .child(div().font_weight(FontWeight::MEDIUM).child(title))
+                .child(
+                    div()
+                        .text_color(rgb(MUTED))
+                        .child(format!("{} 笔", orders.len())),
+                ),
+        )
+        .child(dense_columns(
+            &[
+                (
+                    if canceled {
+                        "撤单时间"
+                    } else {
+                        "委托时间"
+                    },
+                    65.,
+                ),
+                ("方向", 40.),
+                ("委托价格", 70.),
+                ("股数", 60.),
+                ("委托金额", 85.),
+                (if canceled { "委托时间" } else { "状态" }, 90.),
+            ],
+            false,
+        ))
+        .child(
+            div()
+                .id(id)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .when(orders.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .p_3()
+                            .text_color(rgb(MUTED))
+                            .child("没有满足条件的委托"),
+                    )
+                })
+                .children(orders.iter().map(|order| {
+                    let color = if order.buy { RED } else { TEAL };
+                    div()
+                        .h(px(20.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(rgb(0xf0f3f6))
+                        .child(
+                            div()
+                                .w(px(65.))
+                                .flex_shrink_0()
+                                .text_color(rgb(MUTED))
+                                .child(order.canceled_at.as_ref().unwrap_or(&order.time).clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(40.))
+                                .flex_shrink_0()
+                                .text_color(rgb(color))
+                                .child(match (canceled, order.buy) {
+                                    (true, true) => "撤买",
+                                    (true, false) => "撤卖",
+                                    (false, true) => "委买",
+                                    (false, false) => "委卖",
+                                }),
+                        )
+                        .child(
+                            div()
+                                .w(px(70.))
+                                .flex_shrink_0()
+                                .text_color(rgb(color))
+                                .child(format!("{:.3}", order.price)),
+                        )
+                        .child(
+                            div()
+                                .w(px(60.))
+                                .flex_shrink_0()
+                                .text_color(rgb(color))
+                                .child(order.size.to_string()),
+                        )
+                        .child(amount_cell(
+                            order.amount,
+                            (order.amount / max) as f32,
+                            color,
+                            85.,
+                        ))
+                        .child(
+                            div()
+                                .w(px(90.))
+                                .flex_shrink_0()
+                                .px_2()
+                                .text_color(rgb(MUTED))
+                                .child(if canceled {
+                                    order.time.clone()
+                                } else {
+                                    "排队中".into()
+                                }),
+                        )
+                })),
         )
 }
 fn book_row(label: String, price: f64, quantity: u64, max: f32, color: u32) -> Div {
     div()
         .relative()
-        .h(px(25.))
-        .mx_3()
+        .h(px(20.))
+        .mx_2()
         .flex()
         .items_center()
         .child(
@@ -1433,7 +2148,7 @@ fn book_row(label: String, price: f64, quantity: u64, max: f32, color: u32) -> D
                 .bg(rgb(color))
                 .opacity(0.07),
         )
-        .child(div().w(px(40.)).text_color(rgb(color)).child(label))
+        .child(div().w(px(36.)).text_color(rgb(color)).child(label))
         .child(
             div()
                 .flex_1()
@@ -1611,9 +2326,131 @@ pub(crate) fn smoke_demo_orders(cx: &mut HeadlessAppContext) -> anyhow::Result<(
     result
 }
 
+/// Exercise the reference panel controls through real GPUI input events.
+#[cfg(feature = "test-support")]
+pub(crate) fn smoke_market_panels(cx: &mut HeadlessAppContext) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    use gpui_kit::test::TestWindowExt;
+    let mut handles = Vec::new();
+    let result = (|| -> anyhow::Result<()> {
+        let mut open = |kind| -> anyhow::Result<(AnyWindowHandle, Entity<PanelContent>)> {
+            let result = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(50.), px(50.)),
+                            size(px(1100.), px(560.)),
+                        ))),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        cx.new(|cx| {
+                            PanelContent::new(kind, Symbol::Aapl, Period::Intraday, window, cx)
+                        })
+                    },
+                )
+            })?;
+            handles.push(result.0);
+            Ok(result)
+        };
+        let (details, details_view) = open(PanelKind::OrderDetails)?;
+        let (flow, flow_view) = open(PanelKind::TradeDetails)?;
+        let (book, book_view) = open(PanelKind::OrderBook)?;
+        for handle in &handles {
+            cx.update_window(*handle, |_, window, cx| window.render_frame(cx))?;
+        }
+        cx.update_window(details, |_, window, cx| {
+            ensure!(
+                window.find("market-min-amount").visible(),
+                "Market amount filter is not visible"
+            );
+            window.click("market-min-amount", cx);
+            window.input("5", cx);
+            window.click("market-max-amount", cx);
+            window.input("20", cx);
+            window.click("market-min-quantity", cx);
+            window.input("100", cx);
+            window.click("market-direction-1", cx);
+            window.click("market-filter-enabled", cx);
+            let snapshot = details_view.read(cx).snapshot(cx);
+            ensure!(
+                snapshot["order_filter"]["enabled"] == true,
+                "Market filter did not toggle"
+            );
+            ensure!(
+                snapshot["order_filter"]["min_amount"] == "5",
+                "Market amount input not saved"
+            );
+            ensure!(
+                snapshot["order_filter"]["max_amount"] == "20",
+                "Market amount upper bound not saved"
+            );
+            ensure!(
+                snapshot["order_filter"]["min_quantity"] == "100",
+                "Market quantity input not saved"
+            );
+            ensure!(
+                snapshot["order_filter"]["direction"] == 1,
+                "Market direction did not change"
+            );
+            // Rebuilding the content, as a cross-window move does, must keep the filters.
+            let restored = cx.new(|cx| {
+                PanelContent::new(
+                    PanelKind::OrderDetails,
+                    Symbol::Aapl,
+                    Period::Intraday,
+                    window,
+                    cx,
+                )
+            });
+            restored.update(cx, |view, cx| view.restore(&snapshot, window, cx));
+            ensure!(
+                restored.read(cx).snapshot(cx) == snapshot,
+                "Market filter snapshot failed to restore"
+            );
+            Ok::<_, anyhow::Error>(())
+        })??;
+        cx.update_window(flow, |_, window, cx| {
+            window.click("flow-large", cx);
+            ensure!(
+                flow_view.read(cx).snapshot(cx)["large_trades_only"] == true,
+                "Large execution filter did not change"
+            );
+            window.click("flow-all", cx);
+            ensure!(
+                flow_view.read(cx).snapshot(cx)["large_trades_only"] == false,
+                "Execution filter did not reset"
+            );
+            Ok::<_, anyhow::Error>(())
+        })??;
+        cx.update_window(book, |_, window, cx| {
+            window.click("book-queue", cx);
+            ensure!(
+                book_view.read(cx).snapshot(cx)["book_queue"] == true,
+                "Book queue toggle did not change"
+            );
+            window.click("book-depth", cx);
+            ensure!(
+                book_view.read(cx).snapshot(cx)["book_queue"] == false,
+                "Book depth toggle did not reset"
+            );
+            Ok::<_, anyhow::Error>(())
+        })??;
+        println!(
+            "PASS: market order amount/quantity/direction filters, restored filter state, large execution filter and order-book queue controls"
+        );
+        Ok(())
+    })();
+    for handle in handles {
+        let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DemoBroker, OrderStatus, Side};
+    use super::{ContentSnapshot, DemoBroker, OrderFilterSnapshot, OrderRange, OrderStatus, Side};
     use crate::market::Symbol;
 
     #[test]
@@ -1639,5 +2476,54 @@ mod tests {
         assert_eq!(broker.usd, 120_400.);
         assert!(broker.orders.iter().find(|o| o.id == id).unwrap().status == OrderStatus::Filled);
         assert!(broker.submit(Symbol::Aapl, Side::Buy, f64::NAN, 1).is_err());
+    }
+    #[test]
+    fn legacy_content_snapshots_keep_their_values_and_default_new_filters() {
+        let saved: ContentSnapshot = serde_json::from_value(serde_json::json!({
+            "query": "AAPL", "price": "340.00", "quantity": "250", "side": "Sell",
+            "sort": 2, "chart": {"bars_visible": 70, "offset_from_latest": 9}
+        }))
+        .unwrap();
+        assert_eq!(saved.price, "340.00");
+        assert_eq!(saved.quantity, "250");
+        assert_eq!(saved.chart.bars_visible, 70);
+        assert_eq!(saved.chart.offset_from_latest, 9);
+        assert!(!saved.order_filter.enabled);
+        assert!(saved.order_filter.min_amount.is_empty());
+        assert!(!saved.large_trades_only && !saved.book_queue);
+    }
+
+    #[test]
+    fn market_order_filters_apply_currency_units_and_inclusive_boundaries() {
+        let mut order = crate::market::market_orders(Symbol::Aapl, 0).remove(0);
+        order.amount = 200_000.;
+        order.size = 100;
+        let mut filter = OrderFilterSnapshot {
+            min_amount: "20".into(),
+            max_amount: "20".into(),
+            min_quantity: "100".into(),
+            max_quantity: "100".into(),
+            ..Default::default()
+        };
+        assert!(OrderRange::parse(&filter).unwrap().contains(&order));
+        order.amount += 0.01;
+        assert!(!OrderRange::parse(&filter).unwrap().contains(&order));
+        order.amount = 200_000.;
+        order.size = 101;
+        assert!(!OrderRange::parse(&filter).unwrap().contains(&order));
+        filter.min_amount = "21".into();
+        assert!(OrderRange::parse(&filter).is_err());
+        for invalid in ["NaN", "inf", "-1", "abc", "1e308"] {
+            filter.min_amount = invalid.into();
+            assert!(
+                OrderRange::parse(&filter).is_err(),
+                "Accepted invalid filter {invalid}"
+            );
+        }
+        assert!(
+            OrderRange::parse(&OrderFilterSnapshot::default())
+                .unwrap()
+                .contains(&order)
+        );
     }
 }

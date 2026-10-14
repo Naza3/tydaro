@@ -7,7 +7,7 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        Placement, Sizable, Theme, ThemeMode,
+        Disableable, Placement, Sizable, Theme, ThemeMode,
         button::{Button, ButtonVariants},
         dock::*,
         menu::{DropdownMenu, PopupMenu, PopupMenuItem},
@@ -244,7 +244,7 @@ impl Panel for StockPanel {
                             .id(("transfer-grip", id))
                             .px_2()
                             .cursor_grab()
-                            .child("⠿")
+                            .child("⠿ 拖动")
                             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                                 window.focus(&focus, cx);
                                 let point = transfer::screen_point(window, event.position);
@@ -259,32 +259,43 @@ impl Panel for StockPanel {
         &mut self,
         mut menu: PopupMenu,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> PopupMenu {
         let id = self.model.id;
         let owner = self.owner;
+        let locked = is_locked(owner, cx);
         menu = menu
             .item(
-                PopupMenuItem::new("弹出为独立窗口").on_click(move |_, _, cx| {
-                    cx.defer(move |cx| {
-                        let r = detach(id, None, cx);
-                        report(r, cx);
-                    });
-                }),
+                PopupMenuItem::new("弹出为独立窗口")
+                    .disabled(locked)
+                    .on_click(move |_, _, cx| {
+                        cx.defer(move |cx| {
+                            let r = detach(id, None, cx);
+                            report(r, cx);
+                        });
+                    }),
             )
-            .item(PopupMenuItem::new("复制此组件").on_click(move |_, _, cx| {
-                cx.defer(move |cx| {
-                    let r = duplicate(id, cx);
-                    report(r, cx);
-                });
-            }));
+            .item(
+                PopupMenuItem::new("复制为独立组件")
+                    .disabled(locked)
+                    .on_click(move |_, _, cx| {
+                        cx.defer(move |cx| {
+                            let r = duplicate(id, cx);
+                            report(r, cx);
+                        });
+                    }),
+            );
         if owner != 0 {
-            menu = menu.item(PopupMenuItem::new("返回主窗口").on_click(move |_, _, cx| {
-                cx.defer(move |cx| {
-                    let r = move_between(id, 0, None, cx);
-                    report(r, cx);
-                });
-            }));
+            menu = menu.item(
+                PopupMenuItem::new("返回主窗口（标签）")
+                    .disabled(locked || is_locked(0, cx))
+                    .on_click(move |_, _, cx| {
+                        cx.defer(move |cx| {
+                            let r = move_between(id, 0, None, cx);
+                            report(r, cx);
+                        });
+                    }),
+            );
         }
         for group in 0..=3u8 {
             menu = menu.item(
@@ -308,13 +319,67 @@ impl Panel for StockPanel {
     }
 }
 impl Render for StockPanel {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = self.owner;
         let id = self.model.id;
+        let locked = is_locked(owner, cx);
+        let focus = self.focus.clone();
+        // This is an application drag surface, separate from the native titlebar
+        // (which moves the OS window and does not dispatch our docking events).
+        let heading = div()
+            .h(px(26.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(rgb(0xe8ecf0))
+            .bg(rgb(0xf5f6f8))
+            .child(
+                div()
+                    .id(format!("panel-drag-{id}"))
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .child(div().truncate().child(format!(
+                        "{} {}",
+                        self.model.symbol.code(),
+                        self.model.symbol.name()
+                    )))
+                    .when(!locked && cross_drag_available(), |d| {
+                        d.cursor_grab()
+                            .child(div().text_color(rgb(0x86929f)).child("⠿"))
+                            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                window.focus(&focus, cx);
+                                let point = transfer::screen_point(window, event.position);
+                                cx.global_mut::<Session>().drag.begin(owner, id, point);
+                                cx.stop_propagation();
+                            })
+                    }),
+            )
+            .when(owner != 0, |d| {
+                d.child(
+                    Button::new(format!("insert-panel-{id}"))
+                        .label("插入面板 ▾")
+                        .xsmall()
+                        .ghost()
+                        .disabled(locked)
+                        .dropdown_menu(move |menu, window, cx| {
+                            insertion_menu(menu, id, window, cx)
+                        }),
+                )
+            });
         div()
             .track_focus(&self.focus)
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .child(
                 canvas(
@@ -331,8 +396,104 @@ impl Render for StockPanel {
                 .left_0()
                 .size_full(),
             )
-            .child(self.content.clone())
+            .child(heading)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.content.clone()),
+            )
     }
+}
+
+fn is_locked(owner: u64, cx: &App) -> bool {
+    workspace(owner, cx).is_some_and(|w| w.read(cx).dock.read(cx).is_locked())
+}
+
+/// Exact placement is available on every platform, including Wayland and when
+/// a native floating window physically obscures the desired destination.
+fn insertion_menu(
+    mut menu: PopupMenu,
+    source: u64,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let mut targets: Vec<_> = cx
+        .global::<Session>()
+        .panels
+        .values()
+        .filter_map(WeakEntity::upgrade)
+        .filter_map(|p| {
+            let p = p.read(cx);
+            (p.model.id != source).then_some((p.owner, p.model.id, p.model.kind, p.model.symbol))
+        })
+        .collect();
+    targets.sort_by_key(|(owner, id, _, _)| (*owner, *id));
+    for (owner, id, kind, symbol) in targets {
+        let title = format!(
+            "{} · {} {} #{}",
+            if owner == 0 {
+                "主窗口".to_owned()
+            } else {
+                format!("窗口 {owner}")
+            },
+            kind.title(),
+            symbol.code(),
+            id
+        );
+        if is_locked(owner, cx) {
+            menu = menu.item(PopupMenuItem::new(format!("{title}（已锁定）")).disabled(true));
+            continue;
+        }
+        menu = menu.submenu(title, window, cx, move |mut menu, _, _| {
+            for (label, side) in [
+                ("← 插入左侧", DockSide::Left),
+                ("→ 插入右侧", DockSide::Right),
+                ("↑ 插入上方", DockSide::Top),
+                ("↓ 插入下方", DockSide::Bottom),
+                ("▣ 合并为标签", DockSide::Center),
+            ] {
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    cx.defer(move |cx| {
+                        let result = move_between(source, owner, Some((id, side)), cx);
+                        report(result, cx);
+                    });
+                }));
+            }
+            menu
+        });
+    }
+    let empty_windows: Vec<_> = cx
+        .global::<Session>()
+        .windows
+        .keys()
+        .copied()
+        .filter(|owner| {
+            !cx.global::<Session>()
+                .panels
+                .values()
+                .filter_map(WeakEntity::upgrade)
+                .any(|p| p.read(cx).owner == *owner)
+        })
+        .collect();
+    for owner in empty_windows {
+        menu = menu.item(
+            PopupMenuItem::new(if owner == 0 {
+                "插入空白主窗口".to_owned()
+            } else {
+                format!("插入空白窗口 {owner}")
+            })
+            .disabled(is_locked(owner, cx))
+            .on_click(move |_, _, cx| {
+                cx.defer(move |cx| {
+                    let result = move_between(source, owner, None, cx);
+                    report(result, cx);
+                })
+            }),
+        );
+    }
+    menu
 }
 fn cross_drag_available() -> bool {
     cfg!(target_os = "windows") || std::env::var_os("WAYLAND_DISPLAY").is_none()
@@ -470,8 +631,8 @@ fn default_layout(
         )
         .child(
             DockLayout::v_split()
-                .child(quote, Some(px(292.)))
-                .child(book, Some(px(220.)))
+                .child(quote, Some(px(320.)))
+                .child(book, Some(px(300.)))
                 .child(trades, None),
             Some(px(320.)),
         );
@@ -535,8 +696,8 @@ fn open_workspace_on_display(
                 ..Default::default()
             }),
             window_min_size: Some(size(
-                px(if id == 0 { 1024. } else { 420. }),
-                px(if id == 0 { 680. } else { 320. }),
+                px(if id == 0 { 1024. } else { 240. }),
+                px(if id == 0 { 680. } else { 240. }),
             )),
             ..Default::default()
         },
@@ -551,7 +712,10 @@ fn open_workspace_on_display(
 fn visible_bounds(b: [f32; 4], id: u64, cx: &App) -> Bounds<Pixels> {
     let mut result = Bounds::new(
         point(px(b[0]), px(b[1])),
-        size(px(b[2].max(420.)), px(b[3].max(320.))),
+        size(
+            px(b[2].max(if id == 0 { 1024. } else { 240. })),
+            px(b[3].max(if id == 0 { 680. } else { 240. })),
+        ),
     );
     let displays = cx.displays();
     if let Some(display) = displays.first()
@@ -569,7 +733,91 @@ fn visible_bounds(b: [f32; 4], id: u64, cx: &App) -> Bounds<Pixels> {
     }
     result
 }
-fn add_panel(owner: u64, kind: PanelKind, cx: &mut App) -> anyhow::Result<()> {
+fn floating_size(kind: PanelKind) -> [f32; 2] {
+    match kind {
+        PanelKind::Chart => [960., 700.],
+        PanelKind::Quote => [320., 390.],
+        PanelKind::OrderBook => [300., 650.],
+        PanelKind::Trades => [380., 580.],
+        PanelKind::TradeDetails => [400., 540.],
+        PanelKind::OrderDetails => [1020., 580.],
+        PanelKind::Watchlist => [360., 600.],
+        PanelKind::OrderEntry => [440., 580.],
+        _ => [760., 530.],
+    }
+}
+
+fn floating_placement(
+    owner: u64,
+    kind: PanelKind,
+    position: Option<ScreenPoint>,
+    cx: &mut App,
+) -> anyhow::Result<(Option<DisplayId>, [f32; 4])> {
+    let source = workspace(owner, cx).ok_or_else(|| anyhow::anyhow!("源窗口已关闭"))?;
+    let handle = source.read(cx).handle;
+    let (bounds, scale, display) = handle.update(cx, |_, window, cx| {
+        (
+            window.bounds(),
+            window.scale_factor(),
+            window.display(cx).map(|d| d.id()),
+        )
+    })?;
+    let [width, height] = floating_size(kind);
+    let (origin, display) = if let Some(position) = position {
+        transfer::detached_window_origin(position, scale, cx)
+    } else {
+        let cascade = (cx.global::<Session>().windows.len() % 6) as f32 * 24.;
+        (
+            bounds.origin + point(px(48. + cascade), px(48. + cascade)),
+            display,
+        )
+    };
+    Ok((
+        display,
+        [origin.x.as_f32(), origin.y.as_f32(), width, height],
+    ))
+}
+
+fn focus_panel(id: u64, cx: &mut App) {
+    if let Some(p) = panel(id, cx) {
+        let view = p.read(cx);
+        let focus = view.focus.clone();
+        if let Some(w) = workspace(view.owner, cx) {
+            let handle = w.read(cx).handle;
+            let _ = handle.update(cx, |_, window, cx| {
+                window.activate_window();
+                window.focus(&focus, cx);
+            });
+        }
+    }
+}
+
+/// All component creation paths use a native, focused destination so the new
+/// component cannot silently become an inactive tab in an unrelated group.
+fn create_floating(owner: u64, saved: SavedPanel, cx: &mut App) -> anyhow::Result<()> {
+    anyhow::ensure!(!is_locked(owner, cx), "布局已锁定，请先解锁");
+    let (display, bounds) = floating_placement(owner, saved.model.kind, None, cx)?;
+    let id = saved.model.id;
+    let destination = allocate(cx);
+    let w = open_workspace_on_display(destination, None, display, Some(bounds), cx)?;
+    let handle = w.read(cx).handle;
+    let dock = w.read(cx).dock.clone();
+    if let Err(error) = handle.update(cx, |_, window, cx| {
+        let p = StockPanel::create(destination, saved, window, cx);
+        dock.update(cx, |d, cx| {
+            d.add_panel_view(panel_handle(p), DockPlacement::Center, None, window, cx)
+        });
+    }) {
+        close_window(destination, cx);
+        return Err(error);
+    }
+    refresh_market(cx);
+    focus_panel(id, cx);
+    changed(cx);
+    Ok(())
+}
+
+pub(crate) fn add_panel(owner: u64, kind: PanelKind, cx: &mut App) -> anyhow::Result<()> {
     anyhow::ensure!(
         cx.global::<Session>()
             .panels
@@ -579,27 +827,41 @@ fn add_panel(owner: u64, kind: PanelKind, cx: &mut App) -> anyhow::Result<()> {
             < 128,
         "最多支持 128 个组件"
     );
-    let w = workspace(owner, cx).ok_or_else(|| anyhow::anyhow!("窗口已关闭"))?;
-    let handle = w.read(cx).handle;
-    let dock = w.read(cx).dock.clone();
+    anyhow::ensure!(!is_locked(owner, cx), "布局已锁定，请先解锁");
+    anyhow::ensure!(workspace(owner, cx).is_some(), "源窗口已关闭");
+    anyhow::ensure!(
+        cx.global::<Session>().windows.len() < 16,
+        "最多支持 16 个工作区窗口"
+    );
     let id = allocate(cx);
-    handle.update(cx, |_, window, cx| {
-        let p = StockPanel::create(
-            owner,
-            SavedPanel {
-                model: PanelModel::new(id, kind),
-                content: serde_json::Value::Null,
-            },
-            window,
-            cx,
-        );
-        dock.update(cx, |d, cx| {
-            d.add_panel_view(panel_handle(p), DockPlacement::Center, None, window, cx)
-        });
-    })?;
-    changed(cx);
-    Ok(())
+    let mut model = PanelModel::new(id, kind);
+    // Prefer the invoking workspace's linked market context. This remains
+    // deterministic with multiple independent groups and preserves duplication
+    // separately through its complete SavedPanel snapshot.
+    let context = cx
+        .global::<Session>()
+        .panels
+        .values()
+        .filter_map(WeakEntity::upgrade)
+        .filter_map(|p| {
+            let p = p.read(cx);
+            (p.owner == owner && p.model.link_group != 0).then(|| p.model.clone())
+        })
+        .min_by_key(|p| p.id);
+    if let Some(context) = context {
+        model.symbol = context.symbol;
+        model.link_group = context.link_group;
+    }
+    create_floating(
+        owner,
+        SavedPanel {
+            model,
+            content: serde_json::Value::Null,
+        },
+        cx,
+    )
 }
+
 fn duplicate(id: u64, cx: &mut App) -> anyhow::Result<()> {
     anyhow::ensure!(
         cx.global::<Session>()
@@ -612,19 +874,14 @@ fn duplicate(id: u64, cx: &mut App) -> anyhow::Result<()> {
     );
     let p = panel(id, cx).ok_or_else(|| anyhow::anyhow!("组件已关闭"))?;
     let owner = p.read(cx).owner;
+    anyhow::ensure!(!is_locked(owner, cx), "布局已锁定，请先解锁");
+    anyhow::ensure!(
+        cx.global::<Session>().windows.len() < 16,
+        "最多支持 16 个工作区窗口"
+    );
     let mut saved = p.read(cx).saved(cx);
     saved.model.id = allocate(cx);
-    let w = workspace(owner, cx).unwrap();
-    let handle = w.read(cx).handle;
-    let dock = w.read(cx).dock.clone();
-    handle.update(cx, |_, window, cx| {
-        let copy = StockPanel::create(owner, saved, window, cx);
-        dock.update(cx, |d, cx| {
-            d.add_panel_view(panel_handle(copy), DockPlacement::Center, None, window, cx)
-        });
-    })?;
-    changed(cx);
-    Ok(())
+    create_floating(owner, saved, cx)
 }
 fn dock_target(dock: &DockArea, target: Option<(u64, DockSide)>, cx: &App) -> Option<InsertTarget> {
     let (id, side) = target?;
@@ -657,10 +914,29 @@ pub(crate) fn move_between(
 ) -> anyhow::Result<()> {
     let p = panel(id, cx).ok_or_else(|| anyhow::anyhow!("组件已关闭"))?;
     let source = p.read(cx).owner;
+    anyhow::ensure!(
+        !is_locked(source, cx) && !is_locked(destination, cx),
+        "布局已锁定，请先解锁"
+    );
+    if let Some((target_id, _)) = target {
+        if target_id == id {
+            anyhow::ensure!(source == destination, "目标组件不属于目标窗口");
+            return Ok(());
+        }
+        let target_panel = panel(target_id, cx).ok_or_else(|| anyhow::anyhow!("目标组件已关闭"))?;
+        anyhow::ensure!(
+            target_panel.read(cx).owner == destination,
+            "目标组件已移动，请重新选择位置"
+        );
+    }
     let dest = workspace(destination, cx).ok_or_else(|| anyhow::anyhow!("目标窗口已关闭"))?;
     let dest_handle = dest.read(cx).handle;
     let dest_dock = dest.read(cx).dock.clone();
     let insertion = dock_target(dest_dock.read(cx), target, cx);
+    anyhow::ensure!(
+        target.is_none() || insertion.is_some(),
+        "目标组件不在可停靠区域内"
+    );
     if source == destination {
         if let Some(insertion) = insertion {
             dest_handle.update(cx, |_, window, cx| {
@@ -669,6 +945,7 @@ pub(crate) fn move_between(
                 })
             })?;
         }
+        focus_panel(id, cx);
         changed(cx);
         return Ok(());
     }
@@ -703,6 +980,8 @@ pub(crate) fn move_between(
         cx.global_mut::<Session>().panels.insert(id, p.downgrade());
         return Err(err);
     }
+    refresh_market(cx);
+    focus_panel(id, cx);
     changed(cx);
     close_if_empty(source, cx);
     Ok(())
@@ -710,19 +989,13 @@ pub(crate) fn move_between(
 pub(crate) fn detach(id: u64, position: Option<ScreenPoint>, cx: &mut App) -> anyhow::Result<()> {
     let source = panel(id, cx).ok_or_else(|| anyhow::anyhow!("组件已关闭"))?;
     let owner = source.read(cx).owner;
-    let source_handle = workspace(owner, cx)
-        .ok_or_else(|| anyhow::anyhow!("源窗口已关闭"))?
-        .read(cx)
-        .handle;
-    let source_scale = source_handle.update(cx, |_, window, _| window.scale_factor())?;
+    anyhow::ensure!(!is_locked(owner, cx), "布局已锁定，请先解锁");
+    let kind = source.read(cx).model.kind;
+    let (display_id, bounds) = floating_placement(owner, kind, position, cx)?;
     let win = allocate(cx);
-    let placement =
-        position.map(|position| transfer::detached_window_origin(position, source_scale, cx));
-    let display_id = placement.and_then(|(_, display)| display);
-    let bounds = placement.map(|(origin, _)| [origin.x.as_f32(), origin.y.as_f32(), 760., 570.]);
     // Start with an empty live dock. Loading DockAreaState::default() would
     // deserialize an invalid unnamed placeholder as an extra tab.
-    open_workspace_on_display(win, None, display_id, bounds, cx)?;
+    open_workspace_on_display(win, None, display_id, Some(bounds), cx)?;
     if let Err(error) = move_between(id, win, None, cx) {
         close_window(win, cx);
         return Err(error);
@@ -999,8 +1272,8 @@ fn apply_workspace(state: &WorkspaceFile, cx: &mut App) -> anyhow::Result<()> {
             // GPUI exposes resize but no programmatic window-position setter.
             // Reused windows keep their current screen position; fresh windows
             // and the next app launch use the saved, visibility-checked position.
-            let min_width = if saved.id == 0 { 1024. } else { 420. };
-            let min_height = if saved.id == 0 { 680. } else { 320. };
+            let min_width = if saved.id == 0 { 1024. } else { 240. };
+            let min_height = if saved.id == 0 { 680. } else { 240. };
             let requested = size(
                 px(saved.bounds[2].max(min_width)),
                 px(saved.bounds[3].max(min_height)),
@@ -1036,7 +1309,7 @@ fn apply_workspace(state: &WorkspaceFile, cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn restore(state: WorkspaceFile, cx: &mut App) -> anyhow::Result<()> {
+pub(crate) fn restore(state: WorkspaceFile, cx: &mut App) -> anyhow::Result<()> {
     storage::validate(&state)?;
     anyhow::ensure!(
         state.windows.iter().any(|window| window.id == 0),
@@ -1271,7 +1544,7 @@ impl Render for Workspace {
             .drag
             .target
             .filter(|t| t.window == id && !locked);
-        let header = div()
+        let full_header = div()
             .h(px(46.))
             .flex_shrink_0()
             .flex()
@@ -1297,6 +1570,7 @@ impl Render for Workspace {
             .child(
                 Button::new("add-component")
                     .label("＋ 添加组件")
+                    .disabled(locked)
                     .small()
                     .ghost()
                     .dropdown_menu(move |mut menu, _, _| {
@@ -1369,6 +1643,82 @@ impl Render for Workspace {
                         changed(cx);
                     }),
             );
+        let floating_header = div()
+            .h(px(30.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .px_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(rgb(0xe8ecf0))
+            .bg(rgb(0xffffff))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(rgb(0x86929f))
+                    .child("独立组件"),
+            )
+            .child(
+                Button::new("add-component")
+                    .label("＋")
+                    .xsmall()
+                    .ghost()
+                    .disabled(locked)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for kind in PanelKind::ALL {
+                            menu = menu.item(PopupMenuItem::new(kind.title()).on_click(
+                                move |_, _, cx| {
+                                    cx.defer(move |cx| {
+                                        let result = add_panel(id, kind, cx);
+                                        report(result, cx);
+                                    })
+                                },
+                            ));
+                        }
+                        menu
+                    }),
+            )
+            .child(
+                Button::new("floating-layout-lock")
+                    .label(if locked { "解锁" } else { "锁定" })
+                    .xsmall()
+                    .ghost()
+                    .on_click(move |_, window, cx| {
+                        if let Some(w) = workspace(id, cx) {
+                            let dock = w.read(cx).dock.clone();
+                            dock.update(cx, |d, cx| d.set_locked(!locked, window, cx));
+                        }
+                        changed(cx);
+                    }),
+            );
+        let owned: Vec<_> = cx
+            .global::<Session>()
+            .panels
+            .values()
+            .filter_map(WeakEntity::upgrade)
+            .filter_map(|p| {
+                let p = p.read(cx);
+                (p.owner == id).then(|| p.model.clone())
+            })
+            .collect();
+        let panel_count = owned.len();
+        if id != 0 {
+            let title = if let [model] = owned.as_slice() {
+                format!(
+                    "{} {} · {} · Tydaro",
+                    model.symbol.code(),
+                    model.symbol.name(),
+                    model.kind.title()
+                )
+            } else {
+                "Tydaro · 独立工作区".to_owned()
+            };
+            window.set_window_title(&title);
+        }
         let nav = div()
             .w(px(120.))
             .flex_shrink_0()
@@ -1429,6 +1779,9 @@ impl Render for Workspace {
         let pre = canvas(
             move |_, _, cx| {
                 cx.global_mut::<Session>().drag.clear_window_panels(id);
+                cx.global_mut::<Session>()
+                    .drag
+                    .set_window_panel_count(id, panel_count);
             },
             |_, _, _, _| {},
         )
@@ -1478,7 +1831,8 @@ impl Render for Workspace {
             })
             .child(pre)
             .child(listener)
-            .child(header)
+            .when(id == 0, |d| d.child(full_header))
+            .when(id != 0, |d| d.child(floating_header))
             .child(
                 div()
                     .flex_1()
@@ -1509,23 +1863,35 @@ impl Render for Workspace {
             )
             .child(
                 div()
-                    .h(px(27.))
+                    .h(px(if id == 0 { 27. } else { 22. }))
                     .flex_shrink_0()
+                    .min_w_0()
+                    .overflow_hidden()
                     .border_t_1()
                     .border_color(rgb(0xe4e8ee))
                     .flex()
                     .items_center()
-                    .px_3()
-                    .gap_5()
+                    .px_2()
+                    .gap_3()
                     .text_size(px(11.))
-                    .child(div().text_color(rgb(0x009b9a)).child("● 演示行情"))
-                    .child("恒生指数  24,345.20   +0.30%     纳斯达克  23,642.17   +0.86%")
-                    .child(div().flex_1())
-                    .child(if message.is_empty() {
-                        format!("拖动标签调整布局 · ⠿ 跨窗拖动 · 自动保存  |  {tick:04}")
-                    } else {
-                        message
-                    }),
+                    .when(id == 0, |d| {
+                        d.child(div().text_color(rgb(0x009b9a)).child("● 演示行情"))
+                            .child("恒生指数  24,345.20   +0.30%     纳斯达克  23,642.17   +0.86%")
+                            .child(div().flex_1())
+                    })
+                    .child(
+                        div()
+                            .when(id != 0, |d| d.flex_1())
+                            .min_w_0()
+                            .truncate()
+                            .child(if !message.is_empty() {
+                                message
+                            } else if id != 0 {
+                                "模拟 · 拖动股票标题 / 插入面板".to_owned()
+                            } else {
+                                format!("拖动股票标题或 ⠿ 停靠 · 自动保存  |  {tick:04}")
+                            }),
+                    ),
             )
             .when_some(target, |d, t| {
                 let b = t.bounds.preview(t.side);
@@ -1539,7 +1905,24 @@ impl Render for Workspace {
                         .bg(rgba(0x00b6b62c))
                         .border_2()
                         .border_color(rgb(0x00a9aa))
-                        .rounded_sm(),
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(0xffffff))
+                                .text_color(rgb(0x009b9a))
+                                .child(match t.side {
+                                    DockSide::Left => "松开插入左侧",
+                                    DockSide::Right => "松开插入右侧",
+                                    DockSide::Top => "松开插入上方",
+                                    DockSide::Bottom => "松开插入下方",
+                                    DockSide::Center => "松开合并为标签",
+                                }),
+                        ),
                 )
             })
     }

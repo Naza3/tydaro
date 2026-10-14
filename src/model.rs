@@ -8,18 +8,22 @@ pub enum PanelKind {
     Quote,
     OrderBook,
     Trades,
+    TradeDetails,
+    OrderDetails,
     News,
     OrderEntry,
     Orders,
     Positions,
 }
 impl PanelKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Watchlist,
         Self::Chart,
         Self::Quote,
         Self::OrderBook,
         Self::Trades,
+        Self::TradeDetails,
+        Self::OrderDetails,
         Self::News,
         Self::OrderEntry,
         Self::Orders,
@@ -29,9 +33,11 @@ impl PanelKind {
         match self {
             Self::Watchlist => "自选列表",
             Self::Chart => "行情图表",
-            Self::Quote => "报价概览",
-            Self::OrderBook => "买卖盘口",
-            Self::Trades => "逐笔成交",
+            Self::Quote => "关键数据",
+            Self::OrderBook => "买卖十档",
+            Self::Trades => "成交明细",
+            Self::TradeDetails => "逐笔成交",
+            Self::OrderDetails => "委托明细",
             Self::News => "资讯公告",
             Self::OrderEntry => "模拟交易",
             Self::Orders => "当日订单",
