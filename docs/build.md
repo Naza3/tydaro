@@ -48,6 +48,8 @@ cargo test --locked --all-targets --features test-support
 cargo run --locked --bin tydaro
 ```
 
+Linux 的“读取文件”使用桌面的 XDG FileChooser portal，需要会话 D-Bus、`xdg-desktop-portal` 及桌面对应的后端（例如 `xdg-desktop-portal-gtk`）。常规桌面通常已提供；无桌面回归不调用文件选择器，仍可验证粘贴导入和文本解码。没有可用 portal 时界面显示文件选择错误，用户可继续粘贴文本导入。
+
 图形启动需要 X11/Wayland 会话和可用的 Vulkan 驱动。无桌面的 CI 使用 Mesa 软件 Vulkan 驱动进行实际离屏渲染：
 
 ```bash

@@ -7056,6 +7056,7 @@ name = "tydaro"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "gpui-kit",
  "serde",
  "serde_json",
