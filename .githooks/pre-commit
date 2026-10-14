@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+branch=$(git symbolic-ref --quiet --short HEAD) || {
+    echo "Create a task branch before committing (detached HEAD is not a development branch)." >&2
+    exit 1
+}
+case "$branch" in
+    main|master)
+        echo "Direct commits to $branch are blocked. Use git switch -c <type>/<topic>, then open a PR." >&2
+        exit 1
+        ;;
+esac

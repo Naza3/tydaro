@@ -45,6 +45,10 @@ ZIP 包含程序、构建信息和使用说明，旁边提供 SHA-256 校验文�
 
 ## 本地开发
 
+这是由 AI 与维护者持续协作的项目。开始任务先读 [AGENTS.md](AGENTS.md) 和 [贡献规范](CONTRIBUTING.md)，在新的任务分支上开发，通过 PR 合并；禁止在 `main` 直接开发、提交或推送。首次克隆后运行 `git config --local core.hooksPath .githooks` 启用本地分支保护（已有自定义 hooks 时先整合）。
+
+开发入口：[开发与交接](docs/development.md) · [架构与状态约束](docs/architecture.md) · [构建与 CI](docs/build.md)。
+
 仓库固定使用 **Rust 1.96.0 stable** 和 `Cargo.lock`，不需要最新 Rust。rustup 会根据 `rust-toolchain.toml` 选择工具链，不影响机器的全局默认版本。
 
 Rust 版本下限也受 GPUI 和其他依赖影响。当前锁定依赖中有包要求至少 Rust 1.92；本项目选择 1.96 作为构建基线，不宣称更低版本已经得到验证。降级或升级都应重新运行完整构建和测试。
@@ -74,7 +78,7 @@ cargo test --locked --all-targets
 
 ## CI 与目录
 
-`main` 推送、Pull Request 和手动触发均运行 [Desktop build](.github/workflows/build.yml)。格式检查后，Windows 原生 MSVC 测试和 Release 打包、Linux 测试和离屏渲染并行执行。所有正式编译使用锁文件，工作流没有自动发布 GitHub Release 的步骤。
+`main` 推送、Pull Request 和手动触发均运行 [Desktop build](.github/workflows/build.yml)。任务分支推送后通过 PR 触发检查，避免分支 push 与 PR 重复构建。纯文档修改只运行仓库检查；代码、构建配置或脚本修改会运行格式检查，再并行执行 Windows Release 测试和打包、Linux Clippy、测试和离屏渲染。手动触发始终完整构建。最终 `CI` 检查汇总结果，可作为合并所需状态检查。所有正式编译使用锁文件，工作流没有自动发布 GitHub Release 的步骤。
 
 | 路径 | 职责 |
 | --- | --- |
