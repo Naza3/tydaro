@@ -19,21 +19,43 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  format:
-    name: Rust formatting
+  checks:
+    name: Repository checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: changes
+        run: python3 scripts/ci_changes.py
+      - name: Require a development branch for pull requests
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          case "$HEAD_BRANCH" in
+            main|master) echo 'Create a development branch before opening a pull request.' >&2; exit 1 ;;
+          esac
+      - name: Check Git hooks and build selection
+        run: |
+          bash scripts/test-git-hooks.sh
+          python3 scripts/test_ci_changes.py
       - name: Install the repository toolchain
+        if: steps.changes.outputs.build == 'true'
         run: rustup show active-toolchain
-      - run: cargo fmt --all -- --check
+      - name: Check Rust formatting
+        if: steps.changes.outputs.build == 'true'
+        run: cargo fmt --all -- --check
 
   windows:
     name: Windows x64 / MSVC Release
-    needs: format
+    needs: checks
+    if: needs.checks.outputs.build == 'true'
     runs-on: windows-2022
     timeout-minutes: 90
     defaults:
@@ -50,20 +72,25 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version --verbose
-      - name: Cache Rust dependencies and build outputs
+      # Never cache both debug and release dependency graphs on Windows. The
+      # source hash refreshes immutable caches; the prefix reuses dependencies.
+      - name: Cache Rust dependencies and Release outputs
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-2022-msvc-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+            target/x86_64-pc-windows-msvc/release
+          key: rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
           restore-keys: |
-            windows-2022-msvc-${{ hashFiles('rust-toolchain.toml') }}-
+            rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Find the Windows SDK shader compiler
         run: ./scripts/windows-sdk.ps1
-      - name: Run model and workspace tests
-        run: cargo test --locked --all-targets --target x86_64-pc-windows-msvc
+      - name: Run model and workspace tests in the Release profile
+        run: cargo test --locked --release --all-targets --target x86_64-pc-windows-msvc
       - name: Build the distributable application
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin tydaro
       - name: Package executable and SHA-256 checksum
@@ -77,10 +104,12 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0 # The distributable is already a ZIP archive.
 
   linux:
     name: Linux / build, tests and software rendering
-    needs: format
+    needs: checks
+    if: needs.checks.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
@@ -107,12 +136,16 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/debug
+          key: rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
           restore-keys: |
-            ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-
+            rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Check Rust lints
+        run: cargo clippy --locked --all-targets --features test-support -- -D warnings
       - name: Run model and workspace tests
         run: cargo test --locked --all-targets --features test-support
       - name: Build and render the application offscreen
@@ -130,3 +163,28 @@ jobs:
           path: artifacts/tydaro-linux.png
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0 # PNG compression has already done the work.
+
+  ci:
+    name: CI
+    if: always()
+    needs: [checks, windows, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all applicable checks
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          BUILD_REQUIRED: ${{ needs.checks.outputs.build }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+        run: |
+          test "$CHECKS_RESULT" = success
+          if [ "$BUILD_REQUIRED" = true ]; then
+            test "$WINDOWS_RESULT" = success
+            test "$LINUX_RESULT" = success
+          else
+            test "$BUILD_REQUIRED" = false
+            test "$WINDOWS_RESULT" = skipped
+            test "$LINUX_RESULT" = skipped
+          fi

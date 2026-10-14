@@ -1,0 +1,71 @@
+# 开发、验证与交接
+
+先按 [CONTRIBUTING.md](../CONTRIBUTING.md) 建任务分支并启用 hooks，再阅读 [architecture.md](architecture.md) 中相关状态约束。环境安装与精确 CI 流程以 [build.md](build.md) 为准。
+
+## 一个任务的完成条件
+
+开始时明确本次用户可见结果、涉及模块及验收方式。范围变化时更新任务说明，不顺手加入下一阶段后端或发行功能。完成时交付代码、相关文档、适当验证和可检查的分支/PR；尚未执行的 Windows 实机检查应如实列为待办。
+
+对于跨多轮的任务，把稳定的架构决定写入 architecture.md，把后续优先级写入 roadmap.md，把本次进度、日志和截图链接放入 PR。文档记录最终设计，不累积过时的聊天过程或一次性机器路径。
+
+## 检查选择
+
+在仓库根目录运行 Cargo，沿用 Rust 1.96.0 与 `--locked`。已有云开发环境先在同一个 shell 中运行：
+
+```bash
+source /workspace/.cloud-setup/activate.sh
+```
+
+该路径不存在时按 build.md 配置当前机器，不创建同名占位文件。基础命令为：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --features test-support -- -D warnings
+cargo test --locked --all-targets --features test-support
+git diff --check
+```
+
+| 改动范围 | 所需验证 |
+| --- | --- |
+| 纯文档 | diff、链接/命令与现有实现的一致性；无需完整 Rust 编译 |
+| Git hooks、脚本、工作流 | 对应语法/行为检查；工作流改动在任务分支的 PR 或手动 CI 验证，记录是否真正触发 |
+| 行情、状态、交易模拟、存储 | 格式、Clippy、受影响逻辑测试；对数据丢失、错误输入和兼容性补充回归 |
+| 面板、图表、布局或输入交互 | 上述 Rust 检查及离屏渲染/事件回归；视觉变化检查截图，窗口行为变化补充原生桌面操作 |
+| 工具链、锁文件、平台代码、发行脚本 | Windows MSVC 和 Linux CI；涉及发行时确认 ZIP 内容与校验，不能只测主机目标 |
+
+根据变更风险增加有意义的用例。无需为低影响可逆修改增加镜像实现的测试；相关检查通过后，不无理由重复完整编译。Linux 离屏渲染需先按 build.md 准备软件 Vulkan 和运行目录，然后执行：
+
+```bash
+cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
+```
+
+该模式执行实际绘制与 UI 事件，检查面板联动、图表交互、布局迁移及模拟订单。截图不是 Windows 原生桌面验收的替代品。临时输出放在忽略目录；只有需要更新产品预览时才替换 `docs/preview.png`。
+
+## 桌面交互验收
+
+使用独立 `TYDARO_DATA_DIR`，避免覆盖自己的布局；示例中 Bash 使用 `export TYDARO_DATA_DIR=/tmp/tydaro-acceptance`，PowerShell 使用 `$env:TYDARO_DATA_DIR = "$env:TEMP\tydaro-acceptance"`。验收记录应包含提交、系统、显示器缩放和结果。
+
+按改动选择有关操作：
+
+- 窗口内四向分割/合并标签，移动后股票、图表周期、视口与表单保留。
+- 弹出原生窗口、拖动到另一窗口、返回、关闭浮窗；面板 ID 无丢失或重复，空浮窗正确退出。
+- 多显示器不同 DPI 下检查指针、停靠预览和新窗口位置；拖动取消、Escape、失去鼠标后无残留状态。
+- 输入框焦点、中文输入法、窗口缩放和键盘操作；跨窗后仍可输入。
+- 保存、重启、模板切换与撤销；旧布局可读，异常文件及上次有效备份得以保留。
+- 模拟买卖、撤单与成交后的资金/持仓和占用量一致，用户仍能明确知道这是模拟环境。
+
+Windows 10/11 是首要人工验收平台。Linux X11 与 Wayland 分别记录，Wayland 自由跨窗拖动的限制不能记作已修复。
+
+## 交接格式
+
+PR 使用仓库模板；阶段性交接也应让下一位开发者无需翻阅对话即可继续：
+
+```text
+结果：解决的问题与当前行为
+代码：任务分支、提交、PR 链接
+验证：实际执行的命令/CI 链接、结果、截图或产物
+限制：未执行的检查、已知问题及原因
+下一步：剩余事项及可操作的复现/验收方法
+```
+
+不要提交包含本机凭据或个人目录的完整环境转储，也不要把“编译成功”写成“全部平台交互验证成功”。当前能力与下一阶段范围见 [roadmap.md](roadmap.md)。
