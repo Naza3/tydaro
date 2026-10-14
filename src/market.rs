@@ -88,6 +88,32 @@ impl Symbol {
         }
     }
 
+    // Illustrative fundamentals for the local demo, not reported company data.
+    fn float_shares(self) -> u64 {
+        self.shares()
+            * match self {
+                Self::Aapl => 97,
+                Self::Msft => 96,
+                Self::Nvda => 95,
+                Self::Tsla => 87,
+                Self::Tencent => 89,
+                Self::Alibaba => 92,
+            }
+            / 100
+    }
+
+    fn earnings_per_share(self) -> f64 {
+        cents(self.previous_close())
+            / match self {
+                Self::Aapl => 38.63,
+                Self::Msft => 36.42,
+                Self::Nvda => 49.12,
+                Self::Tsla => 109.30,
+                Self::Tencent => 24.60,
+                Self::Alibaba => 20.85,
+            }
+    }
+
     fn shares(self) -> u64 {
         match self {
             Self::Aapl => 14_594_000_000,
@@ -105,16 +131,29 @@ pub enum Period {
     Intraday,
     Day,
     Week,
+    Month,
+    Minute1,
+    Minute5,
 }
 
 impl Period {
-    pub const ALL: [Self; 3] = [Self::Intraday, Self::Day, Self::Week];
+    pub const ALL: [Self; 6] = [
+        Self::Intraday,
+        Self::Day,
+        Self::Week,
+        Self::Month,
+        Self::Minute1,
+        Self::Minute5,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Intraday => "分时",
             Self::Day => "日 K",
             Self::Week => "周 K",
+            Self::Month => "月 K",
+            Self::Minute1 => "1 分",
+            Self::Minute5 => "5 分",
         }
     }
 }
@@ -131,6 +170,17 @@ pub struct Quote {
     pub volume: u64,
     pub turnover: f64,
     pub market_cap: f64,
+    pub float_market_cap: f64,
+    pub total_shares: u64,
+    pub float_shares: u64,
+    /// Session volume / illustrative free-float shares, in percent.
+    pub turnover_rate: f64,
+    /// Session volume / the demo's expected volume for the elapsed minutes.
+    pub volume_ratio: f64,
+    pub buy_volume: u64,
+    pub sell_volume: u64,
+    /// Based on an illustrative EPS fixture; no real fundamentals are fetched.
+    pub pe_ttm: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,6 +199,34 @@ pub struct Trade {
     pub price: f64,
     pub size: u64,
     pub buy: bool,
+    /// Number of executions aggregated into this three-second summary row.
+    pub count: u64,
+}
+
+/// One execution underlying the aggregated成交明细 rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Execution {
+    pub time: String,
+    pub price: f64,
+    pub size: u64,
+    pub amount: f64,
+    pub buy: bool,
+    pub buy_order_amount: f64,
+    pub sell_order_amount: f64,
+}
+
+/// Simulated public market order, separate from the local trading account.
+/// `time` is the submission time; canceled orders retain their original price
+/// and size and carry a later `canceled_at`. Pending orders sum to the book.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarketOrder {
+    pub id: u64,
+    pub time: String,
+    pub price: f64,
+    pub size: u64,
+    pub amount: f64,
+    pub buy: bool,
+    pub canceled_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -248,12 +326,15 @@ pub fn quote(symbol: Symbol, tick: u64) -> Quote {
     let mut high = opening;
     let mut low = opening;
     let mut volume = 0;
+    let mut buy_volume = 0;
     let mut turnover_cents = 0_u64;
     for index in 0..=last_minute {
         let candle = minute_candle(symbol, index);
         high = high.max(candle.high);
         low = low.min(candle.low);
         volume += candle.volume;
+        let buy_percent = if candle.close >= candle.open { 61 } else { 39 };
+        buy_volume += candle.volume * buy_percent / 100;
         let average = (candle.open + candle.high + candle.low + candle.close) / 4;
         turnover_cents += average as u64 * candle.volume;
     }
@@ -269,12 +350,24 @@ pub fn quote(symbol: Symbol, tick: u64) -> Quote {
         volume,
         turnover: turnover_cents as f64 / 100.0,
         market_cap: current as f64 * symbol.shares() as f64 / 100.0,
+        float_market_cap: current as f64 * symbol.float_shares() as f64 / 100.0,
+        total_shares: symbol.shares(),
+        float_shares: symbol.float_shares(),
+        turnover_rate: volume as f64 / symbol.float_shares() as f64 * 100.0,
+        volume_ratio: volume as f64 / ((last_minute + 1) * (58_000 + symbol.seed() * 101)) as f64,
+        buy_volume,
+        sell_volume: volume - buy_volume,
+        pe_ttm: cents(current) / symbol.earnings_per_share(),
     }
 }
 
 fn historical_close(symbol: Symbol, age: u64, period: Period) -> i64 {
     let base = symbol.previous_close();
-    let scale = if period == Period::Week { 3 } else { 1 };
+    let scale = match period {
+        Period::Month => 12,
+        Period::Week => 3,
+        _ => 1,
+    };
     let movement =
         |at| wave(symbol.seed(), at, 23, base / 15) + wave(symbol.seed() + 41, at, 5, base / 50);
     // The last completed daily candle closes exactly at previous_close.
@@ -285,6 +378,10 @@ fn historical_close(symbol: Symbol, age: u64, period: Period) -> i64 {
 // Demo history is anchored at 2026-10-14. It is deliberately independent of the
 // machine date so screenshots and interaction tests remain reproducible.
 fn historical_date(age: u64, period: Period) -> String {
+    if period == Period::Month {
+        let months = 2026 * 12 + 9 - age;
+        return format!("{:04}/{:02}", months / 12, months % 12 + 1);
+    }
     let mut remaining = if period == Period::Week {
         age * 7
     } else {
@@ -310,12 +407,37 @@ fn historical_date(age: u64, period: Period) -> String {
     format!("{month:02}/{day:02}")
 }
 
+/// Entire simulated session for indicators that must retain the opening
+/// history even when the visible intraday window rolls forward.
+pub fn session_bars(symbol: Symbol, tick: u64) -> Vec<Bar> {
+    (0..=minute(tick))
+        .map(|index| public_bar(minute_label(index), minute_candle(symbol, index)))
+        .collect()
+}
+
 /// Returns bars in chronological order, always ending at the current quote.
 pub fn bars(symbol: Symbol, period: Period, tick: u64) -> Vec<Bar> {
-    if period == Period::Intraday {
+    if matches!(period, Period::Intraday | Period::Minute1) {
         let end = minute(tick);
         return (end + 1 - BAR_COUNT..=end)
             .map(|index| public_bar(minute_label(index), minute_candle(symbol, index)))
+            .collect();
+    }
+    if period == Period::Minute5 {
+        let end = minute(tick);
+        return (0..=end)
+            .step_by(5)
+            .map(|start| {
+                let mut combined = minute_candle(symbol, start);
+                for index in start + 1..=(start + 4).min(end) {
+                    let next = minute_candle(symbol, index);
+                    combined.high = combined.high.max(next.high);
+                    combined.low = combined.low.min(next.low);
+                    combined.close = next.close;
+                    combined.volume += next.volume;
+                }
+                public_bar(minute_label(start), combined)
+            })
             .collect();
     }
     let snapshot = quote(symbol, tick);
@@ -347,7 +469,11 @@ pub fn bars(symbol: Symbol, period: Period, tick: u64) -> Vec<Bar> {
                     low: open.min(close) - wick,
                     close,
                     volume: (12_000_000 + noise(symbol.seed() + 31, age) % 40_000_000)
-                        * if period == Period::Week { 5 } else { 1 },
+                        * match period {
+                            Period::Month => 21,
+                            Period::Week => 5,
+                            _ => 1,
+                        },
                 },
             )
         })
@@ -372,14 +498,109 @@ pub fn trades(symbol: Symbol, tick: u64) -> Vec<Trade> {
         .map(|index| {
             let second = last_second - index * 3;
             let price = trade_price(symbol, second);
+            let size = (1 + noise(symbol.seed() + 53, second) % 20) * 100;
             Trade {
                 time: format!("{}:{:02}", minute_label(second / 60), second % 60),
                 price: cents(price),
-                size: (1 + noise(symbol.seed() + 53, second) % 20) * 100,
+                size,
                 buy: price >= trade_price(symbol, second - 1),
+                count: 1 + noise(symbol.seed() + 59, second) % (size / 100).min(5),
             }
         })
         .collect()
+}
+
+/// Positive round-lot partitions, preserving a parent order/execution size.
+fn split_lots(size: u64, count: u64, index: u64) -> u64 {
+    let lots = size / 100;
+    (lots / count + u64::from(index < lots % count)) * 100
+}
+
+/// Individual executions, newest first, matching the aggregate trade tape.
+/// The two order-amount fields describe the originating buy/sell orders, so
+/// each is at least the amount matched in this individual execution.
+pub fn executions(symbol: Symbol, tick: u64) -> Vec<Execution> {
+    trades(symbol, tick)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(row, trade)| {
+            (0..trade.count).map(move |index| {
+                let size = split_lots(trade.size, trade.count, index);
+                let amount = trade.price * size as f64;
+                let seed = minute(tick) * 1_000 + row as u64 * 10 + index;
+                Execution {
+                    time: trade.time.clone(),
+                    price: trade.price,
+                    size,
+                    amount,
+                    buy: trade.buy,
+                    buy_order_amount: amount
+                        + trade.price * (noise(symbol.seed() + 107, seed) % 20 * 100) as f64,
+                    sell_order_amount: amount
+                        + trade.price * (noise(symbol.seed() + 109, seed) % 20 * 100) as f64,
+                }
+            })
+        })
+        .collect()
+}
+
+fn second_label(second: u64) -> String {
+    format!("{}:{:02}", minute_label(second / 60), second % 60)
+}
+
+/// Market-side pending and canceled orders, independent of DemoBroker.
+/// Pending quantities at each price reproduce the displayed ten-level book;
+/// cancellations are historical events and do not contribute to that depth.
+pub fn market_orders(symbol: Symbol, tick: u64) -> Vec<MarketOrder> {
+    let last_second = minute(tick) * 60 + 59;
+    let (bids, asks) = order_book(symbol, tick);
+    let mut orders = Vec::with_capacity(90);
+    let mut next_id = minute(tick) * 1_000;
+    for (buy, levels) in [(true, bids), (false, asks)] {
+        for (level_index, level) in levels.into_iter().enumerate() {
+            let count = (level.size / 100).min(3);
+            for index in 0..count {
+                next_id += 1;
+                let size = split_lots(level.size, count, index);
+                orders.push(MarketOrder {
+                    id: next_id,
+                    time: second_label(
+                        last_second - level_index as u64 * 7 - index * 3 - u64::from(buy),
+                    ),
+                    price: level.price,
+                    size,
+                    amount: level.price * size as f64,
+                    buy,
+                    canceled_at: None,
+                });
+            }
+        }
+    }
+    for index in 0..30 {
+        next_id += 1;
+        let canceled = last_second - index * 3;
+        let submitted = canceled - 60 - noise(symbol.seed() + 113, canceled) % 300;
+        let buy = index % 2 == 0;
+        let price = cents(trade_price(symbol, submitted) + if buy { -1 } else { 1 });
+        let size = (1 + noise(symbol.seed() + 127, submitted) % 90) * 100;
+        orders.push(MarketOrder {
+            id: next_id,
+            time: second_label(submitted),
+            price,
+            size,
+            amount: price * size as f64,
+            buy,
+            canceled_at: Some(second_label(canceled)),
+        });
+    }
+    orders.sort_by(|a, b| {
+        b.canceled_at
+            .as_ref()
+            .unwrap_or(&b.time)
+            .cmp(a.canceled_at.as_ref().unwrap_or(&a.time))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    orders
 }
 
 /// Ten bid and ask levels, each ordered best price first.
@@ -417,7 +638,14 @@ mod tests {
                 assert!(snapshot.low <= snapshot.price && snapshot.price <= snapshot.high);
                 for period in Period::ALL {
                     let history = bars(symbol, period, tick);
-                    assert_eq!(history.len(), BAR_COUNT as usize);
+                    assert_eq!(
+                        history.len(),
+                        if period == Period::Minute5 {
+                            (minute(tick) / 5 + 1) as usize
+                        } else {
+                            BAR_COUNT as usize
+                        }
+                    );
                     assert_eq!(history.last().unwrap().close, snapshot.price);
                     assert_eq!(history, bars(symbol, period, tick));
                     for candle in history {
@@ -477,5 +705,179 @@ mod tests {
         assert_eq!(historical_date(2, Period::Day), "10/12");
         assert_eq!(historical_date(3, Period::Day), "10/09");
         assert_eq!(historical_date(10, Period::Day), "09/30");
+    }
+
+    #[test]
+    fn expanded_statistics_balance_to_the_shared_quote() {
+        for symbol in Symbol::ALL {
+            for tick in [0, 76, 210, 211, u64::MAX] {
+                let snapshot = quote(symbol, tick);
+                assert_eq!(snapshot.buy_volume + snapshot.sell_volume, snapshot.volume);
+                assert!(snapshot.float_shares > 0);
+                assert!(snapshot.float_shares <= snapshot.total_shares);
+                assert!(
+                    (snapshot.market_cap - snapshot.price * snapshot.total_shares as f64).abs()
+                        < 0.01
+                );
+                assert!(
+                    (snapshot.float_market_cap - snapshot.price * snapshot.float_shares as f64)
+                        .abs()
+                        < 0.01
+                );
+                assert!(
+                    (snapshot.turnover_rate * snapshot.float_shares as f64 / 100.0
+                        - snapshot.volume as f64)
+                        .abs()
+                        < 1e-6
+                );
+                assert!(snapshot.volume_ratio.is_finite() && snapshot.volume_ratio > 0.0);
+                assert!(
+                    (snapshot.pe_ttm * symbol.earnings_per_share() - snapshot.price).abs() < 1e-9
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn executions_reconcile_with_the_aggregated_tape() {
+        for symbol in Symbol::ALL {
+            for tick in [0, 210, 211, u64::MAX] {
+                let details = executions(symbol, tick);
+                assert_eq!(details, executions(symbol, tick));
+                assert_eq!(details[0].price, quote(symbol, tick).price);
+                for summary in trades(symbol, tick) {
+                    let matching: Vec<_> = details
+                        .iter()
+                        .filter(|row| row.time == summary.time)
+                        .collect();
+                    assert_eq!(matching.len() as u64, summary.count);
+                    assert_eq!(
+                        matching.iter().map(|row| row.size).sum::<u64>(),
+                        summary.size
+                    );
+                    let total = matching.iter().map(|row| row.amount).sum::<f64>();
+                    assert!((total - summary.price * summary.size as f64).abs() < 1e-6);
+                    for row in matching {
+                        assert_eq!(row.price, summary.price);
+                        assert_eq!(row.buy, summary.buy);
+                        assert!(row.size > 0);
+                        assert!(row.buy_order_amount >= row.amount);
+                        assert!(row.sell_order_amount >= row.amount);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_orders_reproduce_depth_and_cancellations_keep_original_fields() {
+        for symbol in Symbol::ALL {
+            for tick in [0, 76, 210, 211, u64::MAX] {
+                let orders = market_orders(symbol, tick);
+                assert_eq!(orders, market_orders(symbol, tick));
+                let ids: std::collections::HashSet<_> = orders.iter().map(|row| row.id).collect();
+                assert_eq!(ids.len(), orders.len());
+                for row in &orders {
+                    assert!(row.size > 0 && row.price > 0.0);
+                    assert!((row.amount - row.price * row.size as f64).abs() < 1e-9);
+                    if let Some(canceled) = &row.canceled_at {
+                        assert!(canceled > &row.time);
+                    }
+                }
+                let (bids, asks) = order_book(symbol, tick);
+                for (buy, levels) in [(true, bids), (false, asks)] {
+                    for level in levels {
+                        let pending_size: u64 = orders
+                            .iter()
+                            .filter(|row| {
+                                row.buy == buy
+                                    && row.price == level.price
+                                    && row.canceled_at.is_none()
+                            })
+                            .map(|row| row.size)
+                            .sum();
+                        assert_eq!(pending_size, level.size);
+                    }
+                }
+                assert_eq!(
+                    orders
+                        .iter()
+                        .filter(|row| row.canceled_at.is_some())
+                        .count(),
+                    30
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indicator_history_retains_session_open_when_visible_window_rolls() {
+        for symbol in Symbol::ALL {
+            let initial = session_bars(symbol, 0);
+            for tick in [1, 76, 210] {
+                let full = session_bars(symbol, tick);
+                let visible = bars(symbol, Period::Intraday, tick);
+                assert_eq!(&full[..initial.len()], initial.as_slice());
+                assert_eq!(&full[full.len() - visible.len()..], visible.as_slice());
+                assert_eq!(
+                    full.iter().map(|bar| bar.volume).sum::<u64>(),
+                    quote(symbol, tick).volume
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn five_minute_candles_reconcile_the_entire_session() {
+        for symbol in Symbol::ALL {
+            for tick in [0, 1, 76, 210, 211, u64::MAX] {
+                let snapshot = quote(symbol, tick);
+                let history = bars(symbol, Period::Minute5, tick);
+                assert_eq!(
+                    history.iter().map(|row| row.volume).sum::<u64>(),
+                    snapshot.volume
+                );
+                assert_eq!(history.first().unwrap().open, snapshot.open);
+                assert_eq!(history.last().unwrap().close, snapshot.price);
+                assert_eq!(
+                    history
+                        .iter()
+                        .map(|row| row.high)
+                        .fold(f64::NEG_INFINITY, f64::max),
+                    snapshot.high
+                );
+                assert_eq!(
+                    history
+                        .iter()
+                        .map(|row| row.low)
+                        .fold(f64::INFINITY, f64::min),
+                    snapshot.low
+                );
+                assert!(history.windows(2).all(|pair| pair[0].close == pair[1].open));
+            }
+        }
+    }
+
+    #[test]
+    fn added_periods_keep_old_layout_values_and_months_cross_years() {
+        for (serialized, expected) in [
+            ("Intraday", Period::Intraday),
+            ("Day", Period::Day),
+            ("Week", Period::Week),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<Period>(serde_json::json!(serialized)).unwrap(),
+                expected
+            );
+        }
+        for period in Period::ALL {
+            assert_eq!(
+                serde_json::from_value::<Period>(serde_json::to_value(period).unwrap()).unwrap(),
+                period
+            );
+        }
+        assert_eq!(historical_date(0, Period::Month), "2026/10");
+        assert_eq!(historical_date(10, Period::Month), "2025/12");
+        assert_eq!(historical_date(179, Period::Month), "2011/11");
     }
 }

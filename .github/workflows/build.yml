@@ -160,7 +160,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: tydaro-linux-smoke-${{ github.sha }}
-          path: artifacts/tydaro-linux.png
+          path: artifacts/tydaro-linux*.png
           if-no-files-found: error
           retention-days: 14
           compression-level: 0 # PNG compression has already done the work.

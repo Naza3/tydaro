@@ -13,6 +13,7 @@ use crate::{
     market::{self, Period, Symbol},
     model::PanelKind,
     storage::{self, SavedPanel, WorkspaceFile},
+    transfer::DockSide,
     workspace,
 };
 
@@ -104,6 +105,13 @@ pub fn run(path: &str) -> Result<()> {
     cx.update_window(handle, |_, window, cx| window.click("period-日 K", cx))?;
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace");
+    cx.capture_screenshot(handle)
+        .context("The candle chart did not render")?
+        .save(output.with_file_name(format!("{stem}-candles.png")))?;
     let changed = cx.update(|cx| workspace.read(cx).dock.read(cx).dump(cx));
     changed_panels.clear();
     collect_panels(&changed.center, &mut changed_panels)?;
@@ -143,7 +151,9 @@ pub fn run(path: &str) -> Result<()> {
         "The live Dock state did not survive JSON serialization"
     );
     verify_detach_roundtrip(&mut cx, chart)?;
+    verify_new_floating_panels(&mut cx, output)?;
     crate::contents::smoke_demo_orders(&mut cx)?;
+    crate::contents::smoke_market_panels(&mut cx)?;
 
     println!(
         "PASS: native workspace {} × {}, {} panels; MSFT link group, 日 K, chart zoom; detach/return state, persistence/undo and demo order interactions. Screenshot: {}",
@@ -153,6 +163,206 @@ pub fn run(path: &str) -> Result<()> {
         output.display()
     );
     Ok(())
+}
+
+/// Exercise the same production add/insert paths as the component menu. Each
+/// insertion starts from the same workspace so a split cannot pass merely
+/// because an unrelated earlier split happens to have the expected axis.
+fn verify_new_floating_panels(cx: &mut HeadlessAppContext, output: &Path) -> Result<()> {
+    let original = cx.update(|cx| workspace::snapshot(cx));
+    let mut original_panels = Vec::new();
+    for window in &original.windows {
+        collect_panels(&window.dock.center, &mut original_panels)?;
+    }
+    let target = original_panels
+        .iter()
+        .find(|p| p.model.kind == PanelKind::Chart)
+        .context("No chart available as the insertion target")?
+        .model
+        .id;
+    for (kind, side, image_name) in [
+        (PanelKind::Quote, DockSide::Left, "quote"),
+        (PanelKind::OrderBook, DockSide::Right, "order-book"),
+        (PanelKind::Trades, DockSide::Top, "trades"),
+        (PanelKind::TradeDetails, DockSide::Bottom, "trade-details"),
+        (PanelKind::OrderDetails, DockSide::Center, "order-details"),
+    ] {
+        cx.update(|cx| workspace::add_panel(0, kind, cx))?;
+        cx.run_until_parked();
+        render_workspace_windows(cx)?;
+        let added = cx.update(|cx| workspace::snapshot(cx));
+        storage::validate(&added)?;
+        ensure!(
+            added.windows.len() == original.windows.len() + 1,
+            "Adding {} did not create an independent window",
+            kind.title()
+        );
+        let floating = added
+            .windows
+            .iter()
+            .find(|window| !original.windows.iter().any(|old| old.id == window.id))
+            .context("The new component's independent window is missing")?;
+        let mut panels = Vec::new();
+        collect_panels(&floating.dock.center, &mut panels)?;
+        ensure!(
+            panels.len() == 1,
+            "New floating window has extra or hidden panels"
+        );
+        let added_panel = &panels[0];
+        let id = added_panel.model.id;
+        ensure!(added_panel.model.kind == kind, "Wrong component was added");
+        ensure!(
+            !original_panels.iter().any(|old| old.model.id == id),
+            "Adding a component reused a persistent ID"
+        );
+        let handle = cx
+            .update(|cx| workspace::workspace(floating.id, cx).map(|w| w.read(cx).handle))
+            .context("The floating component has no native window")?;
+        cx.update_window(handle, |_, window, _| {
+            ensure!(
+                window.find(format!("insert-panel-{id}")).visible(),
+                "The new component has no visible insert action"
+            );
+            ensure!(
+                window.find(format!("panel-drag-{id}")).visible(),
+                "The component's drag header is not visible"
+            );
+            Ok::<_, anyhow::Error>(())
+        })??;
+        let image = cx
+            .capture_screenshot(handle)
+            .context("Floating component did not render")?;
+        ensure!(
+            image.pixels().filter(|p| p[0].abs_diff(p[1]) > 24).count() > 50,
+            "Floating {} rendered no market content",
+            kind.title()
+        );
+        let stem = output
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("workspace");
+        image.save(output.with_file_name(format!("{stem}-{image_name}.png")))?;
+
+        // Neither a locked destination nor a stale target may lose the source.
+        let main = cx
+            .update(|cx| workspace::workspace(0, cx))
+            .context("Main window closed")?;
+        let main_handle = cx.update(|cx| main.read(cx).handle);
+        let main_dock = cx.update(|cx| main.read(cx).dock.clone());
+        cx.update_window(main_handle, |_, window, cx| {
+            main_dock.update(cx, |dock, cx| dock.set_locked(true, window, cx));
+        })?;
+        let locked = cx.update(|cx| workspace::snapshot(cx));
+        ensure!(
+            cx.update(|cx| workspace::move_between(id, 0, Some((target, side)), cx))
+                .is_err(),
+            "Insertion ignored the destination layout lock"
+        );
+        ensure!(
+            serde_json::to_value(&locked)?
+                == serde_json::to_value(cx.update(|cx| workspace::snapshot(cx)))?,
+            "Rejected insertion changed the workspace"
+        );
+        cx.update_window(main_handle, |_, window, cx| {
+            main_dock.update(cx, |dock, cx| dock.set_locked(false, window, cx));
+        })?;
+        ensure!(
+            cx.update(|cx| workspace::move_between(id, 0, Some((u64::MAX - 1, side)), cx))
+                .is_err(),
+            "Insertion accepted a stale target"
+        );
+        let preserved = cx.update(|cx| workspace::snapshot(cx));
+        let (owner, still_floating) = unique_panel(&preserved, id)?;
+        ensure!(
+            owner == floating.id
+                && still_floating.model == added_panel.model
+                && still_floating.content == added_panel.content,
+            "A failed insertion lost panel state"
+        );
+
+        cx.update(|cx| workspace::move_between(id, 0, Some((target, side)), cx))?;
+        cx.run_until_parked();
+        render_workspace_windows(cx)?;
+        let inserted = cx.update(|cx| workspace::snapshot(cx));
+        storage::validate(&inserted)?;
+        let (owner, moved) = unique_panel(&inserted, id)?;
+        ensure!(
+            owner == 0 && moved.model == added_panel.model && moved.content == added_panel.content,
+            "Insertion changed component identity or content"
+        );
+        ensure!(
+            inserted.windows.len() == original.windows.len(),
+            "The empty floating window was not closed"
+        );
+        let center = &inserted
+            .windows
+            .iter()
+            .find(|w| w.id == 0)
+            .context("Main window missing")?
+            .dock
+            .center;
+        ensure!(
+            placement_matches(center, id, target, side)?,
+            "Component was not inserted on the requested side: {side:?}"
+        );
+        cx.update(workspace::verify_workspace_persistence)?;
+        let restored = cx.update(|cx| workspace::snapshot(cx));
+        let (owner, restored_panel) = unique_panel(&restored, id)?;
+        ensure!(
+            owner == 0
+                && restored_panel.model == added_panel.model
+                && restored_panel.content == added_panel.content,
+            "Inserted component did not survive restore/undo"
+        );
+        cx.update(|cx| workspace::restore(original.clone(), cx))?;
+        cx.run_until_parked();
+        render_workspace_windows(cx)?;
+    }
+    println!(
+        "PASS: new components open separate native windows; exact five-way reinsertion, locks, stale targets, state retention and restore/undo"
+    );
+    Ok(())
+}
+
+fn render_workspace_windows(cx: &mut HeadlessAppContext) -> Result<()> {
+    let state = cx.update(|cx| workspace::snapshot(cx));
+    for saved in state.windows {
+        let handle = cx
+            .update(|cx| workspace::workspace(saved.id, cx).map(|w| w.read(cx).handle))
+            .context("Workspace has no native window")?;
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    }
+    cx.run_until_parked();
+    Ok(())
+}
+
+fn placement_matches(state: &PanelState, moved: u64, target: u64, side: DockSide) -> Result<bool> {
+    let mut moved_child = None;
+    let mut target_child = None;
+    for (index, child) in state.children.iter().enumerate() {
+        let mut panels = Vec::new();
+        collect_panels(child, &mut panels)?;
+        if panels.iter().any(|p| p.model.id == moved) {
+            moved_child = Some(index);
+        }
+        if panels.iter().any(|p| p.model.id == target) {
+            target_child = Some(index);
+        }
+    }
+    let (Some(moved_child), Some(target_child)) = (moved_child, target_child) else {
+        return Ok(false);
+    };
+    if moved_child == target_child {
+        return placement_matches(&state.children[moved_child], moved, target, side);
+    }
+    Ok(match (&state.info, side) {
+        (PanelInfo::Tabs { active_index }, DockSide::Center) => *active_index == moved_child,
+        (PanelInfo::Stack { axis: 0, .. }, DockSide::Left) => moved_child < target_child,
+        (PanelInfo::Stack { axis: 0, .. }, DockSide::Right) => moved_child > target_child,
+        (PanelInfo::Stack { axis: 1, .. }, DockSide::Top) => moved_child < target_child,
+        (PanelInfo::Stack { axis: 1, .. }, DockSide::Bottom) => moved_child > target_child,
+        _ => false,
+    })
 }
 
 fn verify_detach_roundtrip(cx: &mut HeadlessAppContext, expected: &SavedPanel) -> Result<()> {
