@@ -1,0 +1,132 @@
+name: Desktop build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 3
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  format:
+    name: Rust formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: rustup show active-toolchain
+      - run: cargo fmt --all -- --check
+
+  windows:
+    name: Windows x64 / MSVC Release
+    needs: format
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: |
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version --verbose
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-2022-msvc-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            windows-2022-msvc-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Find the Windows SDK shader compiler
+        run: ./scripts/windows-sdk.ps1
+      - name: Run model and workspace tests
+        run: cargo test --locked --all-targets --target x86_64-pc-windows-msvc
+      - name: Build the distributable application
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin tydaro
+      - name: Package executable and SHA-256 checksum
+        run: ./scripts/package-windows.ps1
+      - name: Upload Windows build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tydaro-windows-x86_64-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux / build, tests and software rendering
+    needs: format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      XDG_RUNTIME_DIR: /tmp/tydaro-runtime
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux development and rendering packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential clang cmake pkg-config libfontconfig1-dev \
+            libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libvulkan-dev \
+            libasound2-dev libssl-dev libzstd-dev mesa-vulkan-drivers \
+            fonts-dejavu-core fonts-noto-cjk
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+      - name: Install the repository toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Run model and workspace tests
+        run: cargo test --locked --all-targets --features test-support
+      - name: Build and render the application offscreen
+        run: |
+          driver=$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)
+          test -n "$driver"
+          export VK_DRIVER_FILES="$driver"
+          mkdir -p artifacts
+          cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
+          test -s artifacts/tydaro-linux.png
+      - name: Upload Linux rendering evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tydaro-linux-smoke-${{ github.sha }}
+          path: artifacts/tydaro-linux.png
+          if-no-files-found: error
+          retention-days: 14
