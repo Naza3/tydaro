@@ -72,17 +72,25 @@ git commit -m "fix(workspace): preserve panel state on return"
 
 ## 推送与 Pull Request
 
-在已获推送授权的范围内，将 `codex/dev` 推到同名远端分支：
+提交、构建和 PR 是三个独立步骤：提交记录一次可解释的改动，构建验证某个提交，PR 用于评审并合入一批改动。无需为每次构建或小修复创建 PR。
+
+日常小功能和修复完成后，在已获推送授权的范围内，将 `codex/dev` 推到同名远端分支，自动运行 CI：
 
 ```bash
 git push -u origin codex/dev
-# 只有没有当前阶段的开放 PR 时才创建：
+```
+
+默认累积一批相关、可完整验收的功能后，再按用户的阶段交付要求创建 PR。不要把“本轮任务完成”或“需要 Windows 构建包”自动视为创建 PR 的要求。整理阶段交付且没有对应开放 PR 时执行：
+
+```bash
 gh pr create --draft --base main --head codex/dev
 ```
 
+一个 PR 可以包含多次提交、推送和构建；已开放 PR 会自动包含该分支的后续提交。批次应围绕共同目标，避免把大量无关改动长时间堆积。多人团队常用短期功能分支分担并行开发，本项目按用户选择继续使用长期 `codex/dev`，保留逐项提交和阶段评审。
+
 创建 PR 时使用 [.github/pull_request_template.md](.github/pull_request_template.md)，说明当前阶段的问题、最终行为、验证结果和剩余风险。正常情况下 base 为 `main`，head 为 `codex/dev`；已有尚未合并的依赖时，可暂以依赖分支为 base 并写明关系。PR 标题也采用 Conventional Commits。代码尚待实机验收或评审时保留 Draft，不把 CI 通过写成已完成全部人工验收。
 
-同一阶段已有开放 PR 时，新提交会继续进入该 PR，更新其标题和说明以反映最终范围，不为每个功能重新开 PR。阶段合并后，下一阶段仍从 `codex/dev` 创建新 PR。已有历史功能分支的 PR 可完成当前交付，后续开发统一进入 `codex/dev`。
+同一阶段已有开放 PR 时，新提交会继续进入该 PR，更新其标题和说明以反映最终范围，不为每个功能重新开 PR。阶段合并后，继续在 `codex/dev` 开发，等下一批交付再创建 PR。已有历史功能分支的 PR 可完成当前交付，后续开发统一进入 `codex/dev`。
 
 合并由用户授权的维护者完成，使用 **Create a merge commit** 保留祖先关系，保留 `codex/dev`，不使用 Squash/Rebase merge 或合并后删除长期分支。这样下一阶段 PR 不会重复展示已合并的旧提交。
 

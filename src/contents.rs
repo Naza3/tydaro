@@ -1,8 +1,9 @@
 //! Business panels share a deterministic quote stream and a local demo ledger.
 use gpui_kit::{
     component::{
-        Sizable,
-        input::{Input, InputEvent, InputState},
+        Disableable, Sizable,
+        button::{Button, ButtonVariants},
+        input::{Input, InputEvent, InputState, Textarea, TextareaState},
     },
     prelude::*,
     *,
@@ -10,9 +11,11 @@ use gpui_kit::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    chart::{ChartViewport, MarketChart},
+    chart::{ChartEvent, ChartViewport, MarketChart},
+    history::{self, HistoryWindow},
     market::{self, Period, Symbol},
     model::PanelKind,
+    stock_import::{self, ImportError, ImportPreview},
 };
 
 const INK: u32 = 0x233348;
@@ -26,6 +29,7 @@ pub enum ContentEvent {
     SymbolSelected(Symbol),
     PeriodChanged(Period),
     OrderSubmitted,
+    ListChanged,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -78,13 +82,14 @@ struct DemoPosition {
     cost: f64,
 }
 
-/// Session-only accounting. US and HK demonstration balances are independent.
+/// Session-only accounting. Demonstration balances are independent by currency.
 #[derive(Clone)]
 struct DemoBroker {
     orders: Vec<DemoOrder>,
     positions: Vec<DemoPosition>,
     usd: f64,
     hkd: f64,
+    cny: f64,
     next_id: u64,
 }
 impl Global for DemoBroker {}
@@ -113,23 +118,24 @@ impl Default for DemoBroker {
             ],
             usd: 100_000.,
             hkd: 500_000.,
+            cny: 500_000.,
             next_id: 1002,
         }
     }
 }
 impl DemoBroker {
     fn available_cash(&self, symbol: Symbol) -> f64 {
-        let balance = if symbol.market() == "HK" {
-            self.hkd
-        } else {
-            self.usd
+        let balance = match symbol.currency() {
+            "HKD" => self.hkd,
+            "CNY" => self.cny,
+            _ => self.usd,
         };
         balance
             - self
                 .orders
                 .iter()
                 .filter(|o| {
-                    o.symbol.market() == symbol.market()
+                    o.symbol.currency() == symbol.currency()
                         && o.side == Side::Buy
                         && o.status == OrderStatus::Pending
                 })
@@ -203,10 +209,10 @@ impl DemoBroker {
         order.status = OrderStatus::Filled;
         let order = order.clone();
         let value = order.price * order.quantity as f64;
-        let balance = if order.symbol.market() == "HK" {
-            &mut self.hkd
-        } else {
-            &mut self.usd
+        let balance = match order.symbol.currency() {
+            "HKD" => &mut self.hkd,
+            "CNY" => &mut self.cny,
+            _ => &mut self.usd,
         };
         if order.side == Side::Buy {
             *balance -= value;
@@ -299,6 +305,31 @@ struct ContentSnapshot {
     large_trades_only: bool,
     #[serde(default)]
     book_queue: bool,
+    #[serde(default = "default_members", deserialize_with = "read_members")]
+    members: Vec<Symbol>,
+}
+
+fn default_members() -> Vec<Symbol> {
+    Symbol::LEGACY_DEFAULTS.to_vec()
+}
+
+fn read_members<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Symbol>, D::Error> {
+    let mut unique = Vec::new();
+    for symbol in Vec::<Symbol>::deserialize(deserializer)? {
+        if !unique.contains(&symbol) {
+            unique.push(symbol);
+        }
+    }
+    Ok(unique)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StockListPage {
+    List,
+    Catalog,
+    Import,
 }
 
 pub struct PanelContent {
@@ -307,7 +338,17 @@ pub struct PanelContent {
     period: Period,
     tick: u64,
     chart: Entity<MarketChart>,
+    history: Option<HistoryWindow>,
     query: Entity<InputState>,
+    catalog_query: Entity<InputState>,
+    stock_list_page: StockListPage,
+    import_text: Entity<TextareaState>,
+    import_preview: Result<ImportPreview, ImportError>,
+    import_message: Option<(String, bool)>,
+    import_loading: bool,
+    import_revision: u64,
+    import_request: u64,
+    members: Vec<Symbol>,
     price: Entity<InputState>,
     quantity: Entity<InputState>,
     side: Side,
@@ -338,7 +379,14 @@ impl PanelContent {
         if !cx.has_global::<DemoBroker>() {
             cx.set_global(DemoBroker::default());
         }
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索代码 / 名称"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选列表 / 代码名称"));
+        let catalog_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索股票目录 / 代码名称"));
+        let import_text = cx.new(|cx| {
+            TextareaState::new(window, cx).auto_grow(4, 4).placeholder(
+                "粘贴股票代码或名称，每行一支或用逗号分隔\nAAPL 苹果\n00700 腾讯控股\nMSFT, TSLA",
+            )
+        });
         let price = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(format!("{:.2}", market::quote(symbol, 0).price))
@@ -348,8 +396,9 @@ impl PanelContent {
         let max_amount = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
         let min_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最低"));
         let max_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
-        let subscriptions = [
+        let mut subscriptions: Vec<_> = [
             &query,
+            &catalog_query,
             &price,
             &quantity,
             &min_amount,
@@ -366,13 +415,59 @@ impl PanelContent {
             })
         })
         .collect();
+        subscriptions.push(
+            cx.subscribe(&import_text, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.import_revision = this.import_revision.wrapping_add(1);
+                    this.import_message = None;
+                    this.refresh_import(cx);
+                    cx.notify();
+                }
+            }),
+        );
+        let chart = cx.new(|cx| MarketChart::new(symbol, period, cx));
+        subscriptions.push(
+            cx.subscribe_in(&chart, window, |this, _, event, window, cx| {
+                let ChartEvent::InspectDay {
+                    symbol,
+                    day_index,
+                    tick,
+                } = *event;
+                match history::open(this.history.as_ref(), symbol, day_index, tick, window, cx) {
+                    Ok(view) => {
+                        this.history = Some(view);
+                        this.feedback = None;
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.feedback = Some((error.to_string(), true));
+                        cx.notify();
+                    }
+                }
+            }),
+        );
+        subscriptions.push(cx.on_release(|this, cx| {
+            if let Some(history) = this.history.take() {
+                history.close(cx);
+            }
+        }));
         Self {
             kind,
             symbol,
             period,
             tick: 0,
-            chart: cx.new(|cx| MarketChart::new(symbol, period, cx)),
+            chart,
+            history: None,
             query,
+            catalog_query,
+            stock_list_page: StockListPage::List,
+            import_text,
+            import_preview: stock_import::parse("", &[]),
+            import_message: None,
+            import_loading: false,
+            import_revision: 0,
+            import_request: 0,
+            members: Symbol::ALL.to_vec(),
             price,
             quantity,
             side: Side::Buy,
@@ -422,6 +517,7 @@ impl PanelContent {
             order_filter: self.filter_snapshot(cx),
             large_trades_only: self.large_trades_only,
             book_queue: self.book_queue,
+            members: self.members.clone(),
         })
         .unwrap_or(serde_json::Value::Null)
     }
@@ -445,6 +541,8 @@ impl PanelContent {
             self.filter_direction = saved.order_filter.direction.min(2);
             self.large_trades_only = saved.large_trades_only;
             self.book_queue = saved.book_queue;
+            self.members = saved.members;
+            self.leave_stock_import(window, cx);
             for (input, value) in [
                 (&self.min_amount, saved.order_filter.min_amount),
                 (&self.max_amount, saved.order_filter.max_amount),
@@ -465,10 +563,547 @@ impl PanelContent {
         cx.emit(ContentEvent::SymbolSelected(symbol));
     }
 
-    fn watchlist(&self, cx: &mut Context<Self>) -> AnyElement {
-        let query = self.query.read(cx).value().trim().to_lowercase();
-        let mut symbols: Vec<_> = Symbol::ALL
+    fn show_stock_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stock_list_page = StockListPage::Catalog;
+        self.catalog_query.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn refresh_import(&mut self, cx: &App) {
+        self.import_preview =
+            stock_import::parse(&self.import_text.read(cx).value(), &self.members);
+    }
+
+    fn leave_stock_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stock_list_page = StockListPage::List;
+        self.import_request = self.import_request.wrapping_add(1);
+        self.import_loading = false;
+        self.import_message = None;
+        self.import_preview = stock_import::parse("", &self.members);
+        self.import_text
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
+    fn show_stock_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_stock_import(window, cx);
+        self.stock_list_page = StockListPage::Import;
+        self.import_text
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn apply_stock_import(&mut self, cx: &mut Context<Self>) {
+        if self.import_loading
+            || self
+                .import_message
+                .as_ref()
+                .is_some_and(|(_, error)| *error)
+        {
+            return;
+        }
+        // Resolve against the current draft and membership again at commit time.
+        self.refresh_import(cx);
+        let Ok(preview) = &self.import_preview else {
+            return;
+        };
+        if preview.additions.is_empty() {
+            return;
+        }
+        let count = preview.additions.len();
+        self.members.extend(preview.additions.iter().copied());
+        self.refresh_import(cx);
+        self.import_message = Some((format!("已添加 {count} 支股票到当前列表"), false));
+        cx.emit(ContentEvent::ListChanged);
+        cx.notify();
+    }
+
+    fn read_import_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import_loading {
+            return;
+        }
+        self.import_request = self.import_request.wrapping_add(1);
+        let request = self.import_request;
+        let revision = self.import_revision;
+        self.import_loading = true;
+        self.import_message = None;
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择股票文本文件".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match selected.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        cx.background_executor()
+                            .spawn(async move {
+                                use std::io::Read as _;
+                                let file = std::fs::File::open(&path)
+                                    .map_err(|error| format!("无法读取文件：{error}"))?;
+                                let metadata =
+                                    file.metadata().map_err(|error| error.to_string())?;
+                                if !metadata.is_file() {
+                                    return Err("请选择普通文本文件".into());
+                                }
+                                if metadata.len() > stock_import::MAX_INPUT_BYTES as u64 {
+                                    return Err("文件超过 256 KiB，请拆分后导入".into());
+                                }
+                                let mut bytes = Vec::new();
+                                file.take(stock_import::MAX_INPUT_BYTES as u64 + 1)
+                                    .read_to_end(&mut bytes)
+                                    .map_err(|error| format!("无法读取文件：{error}"))?;
+                                stock_import::decode_text(&bytes)
+                                    .map(Some)
+                                    .map_err(|error| error.to_string())
+                            })
+                            .await
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Ok(Ok(None)) => Ok(None),
+                Ok(Err(error)) => Err(format!("无法打开文件选择器：{error}")),
+                Err(_) => Err("文件选择未完成，请重试或粘贴文本".into()),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.import_request != request || this.stock_list_page != StockListPage::Import {
+                    return;
+                }
+                this.import_loading = false;
+                if this.import_revision != revision {
+                    this.import_message = Some((
+                        "文本已修改，已保留当前输入；如需文件内容请重新读取".into(),
+                        false,
+                    ));
+                } else {
+                    match result {
+                        Ok(Some(text)) => {
+                            this.import_text
+                                .update(cx, |input, cx| input.set_value(text, window, cx));
+                            this.refresh_import(cx);
+                        }
+                        Ok(None) => {}
+                        Err(error) => this.import_message = Some((error, true)),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stock_import_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let preview = self.import_preview.as_ref().ok();
+        let count = preview.map_or(0, |p| p.additions.len());
+        let summary = preview.map_or_else(
+            || "识别未完成".to_string(),
+            |p| {
+                format!(
+                    "可添加 {} 支 · 已有 {} 支 · 重复 {} 次 · 未收录 {} 项",
+                    p.additions.len(),
+                    p.already_present,
+                    p.duplicates,
+                    p.unknown.len()
+                )
+            },
+        );
+        let blocked = self.import_loading
+            || self
+                .import_message
+                .as_ref()
+                .is_some_and(|(_, error)| *error);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .flex_shrink_0()
+                    .child(div().font_weight(FontWeight::MEDIUM).child("从文本导入"))
+                    .child(
+                        Button::new("stock-import-cancel")
+                            .label("返回列表")
+                            .small()
+                            .ghost()
+                            .text_color(rgb(TEAL))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.leave_stock_import(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("stock-import-body")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .flex_shrink_0()
+                            .child("粘贴代码、名称或表格；支持换行、空格及中英文逗号。"),
+                    )
+                    .child(
+                        div()
+                            .id("stock-import-text")
+                            .test_support()
+                            .px_2()
+                            .flex_shrink_0()
+                            .child(
+                                Textarea::new(&self.import_text)
+                                    .accessibility_id("stock-import-text-input")
+                                    .aria_label("待导入股票文本")
+                                    .small()
+                                    .h(px(106.))
+                                    .w_full(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("stock-import-file")
+                                    .label(if self.import_loading {
+                                        "读取中…"
+                                    } else {
+                                        "读取文件"
+                                    })
+                                    .small()
+                                    .ghost()
+                                    .disabled(self.import_loading)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.read_import_file(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("stock-import-clear")
+                                    .label("清空")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.import_request = this.import_request.wrapping_add(1);
+                                        this.import_loading = false;
+                                        this.import_message = None;
+                                        this.import_text.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        this.refresh_import(cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .flex_shrink_0()
+                            .child("TXT / CSV · UTF-8、UTF-16、GB18030 · 最多 256 KiB"),
+                    )
+                    .child(
+                        div()
+                            .id("stock-import-summary")
+                            .test_support()
+                            .aria_label(summary.clone())
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0xe8f6f6))
+                            .text_size(px(11.))
+                            .flex_shrink_0()
+                            .child(summary),
+                    )
+                    .when_some(self.import_preview.as_ref().err(), |view, error| {
+                        view.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_color(rgb(RED))
+                                .child(error.to_string()),
+                        )
+                    })
+                    .when_some(self.import_message.as_ref(), |view, (message, error)| {
+                        view.child(
+                            div()
+                                .id("stock-import-message")
+                                .test_support()
+                                .aria_label(message.clone())
+                                .px_2()
+                                .py_1()
+                                .text_color(rgb(if *error { RED } else { TEAL }))
+                                .child(message.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("stock-import-preview")
+                            .test_support()
+                            .children(preview.into_iter().flat_map(|p| p.recognized.iter()).map(
+                                |symbol| {
+                                    let exists = self.members.contains(symbol);
+                                    div()
+                                        .px_2()
+                                        .py_2()
+                                        .flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .border_b_1()
+                                        .border_color(rgb(LINE))
+                                        .child(div().flex_1().min_w_0().child(format!(
+                                            "{}  {}",
+                                            symbol.code(),
+                                            symbol.name()
+                                        )))
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(if exists { MUTED } else { TEAL }))
+                                                .flex_shrink_0()
+                                                .child(if exists {
+                                                    "已在列表"
+                                                } else {
+                                                    "待添加"
+                                                }),
+                                        )
+                                },
+                            ))
+                            .children(
+                                preview
+                                    .into_iter()
+                                    .flat_map(|p| p.unknown.iter().take(200))
+                                    .map(|code| {
+                                        div()
+                                            .px_2()
+                                            .py_2()
+                                            .flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .border_b_1()
+                                            .border_color(rgb(LINE))
+                                            .child(div().flex_1().min_w_0().child(code.clone()))
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(MUTED))
+                                                    .flex_shrink_0()
+                                                    .child("目录未收录"),
+                                            )
+                                    }),
+                            )
+                            .when(preview.is_some_and(|p| p.unknown.len() > 200), |view| {
+                                view.child(
+                                    div()
+                                        .p_2()
+                                        .text_color(rgb(MUTED))
+                                        .child("未收录项目仅预览前 200 项"),
+                                )
+                            })
+                            .when(
+                                preview.is_some_and(|p| {
+                                    p.recognized.is_empty() && p.unknown.is_empty()
+                                }),
+                                |view| {
+                                    view.child(
+                                        div()
+                                            .p_4()
+                                            .text_color(rgb(MUTED))
+                                            .child("输入后自动识别，确认添加前不改变当前列表"),
+                                    )
+                                },
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Button::new("stock-import-confirm")
+                            .label(format!("添加 {count} 支到当前列表"))
+                            .small()
+                            .primary()
+                            .w_full()
+                            .disabled(count == 0 || blocked)
+                            .on_click(cx.listener(|this, _, _, cx| this.apply_stock_import(cx))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child("仅匹配当前模拟目录，自动跳过已有和重复股票"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn stock_catalog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.catalog_query.read(cx).value().trim().to_lowercase();
+        let symbols: Vec<_> = Symbol::ALL
             .into_iter()
+            .filter(|symbol| {
+                symbol.code().to_lowercase().contains(&query) || symbol.name().contains(&query)
+            })
+            .collect();
+        let empty = symbols.is_empty();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().font_weight(FontWeight::MEDIUM).child("添加股票"))
+                    .child(
+                        Button::new("stock-list-back")
+                            .label("返回列表")
+                            .small()
+                            .ghost()
+                            .text_color(rgb(TEAL))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stock_list_page = StockListPage::List;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div().p_2().child(
+                    Input::new(&self.catalog_query)
+                        .id("stock-list-catalog-search")
+                        .small()
+                        .w_full(),
+                ),
+            )
+            .child(
+                Button::new("stock-catalog-import")
+                    .label("从文本导入")
+                    .small()
+                    .ghost()
+                    .text_color(rgb(TEAL))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.show_stock_import(window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("stock-list-catalog-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(symbols.into_iter().map(|symbol| {
+                        let exists = self.members.contains(&symbol);
+                        div()
+                            .h(px(53.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().truncate().child(symbol.name()))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(MUTED))
+                                            .child(format!(
+                                                "{}  {}",
+                                                symbol.market(),
+                                                symbol.code()
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "stock-list-add-{}",
+                                    symbol.code()
+                                )))
+                                .label(if exists { "已添加" } else { "添加" })
+                                .small()
+                                .ghost()
+                                .flex_shrink_0()
+                                .text_color(rgb(TEAL))
+                                .disabled(exists)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if !this.members.contains(&symbol) {
+                                            this.members.push(symbol);
+                                            cx.emit(ContentEvent::ListChanged);
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                            )
+                    }))
+                    .when(empty, |d| {
+                        d.child(
+                            div()
+                                .p_4()
+                                .text_color(rgb(MUTED))
+                                .child("模拟股票目录中没有匹配结果"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("模拟股票目录 · 当前列表 {} 支", self.members.len())),
+            )
+            .into_any_element()
+    }
+
+    fn watchlist(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.stock_list_page {
+            StockListPage::Catalog => return self.stock_catalog(cx),
+            StockListPage::Import => return self.stock_import_view(cx),
+            StockListPage::List => {}
+        }
+        let query = self.query.read(cx).value().trim().to_lowercase();
+        let mut symbols: Vec<_> = self
+            .members
+            .iter()
+            .copied()
             .filter(|s| s.code().to_lowercase().contains(&query) || s.name().contains(&query))
             .collect();
         if self.sort > 0 {
@@ -487,17 +1122,54 @@ impl PanelContent {
             .flex()
             .flex_col()
             .child(
-                div().p_2().child(
-                    Input::new(&self.query)
-                        .id("watchlist-search")
-                        .small()
-                        .w_full(),
-                ),
+                div()
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.query)
+                                .id("watchlist-search")
+                                .small()
+                                .w_full(),
+                        ),
+                    )
+                    .child(
+                        Button::new("stock-list-add")
+                            .label("添加")
+                            .tooltip("添加股票到当前列表")
+                            .small()
+                            .ghost()
+                            .flex_shrink_0()
+                            .text_color(rgb(TEAL))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_stock_catalog(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .flex()
+                    .justify_end()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("stock-list-import")
+                            .label("从文本导入")
+                            .small()
+                            .ghost()
+                            .text_color(rgb(TEAL))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_stock_import(window, cx)
+                            })),
+                    ),
             )
             .child(
                 div()
                     .h(px(29.))
-                    .px_3()
+                    .px_2()
                     .flex()
                     .items_center()
                     .border_b_1()
@@ -506,7 +1178,7 @@ impl PanelContent {
                     .child(div().flex_1().min_w_0().truncate().child("名称 / 代码"))
                     .child(
                         div()
-                            .w(px(64.))
+                            .w(px(58.))
                             .flex_shrink_0()
                             .text_right()
                             .child("最新价"),
@@ -521,7 +1193,7 @@ impl PanelContent {
                             },
                             false,
                         )
-                        .w(px(64.))
+                        .w(px(58.))
                         .px_0()
                         .flex_shrink_0()
                         .text_right()
@@ -530,7 +1202,8 @@ impl PanelContent {
                             cx.notify();
                         }))
                         .test_support(),
-                    ),
+                    )
+                    .child(div().w(px(26.)).flex_shrink_0()),
             )
             .child(
                 div()
@@ -543,7 +1216,7 @@ impl PanelContent {
                         div()
                             .id(SharedString::from(format!("symbol-{}", symbol.code())))
                             .h(px(53.))
-                            .px_3()
+                            .px_2()
                             .flex()
                             .items_center()
                             .border_b_1()
@@ -582,7 +1255,7 @@ impl PanelContent {
                             )
                             .child(
                                 div()
-                                    .w(px(64.))
+                                    .w(px(58.))
                                     .flex_shrink_0()
                                     .text_right()
                                     .font_weight(FontWeight::MEDIUM)
@@ -591,11 +1264,33 @@ impl PanelContent {
                             )
                             .child(
                                 div()
-                                    .w(px(64.))
+                                    .w(px(58.))
                                     .flex_shrink_0()
                                     .text_right()
                                     .text_color(movement(quote.change))
                                     .child(format!("{:+.2}%", quote.change_pct)),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "stock-list-remove-{}",
+                                    symbol.code()
+                                )))
+                                .label("×")
+                                .tooltip(format!("从当前列表移除 {}", symbol.code()))
+                                .small()
+                                .ghost()
+                                .w(px(26.))
+                                .px_0()
+                                .flex_shrink_0()
+                                .text_color(rgb(MUTED))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.members.retain(|member| *member != symbol);
+                                        cx.emit(ContentEvent::ListChanged);
+                                        cx.notify();
+                                    },
+                                )),
                             )
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.select_symbol(symbol, cx)),
@@ -603,7 +1298,32 @@ impl PanelContent {
                             .test_support()
                     }))
                     .when(count == 0, |d| {
-                        d.child(div().p_4().text_color(rgb(MUTED)).child("没有匹配的股票"))
+                        d.child(
+                            div()
+                                .p_4()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .text_color(rgb(MUTED))
+                                .child(if self.members.is_empty() {
+                                    "列表为空，添加股票开始关注"
+                                } else {
+                                    "列表中没有匹配的股票"
+                                })
+                                .when(self.members.is_empty(), |d| {
+                                    d.child(
+                                        Button::new("stock-list-empty-add")
+                                            .label("添加股票")
+                                            .small()
+                                            .ghost()
+                                            .text_color(rgb(TEAL))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.show_stock_catalog(window, cx);
+                                            })),
+                                    )
+                                }),
+                        )
                     }),
             )
             .child(
@@ -614,7 +1334,11 @@ impl PanelContent {
                     .text_color(rgb(MUTED))
                     .border_t_1()
                     .border_color(rgb(LINE))
-                    .child(format!("{} 支自选 · 点击股票联动工作区", count)),
+                    .child(if query.is_empty() {
+                        format!("{} 支股票 · 点击联动同组组件", self.members.len())
+                    } else {
+                        format!("显示 {} / {} 支股票", count, self.members.len())
+                    }),
             )
             .into_any_element()
     }
@@ -650,31 +1374,64 @@ impl PanelContent {
                         .test_support()
                     }))
                     .child(div().flex_1())
+                    .when(self.period != Period::Intraday, |view| {
+                        view.child(
+                            control("chart-zoom-out", "−", false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chart
+                                        .update(cx, |chart, cx| chart.zoom_step(false, cx));
+                                }))
+                                .test_support(),
+                        )
+                        .child(
+                            control("chart-zoom-in", "+", false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chart.update(cx, |chart, cx| chart.zoom_step(true, cx));
+                                }))
+                                .test_support(),
+                        )
+                    })
                     .child(
-                        control("chart-zoom-out", "−", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.chart
-                                    .update(cx, |chart, cx| chart.zoom_step(false, cx));
-                            }))
-                            .test_support(),
-                    )
-                    .child(
-                        control("chart-zoom-in", "+", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.chart.update(cx, |chart, cx| chart.zoom_step(true, cx));
-                            }))
-                            .test_support(),
-                    )
-                    .child(
-                        control("chart-reset", "复位", false)
-                            .flex_shrink_0()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.chart.update(cx, |chart, cx| chart.reset(cx));
-                            }))
-                            .test_support(),
+                        control(
+                            "chart-reset",
+                            if self.period == Period::Intraday {
+                                "全天"
+                            } else {
+                                "复位"
+                            },
+                            false,
+                        )
+                        .flex_shrink_0()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.chart.update(cx, |chart, cx| chart.reset(cx));
+                        }))
+                        .test_support(),
                     ),
             )
+            .when_some(self.feedback.as_ref(), |view, (message, _)| {
+                view.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(RED))
+                        .child(message.clone()),
+                )
+            })
             .child(div().flex_1().min_h_0().child(self.chart.clone()))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(if self.period == Period::Day {
+                        "单击查看数据 · ← → 逐日定位 · 双击查看当日分时 · Esc 退出定位"
+                    } else if self.period == Period::Intraday {
+                        "单击显示 / 隐藏定位 · 移动鼠标查看 · Esc 退出"
+                    } else {
+                        "单击查看数据 · 滚轮缩放 · 拖动平移 · Esc 退出定位"
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1399,7 +2156,7 @@ impl PanelContent {
                 "市场观察",
                 "09:18",
                 "全球市场晨报：科技板块与主要指数表现".into(),
-                "模拟资讯正文：工作区支持同时打开多个股票面板。点击自选列表可以联动图表、报价、盘口和资讯；固定到独立联动组后，可以并排比较不同标的。",
+                "模拟资讯正文：工作区支持同时打开多个股票面板。点击股票列表可以联动图表、报价、盘口和资讯；固定到独立联动组后，可以并排比较不同标的。",
             ),
             (
                 "产品说明",
@@ -1746,9 +2503,9 @@ impl PanelContent {
 
     fn positions(&self, cx: &mut Context<Self>) -> AnyElement {
         let positions = cx.global::<DemoBroker>().positions.clone();
-        let (usd, hkd) = {
+        let (usd, hkd, cny) = {
             let broker = cx.global::<DemoBroker>();
-            (broker.usd, broker.hkd)
+            (broker.usd, broker.hkd, broker.cny)
         };
         div()
             .size_full()
@@ -1756,14 +2513,17 @@ impl PanelContent {
             .flex_col()
             .child(
                 div()
+                    .id("positions-balances")
                     .h(px(36.))
                     .px_3()
                     .flex()
                     .items_center()
                     .gap_4()
+                    .overflow_x_scroll()
                     .child(badge("模拟持仓"))
                     .child(format!("现金 {usd:.2} USD"))
-                    .child(div().text_color(rgb(MUTED)).child(format!("{hkd:.2} HKD"))),
+                    .child(div().text_color(rgb(MUTED)).child(format!("{hkd:.2} HKD")))
+                    .child(div().text_color(rgb(MUTED)).child(format!("{cny:.2} CNY"))),
             )
             .child(
                 div()
@@ -1895,11 +2655,7 @@ fn movement(change: f64) -> Rgba {
     rgb(if change >= 0. { RED } else { TEAL })
 }
 fn currency(symbol: Symbol) -> &'static str {
-    if symbol.market() == "HK" {
-        "HKD"
-    } else {
-        "USD"
-    }
+    symbol.currency()
 }
 fn compact(value: f64) -> String {
     if value.abs() >= 1e12 {
@@ -2465,6 +3221,31 @@ mod tests {
     }
 
     #[test]
+    fn shanghai_and_shenzhen_share_cny_without_spending_other_currencies() {
+        let mut broker = DemoBroker::default();
+        let id = broker
+            .submit(Symbol::Yinli, Side::Buy, 20., 10_000)
+            .unwrap();
+        assert_eq!(broker.available_cash(Symbol::Yangguang), 300_000.);
+        assert!(
+            broker
+                .submit(Symbol::Yangguang, Side::Buy, 15., 30_000)
+                .is_err()
+        );
+        assert_eq!(broker.available_cash(Symbol::Aapl), 100_000.);
+        assert_eq!(broker.available_cash(Symbol::Tencent), 500_000.);
+        broker.fill(id);
+        broker.fill(id);
+        assert_eq!(broker.cny, 300_000.);
+        assert_eq!(broker.available_shares(Symbol::Yinli), 10_000);
+        let sell = broker.submit(Symbol::Yinli, Side::Sell, 21., 100).unwrap();
+        broker.fill(sell);
+        assert_eq!(broker.cny, 302_100.);
+        assert_eq!(broker.usd, 100_000.);
+        assert_eq!(broker.hkd, 500_000.);
+    }
+
+    #[test]
     fn simulated_fills_update_positions_and_do_not_fill_twice() {
         let mut broker = DemoBroker::default();
         let id = broker.submit(Symbol::Aapl, Side::Sell, 340., 60).unwrap();
@@ -2491,6 +3272,25 @@ mod tests {
         assert!(!saved.order_filter.enabled);
         assert!(saved.order_filter.min_amount.is_empty());
         assert!(!saved.large_trades_only && !saved.book_queue);
+        assert_eq!(saved.members, Symbol::LEGACY_DEFAULTS);
+    }
+
+    #[test]
+    fn stock_members_preserve_explicit_empty_lists_and_remove_duplicate_symbols() {
+        let mut value = serde_json::json!({
+            "query": "", "price": "340.00", "quantity": "100", "side": "Buy",
+            "sort": 0, "chart": {"bars_visible": 70, "offset_from_latest": 0},
+            "members": []
+        });
+        let empty: ContentSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert!(empty.members.is_empty());
+        let restored: ContentSnapshot =
+            serde_json::from_value(serde_json::to_value(empty).unwrap()).unwrap();
+        assert!(restored.members.is_empty());
+
+        value["members"] = serde_json::json!(["Tencent", "Msft", "Tencent", "Msft"]);
+        let saved: ContentSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(saved.members, [Symbol::Tencent, Symbol::Msft]);
     }
 
     #[test]
