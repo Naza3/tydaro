@@ -109,6 +109,8 @@ struct PanelSurface {
 pub struct DragCoordinator {
     windows: BTreeMap<u64, ScreenRect>,
     panels: BTreeMap<u64, PanelSurface>,
+    /// Counts durable panels including inactive tabs, not only painted surfaces.
+    window_panel_counts: BTreeMap<u64, usize>,
     /// Oldest/backmost first. Update when GPUI reports a window activation.
     stacking: Vec<u64>,
     session: Option<DragSession>,
@@ -174,6 +176,10 @@ impl DragCoordinator {
         self.panels.insert(panel, PanelSurface { window, bounds });
     }
 
+    pub fn set_window_panel_count(&mut self, window: u64, count: usize) {
+        self.window_panel_counts.insert(window, count);
+    }
+
     pub fn raise_window(&mut self, window: u64) {
         if self.windows.contains_key(&window) {
             self.stacking.retain(|id| *id != window);
@@ -183,6 +189,7 @@ impl DragCoordinator {
 
     pub fn remove_window(&mut self, window: u64) {
         self.windows.remove(&window);
+        self.window_panel_counts.remove(&window);
         self.clear_window_panels(window);
         self.stacking.retain(|id| *id != window);
         if self.session.is_some_and(|s| s.source_window == window) {
@@ -253,11 +260,32 @@ impl DragCoordinator {
     }
 
     fn hit_test(&self, position: ScreenPoint) -> Option<DropTarget> {
-        let window = self.stacking.iter().rev().find(|id| {
+        let contains = |id: &&u64| {
             self.windows
                 .get(id)
                 .is_some_and(|bounds| bounds.contains(position))
-        })?;
+        };
+        let front = self.stacking.iter().rev().find(contains)?;
+        // A newly opened single-component window usually sits above its intended
+        // destination. During its component drag, treat just this source as a
+        // transparent drag surface so it cannot mask the main workspace. Keep a
+        // self target when nothing lies behind it (a self-drop remains a no-op).
+        // Multi-panel sources are never skipped: their other groups remain valid
+        // destinations, and inactive tabs count towards this decision.
+        let source = self.session.map(|session| session.source_window);
+        let window = if source == Some(*front)
+            && *front != 0
+            && self.window_panel_counts.get(front) == Some(&1)
+        {
+            self.stacking
+                .iter()
+                .rev()
+                .filter(|id| **id != *front)
+                .find(contains)
+                .unwrap_or(front)
+        } else {
+            front
+        };
         let bounds = *self.windows.get(window)?;
         if let Some((panel, surface)) = self
             .panels
@@ -534,5 +562,70 @@ mod tests {
         assert_eq!(drag.update(point(400.0, 300.0)).unwrap().panel, Some(20));
         drag.clear_window_panels(2);
         assert_eq!(drag.update(point(400.0, 300.0)).unwrap().panel, None);
+    }
+
+    #[test]
+    fn singleton_source_does_not_occlude_underlying_docking_target() {
+        let mut drag = DragCoordinator::default();
+        drag.register_window(0, rect(0., 0., 1200., 800.));
+        drag.register_panel(0, 10, rect(0., 0., 1200., 800.));
+        drag.register_window(1, rect(100., 100., 320., 500.));
+        drag.register_panel(1, 20, rect(100., 100., 320., 500.));
+        drag.set_window_panel_count(1, 1);
+        drag.begin(1, 20, point(150., 110.));
+        let target = drag.update(point(120., 300.)).unwrap();
+        assert_eq!(
+            (target.window, target.panel, target.side),
+            (0, Some(10), DockSide::Left)
+        );
+        assert!(matches!(
+            drag.finish(point(120., 300.)),
+            Some(TransferIntent::Dock { panel: 20, .. })
+        ));
+    }
+
+    #[test]
+    fn inactive_tabs_keep_multi_panel_source_as_a_local_target() {
+        let mut drag = DragCoordinator::default();
+        drag.register_window(0, rect(0., 0., 1200., 800.));
+        drag.register_panel(0, 10, rect(0., 0., 1200., 800.));
+        drag.register_window(1, rect(100., 100., 600., 500.));
+        // Only one painted tab, but another durable panel is inactive.
+        drag.register_panel(1, 20, rect(100., 100., 600., 500.));
+        drag.set_window_panel_count(1, 2);
+        drag.begin(1, 20, point(150., 110.));
+        assert_eq!(drag.finish(point(120., 300.)), None);
+        // Another visible group in that same source must remain dockable too.
+        drag.register_panel(1, 21, rect(400., 100., 300., 500.));
+        drag.register_panel(1, 20, rect(100., 100., 300., 500.));
+        drag.begin(1, 20, point(150., 110.));
+        let target = drag.update(point(500., 150.)).unwrap();
+        assert_eq!(
+            (target.window, target.panel, target.side),
+            (1, Some(21), DockSide::Top)
+        );
+    }
+
+    #[test]
+    fn singleton_self_drop_without_underlying_window_is_still_a_noop() {
+        let mut drag = DragCoordinator::default();
+        drag.register_window(1, rect(100., 100., 320., 500.));
+        drag.register_panel(1, 20, rect(100., 100., 320., 500.));
+        drag.set_window_panel_count(1, 1);
+        drag.begin(1, 20, point(150., 110.));
+        assert_eq!(drag.finish(point(120., 300.)), None);
+    }
+
+    #[test]
+    fn cancellation_clears_preview_and_prevents_any_transfer() {
+        let mut drag = DragCoordinator::default();
+        drag.register_window(0, rect(0., 0., 1200., 800.));
+        drag.register_window(1, rect(1400., 0., 320., 500.));
+        drag.begin(1, 20, point(1450., 30.));
+        assert!(drag.update(point(100., 100.)).is_some());
+        drag.cancel();
+        assert!(!drag.is_active());
+        assert!(drag.target.is_none());
+        assert_eq!(drag.finish(point(100., 100.)), None);
     }
 }

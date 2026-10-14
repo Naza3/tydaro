@@ -76,12 +76,12 @@ Windows 和 Linux 在仓库检查后并行；Linux 暂不生成发布安装包�
 
 ### 触发与加速策略
 
-- 任务分支推送后创建或更新 PR，不再单独触发一次 push 构建；同一个 PR 的新提交会取消旧运行。`main` 的 push 用于合并后的验证和更新默认分支缓存，日常开发不得直接推送 `main`。
+- `codex/dev` 推送后通过当前阶段的开放 PR 触发构建，不再单独触发一次 push 构建；没有开放 PR 时可手动构建。同一个 PR 的新提交会取消旧运行。`main` 的 push 用于合并后的验证和更新默认分支缓存，日常开发不得直接推送 `main`。
 - `README.md`、`AGENTS.md`、`CONTRIBUTING.md`、PR 模板及 `docs/` 下的 Markdown/图片属于已知文档。只修改这些文件时跳过原生编译；删除或重命名代码、混合修改、未知路径、无法比较历史时都完整构建。手动运行始终完整构建。纯文档运行不生成新的 Windows ZIP。
 - Windows 测试与发行版共用 Release 依赖，缓存只保留 Release 目录，避免同时存储 Debug/Release 两套图形依赖。Linux 保留 Debug 缓存。
 - 缓存键包含平台、配置、Rust 工具链、锁文件和源文件/构建脚本哈希。源码变化会保存新缓存，按相同锁文件、相同工具链依次回退复用旧依赖；Cargo 自行校验哪些目标需要重编译。缓存不是可直接信任的发行产物，每次仍执行测试、构建与打包。
 - 仅缓存 Cargo 索引、压缩依赖、Git 对象与编译输出，不重复缓存解压后的依赖源码；ZIP/PNG 上传不再二次压缩。
-- GitHub 的 PR 缓存隔离于其他 PR；PR 可以读取默认分支缓存。合并后首次 `main` 构建会建立可供后续分支复用的缓存。缓存格式或 Rust 版本变化后的首轮仍需冷构建。
+- GitHub 的 PR 缓存位于 `refs/pull/<编号>/merge`，可供同一个 PR 的后续构建复用，但隔离于其他 PR；它不等于开发分支本身的缓存。PR 可以读取基础分支和默认分支的缓存。合并后首次 `main` 构建会建立可供后续阶段 PR 复用的缓存。仅保持相同开发分支不能让新 PR 读取旧 PR 的缓存；缓存格式或 Rust 版本变化后的首轮仍需冷构建。
 
 不要为了缩短时间跳过 Windows 原生构建、测试或 Linux 渲染。可用下列命令检查本次工作流修改：
 
@@ -93,4 +93,4 @@ actionlint .github/workflows/build.yml  # 需要另行安装 actionlint
 
 性能对比应分别记录冷缓存、暖缓存、缓存还原及原生编译耗时，不把 Runner 排队或额外检查耗时混为编译提速。优化前的基线为 Actions `38496661889`（冷）和 `38498201872`（暖）：Windows 任务分别为 14 分 20 秒、1 分 53 秒；暖缓存还原约 59 秒，冷构建中 Debug 测试编译 4 分 08 秒、Release 编译 9 分 17 秒。Linux 任务分别为 3 分 44 秒、1 分钟（优化前不包含 Clippy）。新策略的实际效果以对应 PR 的运行记录为准。
 
-到仓库 **Actions → Desktop build → 对应提交 → Artifacts** 下载 `tydaro-windows-x86_64-<commit>`；解开 GitHub artifact 后再解开内部版本 ZIP。PR 构建的提交号是 GitHub 临时合并提交，打包信息会记录实际构建的提交。产物保留 14 天，工作流不自动创建 GitHub Release。若需手动重建，选择 **Run workflow → 当前任务分支**。构建成功与真实 Windows 桌面验收分别记录：CI 模型测试与编译不能证明跨屏拖拽、输入法、混合 DPI 等交互已经通过。
+到仓库 **Actions → Desktop build → 对应提交 → Artifacts** 下载 `tydaro-windows-x86_64-<commit>`；解开 GitHub artifact 后再解开内部版本 ZIP。PR 构建的提交号是 GitHub 临时合并提交，打包信息会记录实际构建的提交。产物保留 14 天，工作流不自动创建 GitHub Release。若需手动重建，选择 **Run workflow → codex/dev**。构建成功与真实 Windows 桌面验收分别记录：CI 模型测试与编译不能证明跨屏拖拽、输入法、混合 DPI 等交互已经通过。

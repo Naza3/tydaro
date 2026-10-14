@@ -28,9 +28,9 @@ expect_rejected() {
 }
 
 expect_rejected 'Direct commits to main are blocked' git commit --quiet --allow-empty -m 'test: blocked main commit'
-git switch --quiet -c chore/hook-test
-git commit --quiet --allow-empty -m 'test: task branch is allowed'
-git push --quiet origin HEAD:refs/heads/chore/hook-test
+git switch --quiet -c codex/dev
+git commit --quiet --allow-empty -m 'test: development branch is allowed'
+git push --quiet origin HEAD:refs/heads/codex/dev
 expect_rejected 'Direct pushes to refs/heads/main are blocked' git push origin HEAD:refs/heads/main
 expect_rejected 'Direct pushes to refs/heads/master are blocked' git push origin HEAD:refs/heads/master
 if git --git-dir="$test_root/remote.git" show-ref --verify --quiet refs/heads/main; then
@@ -41,4 +41,4 @@ git switch --quiet -c master
 expect_rejected 'Direct commits to master are blocked' git commit --quiet --allow-empty -m 'test: blocked master commit'
 git switch --quiet --detach HEAD
 expect_rejected 'detached HEAD' git commit --quiet --allow-empty -m 'test: blocked detached commit'
-printf '%s\n' 'PASS: task branch commit/push; main/master commit and destination push guards; detached HEAD guard.'
+printf '%s\n' 'PASS: codex/dev commit/push; main/master commit and destination push guards; detached HEAD guard.'
