@@ -55,6 +55,13 @@ impl Symbol {
         }
     }
 
+    pub fn currency(self) -> &'static str {
+        match self {
+            Self::Tencent | Self::Alibaba => "HKD",
+            _ => "USD",
+        }
+    }
+
     fn seed(self) -> u64 {
         match self {
             Self::Aapl => 11,
@@ -191,6 +198,26 @@ pub struct Bar {
     pub low: f64,
     pub close: f64,
     pub volume: u64,
+}
+
+/// A frozen local demonstration of one daily candle's intraday session.
+///
+/// `day_index` addresses the chronological array returned by `bars(..., Day,
+/// ...)`, rather than the visible/panned chart slice. Dates skip weekends, but
+/// are not an exchange holiday calendar. All symbols share the synthetic
+/// 09:30–16:00 clock, including Hong Kong symbols.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoricalSession {
+    pub day_index: usize,
+    pub date: String,
+    pub weekday: &'static str,
+    pub daily: Bar,
+    pub previous_close: f64,
+    pub bars: Vec<Bar>,
+    pub turnover: f64,
+    pub turnover_rate: f64,
+    pub previous_day: Option<usize>,
+    pub next_day: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -377,11 +404,7 @@ fn historical_close(symbol: Symbol, age: u64, period: Period) -> i64 {
 
 // Demo history is anchored at 2026-10-14. It is deliberately independent of the
 // machine date so screenshots and interaction tests remain reproducible.
-fn historical_date(age: u64, period: Period) -> String {
-    if period == Period::Month {
-        let months = 2026 * 12 + 9 - age;
-        return format!("{:04}/{:02}", months / 12, months % 12 + 1);
-    }
+fn historical_date_parts(age: u64, period: Period) -> (i32, i32, i32) {
     let mut remaining = if period == Period::Week {
         age * 7
     } else {
@@ -404,7 +427,172 @@ fn historical_date(age: u64, period: Period) -> String {
         };
     }
     day -= remaining as i32;
+    (year, month, day)
+}
+
+fn historical_date(age: u64, period: Period) -> String {
+    if period == Period::Month {
+        let months = 2026 * 12 + 9 - age;
+        return format!("{:04}/{:02}", months / 12, months % 12 + 1);
+    }
+    let (_, month, day) = historical_date_parts(age, period);
     format!("{month:02}/{day:02}")
+}
+
+/// Full date for one candle in the complete daily history. A visible chart
+/// index must first be offset by its viewport's start. Out-of-range indices do
+/// not wrap or silently select another day.
+pub fn daily_date(day_index: usize) -> Option<String> {
+    let age = (BAR_COUNT as usize).checked_sub(day_index.checked_add(1)?)? as u64;
+    let (year, month, day) = historical_date_parts(age, Period::Day);
+    Some(format!("{year:04}/{month:02}/{day:02}"))
+}
+
+fn completed_daily_candle(symbol: Symbol, age: u64) -> Candle {
+    let open = historical_close(symbol, age, Period::Day);
+    let close = historical_close(symbol, age - 1, Period::Day);
+    let wick = symbol.previous_close() / 150 + (noise(symbol.seed(), age) % 80) as i64;
+    Candle {
+        open,
+        high: open.max(close) + wick,
+        low: open.min(close) - wick,
+        close,
+        volume: 12_000_000 + noise(symbol.seed() + 31, age) % 40_000_000,
+    }
+}
+
+/// Expand an existing completed daily candle without inventing conflicting
+/// high/low/close or total volume. Price paths visit both daily extremes, and
+/// integer cumulative allocation preserves every share of the daily volume.
+fn completed_session_bars(symbol: Symbol, age: u64, daily: Candle) -> Vec<Bar> {
+    const LAST_MINUTE: u64 = 390;
+    let seed = symbol.seed().wrapping_add(age * 337);
+    let first_extreme = 70 + noise(seed, 1) % 45;
+    let second_extreme = 235 + noise(seed, 2) % 55;
+    let (first_price, second_price) = if daily.close >= daily.open {
+        (daily.low, daily.high)
+    } else {
+        (daily.high, daily.low)
+    };
+    let anchors = [
+        (0, daily.open),
+        (first_extreme, first_price),
+        (second_extreme, second_price),
+        (LAST_MINUTE, daily.close),
+    ];
+    let close_at = |index: u64| {
+        let &(left_index, left_price) = anchors
+            .iter()
+            .rev()
+            .find(|(position, _)| *position <= index)
+            .unwrap();
+        if index == left_index {
+            return left_price;
+        }
+        let &(right_index, right_price) = anchors
+            .iter()
+            .find(|(position, _)| *position > index)
+            .unwrap();
+        let span = (right_index - left_index) as i64;
+        let offset = (index - left_index) as i64;
+        let trend = left_price + (right_price - left_price) * offset / span;
+        let envelope = offset.min(span - offset);
+        let movement =
+            wave(seed + 7, index, 7, (daily.high - daily.low) / 20) * envelope * 2 / span;
+        (trend + movement).clamp(daily.low, daily.high)
+    };
+    let weights: Vec<_> = (0..=LAST_MINUTE)
+        .map(|index| {
+            50 + noise(seed + 11, index) % 100 + if !(30..=360).contains(&index) { 160 } else { 0 }
+        })
+        .collect();
+    let weight_sum: u64 = weights.iter().sum();
+    let mut weight_so_far = 0;
+    let mut volume_so_far = 0;
+    (0..=LAST_MINUTE)
+        .map(|index| {
+            let open = if index == 0 {
+                daily.open
+            } else {
+                close_at(index - 1)
+            };
+            let close = close_at(index);
+            let wick = (noise(seed + 17, index) % 15) as i64;
+            weight_so_far += weights[index as usize];
+            let next_volume = daily.volume * weight_so_far / weight_sum;
+            let volume = next_volume - volume_so_far;
+            volume_so_far = next_volume;
+            public_bar(
+                minute_label(index),
+                Candle {
+                    open,
+                    high: (open.max(close) + wick).min(daily.high),
+                    low: (open.min(close) - wick).max(daily.low),
+                    close,
+                    volume,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Inspect a daily candle using one fixed demo tick. The latest day is a
+/// partial session matching the current quote at that tick; completed days
+/// contain the full synthetic session and are independent of future ticks.
+/// Previous/next indices stay within the available daily history.
+pub fn historical_session(
+    symbol: Symbol,
+    day_index: usize,
+    tick: u64,
+) -> Option<HistoricalSession> {
+    let date = daily_date(day_index)?;
+    let age = BAR_COUNT - 1 - day_index as u64;
+    let (daily, session, previous_close) = if age == 0 {
+        let snapshot = quote(symbol, tick);
+        (
+            Bar {
+                time: historical_date(0, Period::Day),
+                open: snapshot.open,
+                high: snapshot.high,
+                low: snapshot.low,
+                close: snapshot.price,
+                volume: snapshot.volume,
+            },
+            session_bars(symbol, tick),
+            snapshot.previous_close,
+        )
+    } else {
+        let candle = completed_daily_candle(symbol, age);
+        (
+            public_bar(historical_date(age, Period::Day), candle),
+            completed_session_bars(symbol, age, candle),
+            cents(historical_close(symbol, age, Period::Day)),
+        )
+    };
+    // The same integer-cent OHLC convention used by quote() and the chart's
+    // cumulative session average. No turnover is taken from another day.
+    let turnover_cents: u64 = session
+        .iter()
+        .map(|bar| {
+            let mean_cents =
+                ((bar.open + bar.high + bar.low + bar.close) * 100.).round() as u64 / 4;
+            mean_cents * bar.volume
+        })
+        .sum();
+    let weekday =
+        ["星期一", "星期二", "星期三", "星期四", "星期五"][(2 + 5 - age % 5) as usize % 5];
+    Some(HistoricalSession {
+        day_index,
+        date,
+        weekday,
+        turnover_rate: daily.volume as f64 / symbol.float_shares() as f64 * 100.,
+        daily,
+        previous_close,
+        bars: session,
+        turnover: turnover_cents as f64 / 100.,
+        previous_day: day_index.checked_sub(1),
+        next_day: (day_index + 1 < BAR_COUNT as usize).then_some(day_index + 1),
+    })
 }
 
 /// Entire simulated session for indicators that must retain the opening
@@ -453,6 +641,12 @@ pub fn bars(symbol: Symbol, period: Period, tick: u64) -> Vec<Bar> {
                     close: snapshot.price,
                     volume: snapshot.volume,
                 };
+            }
+            if period == Period::Day {
+                return public_bar(
+                    historical_date(age, period),
+                    completed_daily_candle(symbol, age),
+                );
             }
             let open = historical_close(symbol, age, period);
             let close = if age == 0 {
@@ -705,6 +899,119 @@ mod tests {
         assert_eq!(historical_date(2, Period::Day), "10/12");
         assert_eq!(historical_date(3, Period::Day), "10/09");
         assert_eq!(historical_date(10, Period::Day), "09/30");
+    }
+
+    #[test]
+    fn historical_sessions_reproduce_each_selected_daily_candle() {
+        for symbol in Symbol::ALL {
+            let daily = bars(symbol, Period::Day, 76);
+            for (day_index, expected) in daily.iter().enumerate() {
+                let session = historical_session(symbol, day_index, 76).unwrap();
+                assert_eq!(&session.daily, expected);
+                assert_eq!(session.bars.first().unwrap().open, expected.open);
+                assert_eq!(session.bars.last().unwrap().close, expected.close);
+                assert_eq!(
+                    session
+                        .bars
+                        .iter()
+                        .map(|bar| bar.high)
+                        .fold(f64::NEG_INFINITY, f64::max),
+                    expected.high
+                );
+                assert_eq!(
+                    session
+                        .bars
+                        .iter()
+                        .map(|bar| bar.low)
+                        .fold(f64::INFINITY, f64::min),
+                    expected.low
+                );
+                assert_eq!(
+                    session.bars.iter().map(|bar| bar.volume).sum::<u64>(),
+                    expected.volume
+                );
+                assert!(
+                    session
+                        .bars
+                        .windows(2)
+                        .all(|pair| pair[0].close == pair[1].open)
+                );
+                assert!(session.bars.iter().all(|bar| {
+                    bar.volume > 0
+                        && bar.low > 0.
+                        && bar.low <= bar.open.min(bar.close)
+                        && bar.high >= bar.open.max(bar.close)
+                }));
+                let turnover = session
+                    .bars
+                    .iter()
+                    .map(|bar| {
+                        let cents =
+                            ((bar.open + bar.high + bar.low + bar.close) * 100.).round() as u64 / 4;
+                        cents * bar.volume
+                    })
+                    .sum::<u64>() as f64
+                    / 100.;
+                assert_eq!(session.turnover, turnover);
+                assert!(session.turnover >= expected.low * expected.volume as f64);
+                assert!(session.turnover <= expected.high * expected.volume as f64);
+                if day_index > 0 {
+                    assert_eq!(session.previous_close, daily[day_index - 1].close);
+                }
+                if session.next_day.is_some() {
+                    assert_eq!(session.bars.len(), 391);
+                    assert_eq!(session.bars.first().unwrap().time, "09:30");
+                    assert_eq!(session.bars.last().unwrap().time, "16:00");
+                    assert_eq!(
+                        session,
+                        historical_session(symbol, day_index, u64::MAX).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn latest_historical_session_freezes_the_requested_demo_tick() {
+        for symbol in Symbol::ALL {
+            for tick in [0, 1, 76, 210, 211, u64::MAX] {
+                let snapshot = quote(symbol, tick);
+                let session = historical_session(symbol, BAR_COUNT as usize - 1, tick).unwrap();
+                assert_eq!(session.bars, session_bars(symbol, tick));
+                assert_eq!(session.daily.close, snapshot.price);
+                assert_eq!(session.previous_close, snapshot.previous_close);
+                assert_eq!(session.turnover, snapshot.turnover);
+                assert_eq!(session.turnover_rate, snapshot.turnover_rate);
+                assert_eq!(
+                    session,
+                    historical_session(symbol, BAR_COUNT as usize - 1, tick).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_session_navigation_uses_bounded_full_daily_dates() {
+        let session = |day| historical_session(Symbol::Aapl, day, 0).unwrap();
+        let latest = session(179);
+        assert_eq!(latest.date, "2026/10/14");
+        assert_eq!(latest.weekday, "星期三");
+        assert_eq!(latest.previous_day, Some(178));
+        assert_eq!(latest.next_day, None);
+        assert_eq!(session(177).date, "2026/10/12");
+        let friday = session(session(177).previous_day.unwrap());
+        assert_eq!(friday.date, "2026/10/09");
+        assert_eq!(friday.weekday, "星期五");
+        assert_eq!(friday.next_day, Some(177));
+        let earliest = session(0);
+        assert_eq!(earliest.date, "2026/02/05");
+        assert_eq!(earliest.weekday, "星期四");
+        assert_eq!(earliest.previous_day, None);
+        assert_eq!(earliest.next_day, Some(1));
+        for index in [180, usize::MAX] {
+            assert!(daily_date(index).is_none());
+            assert!(historical_session(Symbol::Aapl, index, 0).is_none());
+        }
     }
 
     #[test]

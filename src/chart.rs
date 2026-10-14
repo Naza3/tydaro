@@ -2,13 +2,13 @@
 use std::{cell::Cell, ops::Range, rc::Rc};
 
 use gpui_kit::{
-    App, Bounds, Context, IntoElement, MouseButton, PathBuilder, Pixels, Point, Render,
-    ScrollDelta, TestSupportExt, TextAlign, TextRun, Window, canvas, div, fill, point, prelude::*,
-    px, rgb, rgba, size,
+    App, Bounds, Context, EventEmitter, FocusHandle, IntoElement, MouseButton, PathBuilder, Pixels,
+    Point, Render, ScrollDelta, TestSupportExt, TextAlign, TextRun, Window, canvas, div, fill,
+    point, prelude::*, px, rgb, rgba, size,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::market::{self, Bar, Period, Symbol};
+use crate::market::{self, Bar, HistoricalSession, Period, Symbol};
 
 const BLUE: u32 = 0x397AF6;
 const UP: u32 = 0xF0446D;
@@ -67,6 +67,15 @@ impl ChartViewport {
         self.offset_from_latest = len - end.max(count);
     }
 
+    fn reveal(&mut self, index: usize, len: usize) {
+        let range = self.range(len);
+        if index < range.start {
+            self.offset_from_latest = len.saturating_sub(index + range.len());
+        } else if index >= range.end {
+            self.offset_from_latest = len.saturating_sub(index + 1);
+        }
+    }
+
     fn pan(&mut self, bars: isize, len: usize) {
         let count = self.range(len).len();
         self.offset_from_latest = self
@@ -74,6 +83,54 @@ impl ChartViewport {
             .saturating_add_signed(bars)
             .min(len.saturating_sub(count));
     }
+}
+
+/// Opening history is separate from changing the live chart's period or viewport.
+#[derive(Clone, Debug)]
+pub enum ChartEvent {
+    InspectDay {
+        symbol: Symbol,
+        day_index: usize,
+        tick: u64,
+    },
+}
+
+#[derive(Clone)]
+struct Inspection {
+    // Time identity survives rolling samples; a pixel or retained-array index does not.
+    time: String,
+    y_fraction: f32,
+    on_volume: bool,
+}
+
+impl Inspection {
+    fn index_in(&self, bars: &[Bar]) -> Option<usize> {
+        bars.iter().position(|bar| bar.time == self.time)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DragState {
+    origin: Point<Pixels>,
+    viewport: ChartViewport,
+    moved: bool,
+    click_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Crosshair {
+    index: usize,
+    y_fraction: f32,
+    on_volume: bool,
+}
+
+struct CandleDetails {
+    date: String,
+    weekday: String,
+    bar: Bar,
+    previous_close: Option<f64>,
+    turnover: Option<f64>,
+    turnover_rate: Option<f64>,
 }
 
 pub struct MarketChart {
@@ -84,12 +141,19 @@ pub struct MarketChart {
     indicators: Indicators,
     viewport: ChartViewport,
     bounds: Rc<Cell<Bounds<Pixels>>>,
-    hover: Option<Point<Pixels>>,
-    drag: Option<(f32, ChartViewport)>,
+    inspection: Option<Inspection>,
+    details: Option<CandleDetails>,
+    drag: Option<DragState>,
+    last_gesture_dragged: bool,
+    focus: FocusHandle,
+    reference_price: f64,
+    historical: bool,
 }
 
+impl EventEmitter<ChartEvent> for MarketChart {}
+
 impl MarketChart {
-    pub fn new(symbol: Symbol, period: Period, _cx: &mut Context<Self>) -> Self {
+    pub fn new(symbol: Symbol, period: Period, cx: &mut Context<Self>) -> Self {
         let data = market::bars(symbol, period, 0);
         let indicators = Indicators::for_market(symbol, period, 0, &data);
         Self {
@@ -100,9 +164,40 @@ impl MarketChart {
             indicators,
             viewport: ChartViewport::default(),
             bounds: Rc::new(Cell::new(Bounds::default())),
-            hover: None,
+            inspection: None,
+            details: None,
             drag: None,
+            last_gesture_dragged: false,
+            focus: cx.focus_handle(),
+            reference_price: market::quote(symbol, 0).previous_close,
+            historical: false,
         }
+    }
+
+    /// A historical inspector owns its frozen session and never follows live ticks.
+    pub fn new_historical(
+        symbol: Symbol,
+        session: &HistoricalSession,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut chart = Self::new(symbol, Period::Intraday, cx);
+        chart.historical = true;
+        chart.set_historical(session, cx);
+        chart
+    }
+
+    pub fn set_historical(&mut self, session: &HistoricalSession, cx: &mut Context<Self>) {
+        self.historical = true;
+        self.period = Period::Intraday;
+        self.data = session.bars.clone();
+        self.indicators = Indicators::new(&self.data);
+        self.reference_price = session.previous_close;
+        self.viewport = ChartViewport {
+            bars_visible: self.data.len(),
+            offset_from_latest: 0,
+        };
+        self.clear_inspection();
+        cx.notify();
     }
 
     pub fn set_market(
@@ -112,18 +207,26 @@ impl MarketChart {
         tick: u64,
         cx: &mut Context<Self>,
     ) {
-        if self.symbol == symbol && self.period == period && self.tick == tick {
+        if self.historical || (self.symbol == symbol && self.period == period && self.tick == tick)
+        {
             return;
         }
         if self.symbol != symbol || self.period != period {
             self.viewport = ChartViewport::default();
-            self.hover = None;
+            self.clear_inspection();
         }
         self.symbol = symbol;
         self.period = period;
         self.tick = tick;
         self.data = market::bars(symbol, period, tick);
         self.indicators = Indicators::for_market(symbol, period, tick, &self.data);
+        self.reference_price = market::quote(symbol, tick).previous_close;
+        // Re-find the exact time after a rolling update. Never move to a different date.
+        if self.inspection.is_some() && self.selected_index().is_none() {
+            self.clear_inspection();
+        } else {
+            self.refresh_details();
+        }
         cx.notify();
     }
 
@@ -142,9 +245,95 @@ impl MarketChart {
     }
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
-        self.viewport = ChartViewport::default();
-        self.hover = None;
+        self.viewport = if self.historical {
+            ChartViewport {
+                bars_visible: self.data.len(),
+                offset_from_latest: 0,
+            }
+        } else {
+            ChartViewport::default()
+        };
+        self.clear_inspection();
         cx.notify();
+    }
+
+    fn clear_inspection(&mut self) {
+        self.inspection = None;
+        self.details = None;
+        self.drag = None;
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let selected = self.inspection.as_ref()?;
+        selected.index_in(&self.data)
+    }
+
+    fn locate(&mut self, pointer: Point<Pixels>) -> Option<usize> {
+        let geometry = Geometry::new(self.bounds.get());
+        let range = self.viewport.range(self.data.len());
+        let index = range.start + geometry.index(pointer, range.len())?;
+        let on_volume = pointer.y.as_f32() >= geometry.volume_top;
+        let (top, height) = if on_volume {
+            (geometry.volume_top, geometry.bottom - geometry.volume_top)
+        } else {
+            (geometry.top, geometry.price_height)
+        };
+        let changed = self.selected_index() != Some(index);
+        self.inspection = Some(Inspection {
+            time: self.data[index].time.clone(),
+            y_fraction: ((pointer.y.as_f32() - top) / height.max(1.)).clamp(0., 1.),
+            on_volume,
+        });
+        if changed {
+            self.refresh_details();
+        }
+        Some(index)
+    }
+
+    fn refresh_details(&mut self) {
+        self.details = self.selected_index().and_then(|index| {
+            if self.period == Period::Intraday {
+                return None;
+            }
+            if self.period == Period::Day {
+                let session = market::historical_session(self.symbol, index, self.tick)?;
+                Some(CandleDetails {
+                    date: session.date,
+                    weekday: session.weekday.into(),
+                    bar: session.daily,
+                    previous_close: Some(session.previous_close),
+                    turnover: Some(session.turnover),
+                    turnover_rate: Some(session.turnover_rate),
+                })
+            } else {
+                Some(CandleDetails {
+                    date: self.data[index].time.clone(),
+                    weekday: String::new(),
+                    bar: self.data[index].clone(),
+                    previous_close: index
+                        .checked_sub(1)
+                        .map(|previous| self.data[previous].close),
+                    turnover: None,
+                    turnover_rate: None,
+                })
+            }
+        });
+    }
+
+    fn step_inspection(&mut self, right: bool) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let next = if right {
+            (index + 1).min(self.data.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+        if let Some(inspection) = self.inspection.as_mut() {
+            inspection.time = self.data[next].time.clone();
+        }
+        self.viewport.reveal(next, self.data.len());
+        self.refresh_details();
     }
 }
 
@@ -154,11 +343,14 @@ impl Render for MarketChart {
         let visible = self.data[range.clone()].to_vec();
         let indicators = self.indicators.slice(range.clone());
         let geometry = Geometry::new(self.bounds.get());
-        let selection = self.hover.and_then(|p| geometry.index(p, visible.len()));
+        let selection = self
+            .selected_index()
+            .filter(|index| range.contains(index))
+            .map(|index| index - range.start);
         let selected_index = selection.unwrap_or_else(|| visible.len().saturating_sub(1));
         let selected = visible.get(selected_index);
         let intraday = self.period == Period::Intraday;
-        let reference_price = market::quote(self.symbol, self.tick).previous_close;
+        let reference_price = self.reference_price;
         let header = selected
             .map(|bar| {
                 if intraday {
@@ -188,7 +380,21 @@ impl Render for MarketChart {
             .unwrap_or_default();
         let selected_average = indicators.session.get(selected_index).copied();
         let bounds_cell = self.bounds.clone();
-        let hover = self.hover;
+        let crosshair = selection.and_then(|index| {
+            self.inspection.as_ref().map(|inspection| Crosshair {
+                index,
+                y_fraction: inspection.y_fraction,
+                on_volume: inspection.on_volume,
+            })
+        });
+        let selected_date = self.selected_index().and_then(|index| {
+            (self.period == Period::Day)
+                .then(|| market::daily_date(index))
+                .flatten()
+        });
+        let details_card = selection
+            .zip(self.details.as_ref())
+            .map(|(index, details)| inspection_card(details, geometry, index, visible.len()));
         let latest = self.data.last().map(|b| b.close);
 
         div()
@@ -222,52 +428,97 @@ impl Render for MarketChart {
                 div()
                     .id("native-market-chart")
                     .test_support()
+                    .track_focus(&self.focus)
+                    .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                        if this.inspection.is_none() {
+                            return;
+                        }
+                        match event.keystroke.key.as_str() {
+                            "escape" => this.clear_inspection(),
+                            "left" => this.step_inspection(false),
+                            "right" => this.step_inspection(true),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
                     .relative()
                     .flex_1()
                     .min_h(px(80.))
                     .overflow_hidden()
                     .on_mouse_move(
                         cx.listener(|this, event: &gpui_kit::MouseMoveEvent, _, cx| {
-                            if let Some((start_x, viewport)) = this.drag {
+                            if let Some(mut drag) = this.drag {
                                 if event.dragging() {
-                                    let geometry = Geometry::new(this.bounds.get());
-                                    let count = viewport.range(this.data.len()).len();
-                                    let movement = (event.position.x.as_f32() - start_x)
-                                        / geometry.width.max(1.);
-                                    this.viewport = viewport;
-                                    this.viewport.pan(
-                                        (movement * count as f32).round() as isize,
-                                        this.data.len(),
-                                    );
-                                } else {
-                                    this.drag = None;
+                                    let dx = event.position.x.as_f32() - drag.origin.x.as_f32();
+                                    let dy = event.position.y.as_f32() - drag.origin.y.as_f32();
+                                    drag.moved |= dx.hypot(dy) > 4.;
+                                    if drag.moved {
+                                        let geometry = Geometry::new(this.bounds.get());
+                                        let count = drag.viewport.range(this.data.len()).len();
+                                        this.viewport = drag.viewport;
+                                        this.viewport.pan(
+                                            (dx / geometry.width.max(1.) * count as f32).round()
+                                                as isize,
+                                            this.data.len(),
+                                        );
+                                    }
+                                    this.drag = Some(drag);
+                                    cx.notify();
+                                    return;
                                 }
+                                this.drag = None;
                             }
-                            this.hover = Some(event.position);
-                            cx.notify();
+                            if this.inspection.is_some() && this.locate(event.position).is_some() {
+                                cx.notify();
+                            }
                         }),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &gpui_kit::MouseDownEvent, _, cx| {
-                            if event.click_count == 2 {
-                                this.reset(cx);
-                            } else {
-                                this.drag = Some((event.position.x.as_f32(), this.viewport));
+                        cx.listener(|this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                            let geometry = Geometry::new(this.bounds.get());
+                            if geometry
+                                .index(event.position, this.viewport.range(this.data.len()).len())
+                                .is_some()
+                            {
+                                this.focus.focus(window, cx);
+                                this.drag = Some(DragState {
+                                    origin: event.position,
+                                    viewport: this.viewport,
+                                    moved: false,
+                                    click_count: event.click_count,
+                                });
                             }
                         }),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, _| {
-                            this.drag = None;
+                        cx.listener(|this, event: &gpui_kit::MouseUpEvent, _, cx| {
+                            let Some(drag) = this.drag.take() else {
+                                return;
+                            };
+                            let was_dragged = this.last_gesture_dragged;
+                            this.last_gesture_dragged = drag.moved;
+                            if !drag.moved
+                                && let Some(index) = this.locate(event.position)
+                                && drag.click_count == 2
+                                && !was_dragged
+                                && this.period == Period::Day
+                                && !this.historical
+                            {
+                                cx.emit(ChartEvent::InspectDay {
+                                    symbol: this.symbol,
+                                    day_index: index,
+                                    tick: this.tick,
+                                });
+                            }
+                            cx.notify();
                         }),
                     )
-                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                    .on_hover(cx.listener(|this, hovered, _, _| {
                         if !hovered {
-                            this.hover = None;
                             this.drag = None;
-                            cx.notify();
                         }
                     }))
                     .on_scroll_wheel(cx.listener(
@@ -301,16 +552,181 @@ impl Render for MarketChart {
                                     intraday,
                                     reference_price,
                                     latest,
-                                    hover,
+                                    crosshair,
+                                    selected_date.as_deref(),
                                     window,
                                     cx,
                                 );
                             },
                         )
                         .size_full(),
-                    ),
+                    )
+                    .children(details_card),
             )
     }
+}
+
+/// Place the card on the half opposite the inspected candle, keeping the pointer clear.
+fn card_on_left(index: usize, count: usize) -> bool {
+    index >= count / 2
+}
+
+fn inspection_card(
+    details: &CandleDetails,
+    geometry: Geometry,
+    index: usize,
+    count: usize,
+) -> impl IntoElement + use<> {
+    let bar = &details.bar;
+    let previous = details.previous_close.filter(|price| *price > 0.);
+    let value_color = |price: f64| {
+        previous.map_or(MUTED, |reference| {
+            if (price - reference).abs() < 0.000_001 {
+                MUTED
+            } else if price > reference {
+                UP
+            } else {
+                DOWN
+            }
+        })
+    };
+    let change_color = value_color(bar.close);
+    let fields = [
+        (
+            "open",
+            "开盘",
+            format!("{:.2}", bar.open),
+            value_color(bar.open),
+        ),
+        (
+            "high",
+            "最高",
+            format!("{:.2}", bar.high),
+            value_color(bar.high),
+        ),
+        (
+            "low",
+            "最低",
+            format!("{:.2}", bar.low),
+            value_color(bar.low),
+        ),
+        ("close", "收盘", format!("{:.2}", bar.close), change_color),
+        (
+            "change",
+            "涨跌",
+            previous
+                .map(|p| format!("{:+.2}", bar.close - p))
+                .unwrap_or_else(|| "—".into()),
+            change_color,
+        ),
+        (
+            "percent",
+            "涨幅",
+            previous
+                .map(|p| format!("{:+.2}%", change_percent(bar.close, p)))
+                .unwrap_or_else(|| "—".into()),
+            change_color,
+        ),
+        (
+            "amplitude",
+            "振幅",
+            previous
+                .map(|p| format!("{:.2}%", (bar.high - bar.low) / p * 100.))
+                .unwrap_or_else(|| "—".into()),
+            MUTED,
+        ),
+        (
+            "volume",
+            "成交量",
+            format!("{}股", volume_label(bar.volume)),
+            BLUE,
+        ),
+        (
+            "turnover",
+            "成交额",
+            details
+                .turnover
+                .map(|value| volume_label(value.round() as u64))
+                .unwrap_or_else(|| "—".into()),
+            BLUE,
+        ),
+        (
+            "turnover-rate",
+            "换手率",
+            details
+                .turnover_rate
+                .map(|value| format!("{value:.2}%"))
+                .unwrap_or_else(|| "—".into()),
+            MUTED,
+        ),
+    ];
+    let date_label = format!("{}  {}", details.date, details.weekday);
+    let width = 174_f32.min((geometry.width - 8.).max(128.));
+    let on_left = card_on_left(index, count);
+    // Coordinates here are local to the plot container; Geometry uses window coordinates.
+    let left = if on_left {
+        59.
+    } else {
+        55. + geometry.width - width - 4.
+    };
+    div()
+        .id("chart-inspection-card")
+        .test_support()
+        .absolute()
+        .left(px(left.max(4.)))
+        .top(px(28.))
+        .w(px(width))
+        .max_h(px((geometry.price_height - 8.).max(64.)))
+        .overflow_y_scroll()
+        // Scrolling/reading the floating details must not zoom or click the plot beneath it.
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .border_1()
+        .border_color(rgb(0xCAD8EB))
+        .rounded_sm()
+        .bg(rgba(0xFFFFFFF0))
+        .px_2()
+        .py_1()
+        .text_size(px(11.))
+        .child(
+            div()
+                .id(if on_left {
+                    "chart-inspection-left"
+                } else {
+                    "chart-inspection-right"
+                })
+                .test_support()
+                .child(
+                    div()
+                        .id("chart-inspection-date")
+                        .test_support()
+                        .aria_label(date_label.clone())
+                        .pb_1()
+                        .mb_1()
+                        .border_b_1()
+                        .border_color(rgb(GRID))
+                        .text_color(rgb(0x233348))
+                        .child(date_label),
+                ),
+        )
+        .children(fields.into_iter().map(|(key, name, value, color)| {
+            div()
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(div().text_color(rgb(MUTED)).child(name))
+                .child(
+                    div()
+                        .id(format!("chart-inspection-{key}"))
+                        .test_support()
+                        .aria_label(value.clone())
+                        .text_color(rgb(color))
+                        .child(value),
+                )
+        }))
 }
 
 #[derive(Clone, Copy)]
@@ -410,7 +826,8 @@ fn paint_chart(
     intraday: bool,
     reference_price: f64,
     latest: Option<f64>,
-    hover: Option<Point<Pixels>>,
+    crosshair: Option<Crosshair>,
+    selected_date: Option<&str>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -420,8 +837,8 @@ fn paint_chart(
     let g = Geometry::new(bounds);
     let (minimum, maximum) = price_extent(bars, indicators, intraday, reference_price);
     let y = |price: f64| g.top + ((maximum - price) / (maximum - minimum)) as f32 * g.price_height;
-    let selected = hover
-        .and_then(|pointer| g.index(pointer, bars.len()))
+    let selected = crosshair
+        .map(|crosshair| crosshair.index)
         .unwrap_or(bars.len() - 1);
     let origin_x = bounds.origin.x.as_f32();
     let price_color = |price: f64| {
@@ -686,15 +1103,14 @@ fn paint_chart(
         );
     }
 
-    if let Some(pointer) = hover
-        && let Some(index) = g.index(pointer, bars.len())
-    {
+    if let Some(crosshair) = crosshair {
+        let index = crosshair.index;
         let cross_x = g.x(index, bars.len());
-        let on_volume = pointer.y.as_f32() >= g.volume_top;
+        let on_volume = crosshair.on_volume;
         let cross_y = if on_volume {
-            pointer.y.as_f32().clamp(g.volume_top, g.bottom)
+            g.volume_top + crosshair.y_fraction * (g.bottom - g.volume_top)
         } else {
-            pointer.y.as_f32().clamp(g.top, g.price_bottom())
+            g.top + crosshair.y_fraction * g.price_height
         };
         stroke(
             &[(cross_x, g.top), (cross_x, g.bottom)],
@@ -740,10 +1156,13 @@ fn paint_chart(
             window,
             cx,
         );
-        let time_x = (cross_x - 26.).clamp(g.left, (g.right() - 58.).max(g.left));
-        rect(time_x, g.bottom + 2., 64., 18., 0x516176, window);
+        let time_text = selected_date.unwrap_or(&bars[index].time);
+        let time_width = if selected_date.is_some() { 78. } else { 64. };
+        let time_x =
+            (cross_x - time_width / 2.).clamp(g.left, (g.right() - time_width).max(g.left));
+        rect(time_x, g.bottom + 2., time_width, 18., 0x516176, window);
         label(
-            bars[index].time.clone(),
+            time_text.to_owned(),
             time_x + 5.,
             g.bottom + 3.,
             10.,
@@ -924,6 +1343,48 @@ mod tests {
         ChartViewport, Indicators, change_percent, moving_average, price_extent, session_averages,
     };
     use crate::market::{self, Bar, Period, Symbol};
+
+    #[test]
+    fn inspection_tracks_the_time_identity_when_the_retained_tail_rolls() {
+        let initial = market::bars(Symbol::Aapl, Period::Intraday, 30);
+        let inspection = super::Inspection {
+            time: initial[10].time.clone(),
+            y_fraction: 0.5,
+            on_volume: false,
+        };
+        assert_eq!(inspection.index_in(&initial), Some(10));
+        let rolled = market::bars(Symbol::Aapl, Period::Intraday, 35);
+        assert_eq!(inspection.index_in(&rolled), Some(5));
+        // Once that minute leaves retained history, clear rather than showing another bar.
+        let expired = market::bars(Symbol::Aapl, Period::Intraday, 50);
+        assert_eq!(inspection.index_in(&expired), None);
+        let daily = market::bars(Symbol::Aapl, Period::Day, 0);
+        let selected_day = super::Inspection {
+            time: daily[42].time.clone(),
+            y_fraction: 0.5,
+            on_volume: false,
+        };
+        assert_eq!(
+            selected_day.index_in(&market::bars(Symbol::Aapl, Period::Day, 70)),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn keyboard_inspection_reveals_each_edge_without_changing_zoom() {
+        let mut view = ChartViewport {
+            bars_visible: 24,
+            offset_from_latest: 30,
+        };
+        assert_eq!(view.range(180), 126..150);
+        view.reveal(125, 180);
+        assert_eq!(view.range(180), 125..149);
+        view.reveal(179, 180);
+        assert_eq!(view.range(180), 156..180);
+        view.reveal(0, 180);
+        assert_eq!(view.range(180), 0..24);
+        assert_eq!(view.bars_visible, 24);
+    }
 
     #[test]
     fn moving_averages_require_history_and_keep_values_after_panning() {

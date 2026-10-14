@@ -11,7 +11,8 @@ use gpui_kit::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    chart::{ChartViewport, MarketChart},
+    chart::{ChartEvent, ChartViewport, MarketChart},
+    history::{self, HistoryWindow},
     market::{self, Period, Symbol},
     model::PanelKind,
 };
@@ -327,6 +328,7 @@ pub struct PanelContent {
     period: Period,
     tick: u64,
     chart: Entity<MarketChart>,
+    history: Option<HistoryWindow>,
     query: Entity<InputState>,
     catalog_query: Entity<InputState>,
     adding_stocks: bool,
@@ -373,7 +375,7 @@ impl PanelContent {
         let max_amount = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
         let min_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最低"));
         let max_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
-        let subscriptions = [
+        let mut subscriptions: Vec<_> = [
             &query,
             &catalog_query,
             &price,
@@ -392,12 +394,39 @@ impl PanelContent {
             })
         })
         .collect();
+        let chart = cx.new(|cx| MarketChart::new(symbol, period, cx));
+        subscriptions.push(
+            cx.subscribe_in(&chart, window, |this, _, event, window, cx| {
+                let ChartEvent::InspectDay {
+                    symbol,
+                    day_index,
+                    tick,
+                } = *event;
+                match history::open(this.history.as_ref(), symbol, day_index, tick, window, cx) {
+                    Ok(view) => {
+                        this.history = Some(view);
+                        this.feedback = None;
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.feedback = Some((error.to_string(), true));
+                        cx.notify();
+                    }
+                }
+            }),
+        );
+        subscriptions.push(cx.on_release(|this, cx| {
+            if let Some(history) = this.history.take() {
+                history.close(cx);
+            }
+        }));
         Self {
             kind,
             symbol,
             period,
             tick: 0,
-            chart: cx.new(|cx| MarketChart::new(symbol, period, cx)),
+            chart,
+            history: None,
             query,
             catalog_query,
             adding_stocks: false,
@@ -912,7 +941,28 @@ impl PanelContent {
                             .test_support(),
                     ),
             )
+            .when_some(self.feedback.as_ref(), |view, (message, _)| {
+                view.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(rgb(RED))
+                        .child(message.clone()),
+                )
+            })
             .child(div().flex_1().min_h_0().child(self.chart.clone()))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(if self.period == Period::Day {
+                        "单击查看数据 · ← → 逐日定位 · 双击查看当日分时 · Esc 退出定位"
+                    } else {
+                        "单击查看数据 · 滚轮缩放 · 拖动平移 · Esc 退出定位"
+                    }),
+            )
             .into_any_element()
     }
 
@@ -2133,11 +2183,7 @@ fn movement(change: f64) -> Rgba {
     rgb(if change >= 0. { RED } else { TEAL })
 }
 fn currency(symbol: Symbol) -> &'static str {
-    if symbol.market() == "HK" {
-        "HKD"
-    } else {
-        "USD"
-    }
+    symbol.currency()
 }
 fn compact(value: f64) -> String {
     if value.abs() >= 1e12 {

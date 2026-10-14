@@ -3,6 +3,7 @@ mod board_bar;
 mod boards;
 mod chart;
 mod contents;
+mod history;
 mod market;
 mod model;
 #[cfg(feature = "test-support")]
