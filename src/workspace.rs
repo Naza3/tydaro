@@ -52,6 +52,14 @@ pub(crate) fn workspace(id: u64, cx: &App) -> Option<Entity<Workspace>> {
 }
 
 #[cfg(feature = "test-support")]
+pub(crate) fn live_panel_ids(cx: &App) -> Vec<u64> {
+    // Include stale weak entries so regression checks also catch registry leaks.
+    let mut ids: Vec<_> = cx.global::<Session>().panels.keys().copied().collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[cfg(feature = "test-support")]
 pub(crate) fn verify_transfer_geometry(cx: &mut App) -> anyhow::Result<()> {
     let windows: Vec<_> = cx
         .global::<Session>()
@@ -205,6 +213,7 @@ impl BasePanel for StockPanel {
     }
     fn on_removed(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let id = self.model.id;
+        let owner = self.owner;
         let entity_id = cx.entity_id();
         cx.defer(move |cx| {
             let remove = cx
@@ -212,10 +221,13 @@ impl BasePanel for StockPanel {
                 .panels
                 .get(&id)
                 .is_some_and(|p| p.entity_id() == entity_id);
+            changed(cx);
             if remove {
                 cx.global_mut::<Session>().panels.remove(&id);
+                close_if_empty(owner, cx);
+                record(cx);
+                save_now(cx);
             }
-            changed(cx);
         });
     }
 }
@@ -549,6 +561,7 @@ impl Workspace {
                 cx.global_mut::<Session>().drag.raise_window(id);
             }
         });
+        let entity_id = cx.entity_id();
         window.on_window_should_close(cx, move |_, cx| {
             if id == 0 {
                 save_now(cx);
@@ -556,8 +569,12 @@ impl Workspace {
                 true
             } else {
                 cx.defer(move |cx| {
-                    let r = return_window(id, cx);
-                    report(r, cx);
+                    // A queued native request must not dismiss a replacement
+                    // window created by a board switch or layout restoration.
+                    if workspace(id, cx).is_some_and(|view| view.entity_id() == entity_id) {
+                        let r = dismiss_window(id, cx);
+                        report(r, cx);
+                    }
                 });
                 false
             }
@@ -1024,16 +1041,60 @@ fn close_window(id: u64, cx: &mut App) {
 }
 fn close_if_empty(id: u64, cx: &mut App) {
     if id != 0
-        && !cx
-            .global::<Session>()
-            .panels
-            .values()
-            .filter_map(WeakEntity::upgrade)
-            .any(|p| p.read(cx).owner == id)
+        && workspace(id, cx).is_some_and(|view| {
+            let dock = view.read(cx).dock.read(cx);
+            // Hidden tabs, side docks and unknown panel types still own their
+            // window, even when they have no visible StockPanel registration.
+            [
+                DockPlacement::Center,
+                DockPlacement::Left,
+                DockPlacement::Right,
+                DockPlacement::Bottom,
+            ]
+            .into_iter()
+            .all(|placement| {
+                dock.layout(placement)
+                    .is_none_or(|tree| tree.panels().next().is_none())
+            })
+        })
     {
         close_window(id, cx);
     }
 }
+
+/// A user closing a native floating window discards all its components.
+/// Programmatic retirement (board switches, restoration and transfers) uses
+/// `close_window` instead, so it cannot delete a board's saved components.
+pub(crate) fn dismiss_window(id: u64, cx: &mut App) -> anyhow::Result<()> {
+    anyhow::ensure!(id != 0, "主窗口关闭时应保存并退出应用");
+    if workspace(id, cx).is_none() {
+        return Ok(());
+    }
+    // Capture current forms/viewports before any entity is released, including
+    // edits made since the latest autosave. One undo restores the entire window.
+    record(cx);
+    let panels: Vec<_> = cx
+        .global::<Session>()
+        .panels
+        .iter()
+        .filter_map(|(panel_id, view)| {
+            view.upgrade()
+                .filter(|view| view.read(cx).owner == id)
+                .map(|_| *panel_id)
+        })
+        .collect();
+    let session = cx.global_mut::<Session>();
+    session.drag.cancel();
+    for panel_id in panels {
+        session.panels.remove(&panel_id);
+    }
+    close_window(id, cx);
+    changed(cx);
+    record(cx);
+    save_now(cx);
+    Ok(())
+}
+
 pub(crate) fn return_window(id: u64, cx: &mut App) -> anyhow::Result<()> {
     if id == 0 {
         return Ok(());

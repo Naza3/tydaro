@@ -159,6 +159,7 @@ pub fn run(path: &str) -> Result<()> {
     crate::contents::smoke_demo_orders(&mut cx)?;
     crate::contents::smoke_market_panels(&mut cx)?;
     verify_boards(&mut cx, output)?;
+    verify_floating_window_close(&mut cx)?;
 
     println!(
         "PASS: native workspace {} × {}, {} panels; MSFT link group, 日 K, chart zoom; detach/return state, persistence/undo and demo order interactions. Screenshot: {}",
@@ -867,7 +868,8 @@ fn verify_detach_roundtrip(cx: &mut HeadlessAppContext, expected: &SavedPanel) -
         "Restore/undo did not retain the independent chart state"
     );
 
-    // This is the same return path invoked by closing a secondary window.
+    // Explicitly returning a component preserves it; closing its native window
+    // instead deletes it, as exercised by verify_floating_window_close.
     cx.update(|cx| workspace::return_window(secondary, cx))?;
     cx.run_until_parked();
     let returned = cx.update(|cx| workspace::snapshot(cx));
@@ -885,6 +887,242 @@ fn verify_detach_roundtrip(cx: &mut HeadlessAppContext, expected: &SavedPanel) -
         "Returning the chart changed its durable identity or content state"
     );
     Ok(())
+}
+
+/// The headless platform does not dispatch native should-close callbacks. Call
+/// their production dismissal path and inspect live ownership, persistence and
+/// undo; native window-manager delivery is verified separately on a desktop.
+fn verify_floating_window_close(cx: &mut HeadlessAppContext) -> Result<()> {
+    let original = cx.update(|cx| workspace::snapshot_board_set(cx));
+    let result = verify_window_dismissal(cx);
+    let restored = cx.update(|cx| workspace::restore_board_set(original, cx));
+    cx.run_until_parked();
+    result?;
+    restored?;
+    render_workspace_windows(cx)?;
+    println!(
+        "PASS: closing single/multi-tab floating windows deletes their components despite layout locks; no registry or persisted resurrection, content-preserving undo and inactive-board isolation"
+    );
+    Ok(())
+}
+
+fn verify_window_dismissal(cx: &mut HeadlessAppContext) -> Result<()> {
+    let active = cx.update(|cx| workspace::active_board_id(cx));
+    let initial = cx.update(|cx| workspace::snapshot(cx));
+    let chart = board_panels(&initial)?
+        .into_iter()
+        .find(|(_, p)| p.model.kind == PanelKind::Chart)
+        .context("No chart available for close/undo regression")?
+        .1;
+    ensure!(
+        chart.model.symbol == Symbol::Msft
+            && chart.model.period == Period::Day
+            && chart.content["chart"]["bars_visible"].as_u64().is_some(),
+        "Close regression requires the preceding native symbol, period and zoom edits"
+    );
+    let (entry_owner, entry) = add_floating_panel(cx, PanelKind::OrderEntry)?;
+
+    // The inactive board has its own copied floating form; deletion must affect
+    // only the currently mounted instance, never another board's saved windows.
+    let inactive = cx.update(|cx| workspace::duplicate_board("关闭隔离验收", cx))?;
+    cx.update(|cx| workspace::switch_board(active, cx))?;
+    render_workspace_windows(cx)?;
+    set_workspace_locked(cx, 0, true)?;
+
+    // Edit after the most recent board/layout record. Dismissal must capture
+    // these current inputs itself instead of depending on an autosave tick.
+    let entry_handle = native_workspace(cx, entry_owner)?;
+    cx.update_window(entry_handle, |_, window, cx| {
+        window.click("order-price", cx);
+        window.press("ctrl-a", cx);
+        window.input("427.65", cx);
+        window.click("order-quantity", cx);
+        window.press("ctrl-a", cx);
+        window.input("375", cx);
+    })?;
+    render_workspace_windows(cx)?;
+    let entry_state = unique_panel(&cx.update(|cx| workspace::snapshot(cx)), entry.model.id)?.1;
+    ensure!(
+        entry_state.content["price"] == "427.65" && entry_state.content["quantity"] == "375",
+        "Native order input did not enter the close regression snapshot"
+    );
+    let before_single = dismiss_and_verify(cx, entry_owner)?;
+    cx.update(workspace::undo);
+    render_workspace_windows(cx)?;
+    let restored_single = cx.update(|cx| workspace::snapshot(cx));
+    ensure!(
+        same_board_workspace(&before_single, &restored_single)?
+            && unique_panel(&restored_single, entry.model.id)?.1.content == entry_state.content,
+        "Undo failed to recover the closed independent form and its current input"
+    );
+
+    // Assemble two components as tabs: the chart becomes inactive, so a close
+    // implementation that only removes the active form must fail this test.
+    set_workspace_locked(cx, 0, false)?;
+    cx.update(|cx| workspace::detach(chart.model.id, None, cx))?;
+    let chart_owner = unique_panel(&cx.update(|cx| workspace::snapshot(cx)), chart.model.id)?.0;
+    cx.update(|cx| {
+        workspace::move_between(
+            entry.model.id,
+            chart_owner,
+            Some((chart.model.id, DockSide::Center)),
+            cx,
+        )
+    })?;
+    let (survivor, _) = add_floating_panel(cx, PanelKind::Quote)?;
+    set_workspace_locked(cx, 0, true)?;
+    set_workspace_locked(cx, chart_owner, true)?;
+    render_workspace_windows(cx)?;
+    let multi = cx.update(|cx| workspace::snapshot(cx));
+    let center = &multi
+        .windows
+        .iter()
+        .find(|window| window.id == chart_owner)
+        .context("Multi-tab close fixture has no floating window")?
+        .dock
+        .center;
+    ensure!(
+        placement_matches(center, entry.model.id, chart.model.id, DockSide::Center)?
+            && board_panels(&multi)?
+                .iter()
+                .filter(|(owner, _)| *owner == chart_owner)
+                .count()
+                == 2,
+        "Close regression did not create both active and inactive floating tabs"
+    );
+    let before_multi = dismiss_and_verify(cx, chart_owner)?;
+    ensure!(
+        cx.update(|cx| workspace::workspace(survivor, cx).is_some()),
+        "Closing one floating window removed a different native window"
+    );
+    cx.update(workspace::undo);
+    render_workspace_windows(cx)?;
+    let restored_multi = cx.update(|cx| workspace::snapshot(cx));
+    let (_, restored_chart) = unique_panel(&restored_multi, chart.model.id)?;
+    let (_, restored_entry) = unique_panel(&restored_multi, entry.model.id)?;
+    ensure!(
+        same_board_workspace(&before_multi, &restored_multi)?
+            && restored_chart.model == chart.model
+            && restored_chart.content == chart.content
+            && restored_entry.model == entry_state.model
+            && restored_entry.content == entry_state.content,
+        "Undo failed to recover all closed tabs with their symbol, form and viewport"
+    );
+
+    dismiss_and_verify(cx, chart_owner)?;
+    let deleted = cx.update(|cx| workspace::snapshot_board_set(cx));
+    let directory = BoardSmokeDirectory::new()?;
+    let path = directory.0.join("workspace.json");
+    storage::write_board_set(&path, &deleted)?;
+    let loaded = storage::read_board_set(&path)?;
+    ensure!(
+        serde_json::to_value(&deleted)? == serde_json::to_value(&loaded)?,
+        "Saving a component deletion changed other board content"
+    );
+    cx.update(|cx| workspace::restore_board_set(loaded, cx))?;
+    render_workspace_windows(cx)?;
+    ensure!(
+        same_board_workspace(
+            &deleted
+                .boards
+                .iter()
+                .find(|b| b.id == active)
+                .unwrap()
+                .workspace,
+            &cx.update(|cx| workspace::snapshot(cx)),
+        )?,
+        "Reload resurrected deleted floating components"
+    );
+    cx.update(|cx| workspace::switch_board(inactive, cx))?;
+    render_workspace_windows(cx)?;
+    ensure!(
+        same_board_workspace(
+            &deleted
+                .boards
+                .iter()
+                .find(|b| b.id == inactive)
+                .unwrap()
+                .workspace,
+            &cx.update(|cx| workspace::snapshot(cx)),
+        )?,
+        "Deleting active-board components changed an inactive board's form or window"
+    );
+    cx.update(|cx| workspace::switch_board(active, cx))?;
+    render_workspace_windows(cx)?;
+    let final_state = cx.update(|cx| workspace::snapshot(cx));
+    ensure!(
+        board_panels(&final_state)?.iter().all(|(_, panel)| {
+            panel.model.id != chart.model.id && panel.model.id != entry.model.id
+        }) && cx
+            .update(|cx| workspace::live_panel_ids(cx))
+            .iter()
+            .all(|id| { *id != chart.model.id && *id != entry.model.id }),
+        "Switching boards resurrected deleted components in layout or live ownership"
+    );
+    Ok(())
+}
+
+fn add_floating_panel(cx: &mut HeadlessAppContext, kind: PanelKind) -> Result<(u64, SavedPanel)> {
+    let before = cx.update(|cx| workspace::snapshot(cx));
+    cx.update(|cx| workspace::add_panel(0, kind, cx))?;
+    render_workspace_windows(cx)?;
+    board_panels(&cx.update(|cx| workspace::snapshot(cx)))?
+        .into_iter()
+        .find(|(owner, panel)| {
+            panel.model.kind == kind && !before.windows.iter().any(|w| w.id == *owner)
+        })
+        .context("Adding a close-regression component did not create its own window")
+}
+
+fn set_workspace_locked(cx: &mut HeadlessAppContext, id: u64, locked: bool) -> Result<()> {
+    let view = cx
+        .update(|cx| workspace::workspace(id, cx))
+        .context("Cannot lock missing window")?;
+    let (handle, dock) = cx.update(|cx| (view.read(cx).handle, view.read(cx).dock.clone()));
+    cx.update_window(handle, |_, window, cx| {
+        dock.update(cx, |dock, cx| dock.set_locked(locked, window, cx));
+    })?;
+    render_workspace_windows(cx)
+}
+
+fn dismiss_and_verify(cx: &mut HeadlessAppContext, id: u64) -> Result<WorkspaceFile> {
+    let before = cx.update(|cx| workspace::snapshot(cx));
+    let boards = cx.update(|cx| workspace::snapshot_board_set(cx));
+    let handle = native_workspace(cx, id)?;
+    cx.update(|cx| workspace::dismiss_window(id, cx))?;
+    render_workspace_windows(cx)?;
+    let after = cx.update(|cx| workspace::snapshot(cx));
+    storage::validate(&after)?;
+    let mut expected = before.clone();
+    expected.windows.retain(|window| window.id != id);
+    ensure!(
+        same_board_workspace(&expected, &after)?
+            && cx.update(|cx| workspace::workspace(id, cx).is_none())
+            && cx.update_window(handle, |_, _, _| ()).is_err(),
+        "Closing a floating window returned components to the main window or changed another window"
+    );
+    let mut expected_ids: Vec<_> = board_panels(&expected)?
+        .into_iter()
+        .map(|(_, panel)| panel.model.id)
+        .collect();
+    expected_ids.sort_unstable();
+    let mut live_ids = cx.update(|cx| workspace::live_panel_ids(cx));
+    live_ids.sort_unstable();
+    ensure!(
+        expected_ids == live_ids,
+        "Closing a floating window left stale component ownership or removed unrelated components"
+    );
+    let after_boards = cx.update(|cx| workspace::snapshot_board_set(cx));
+    for board in boards.boards.iter().filter(|b| b.id != boards.active_board) {
+        let preserved = after_boards.boards.iter().find(|b| b.id == board.id);
+        ensure!(
+            preserved.is_some_and(
+                |after| serde_json::to_value(after).ok() == serde_json::to_value(board).ok()
+            ),
+            "Closing a floating window changed an inactive board snapshot"
+        );
+    }
+    Ok(before)
 }
 
 fn unique_panel(state: &WorkspaceFile, id: u64) -> Result<(u64, SavedPanel)> {
