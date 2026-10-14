@@ -115,6 +115,7 @@ struct DragState {
     viewport: ChartViewport,
     moved: bool,
     click_count: usize,
+    inspection_was_active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -131,6 +132,32 @@ struct CandleDetails {
     previous_close: Option<f64>,
     turnover: Option<f64>,
     turnover_rate: Option<f64>,
+}
+
+/// Minute inspection values are independent of the live/latest quote.
+struct IntradayDetails {
+    time: String,
+    latest: f64,
+    change: Option<f64>,
+    percent: Option<f64>,
+    average: Option<f64>,
+    volume: u64,
+    turnover: f64,
+}
+
+impl IntradayDetails {
+    fn new(bar: &Bar, previous_close: f64, average: Option<f64>) -> Self {
+        let previous = (previous_close > 0.).then_some(previous_close);
+        Self {
+            time: bar.time.clone(),
+            latest: bar.close,
+            change: previous.map(|previous| bar.close - previous),
+            percent: previous.map(|previous| change_percent(bar.close, previous)),
+            average,
+            volume: bar.volume,
+            turnover: bar_turnover(bar),
+        }
+    }
 }
 
 pub struct MarketChart {
@@ -444,6 +471,20 @@ impl Render for MarketChart {
         let details_card = selection
             .zip(self.details.as_ref())
             .map(|(index, details)| inspection_card(details, geometry, index, visible.len()));
+        let intraday_card = selection.and_then(|index| {
+            let timeline = timeline.as_ref()?;
+            let bar = visible.get(index)?;
+            let details =
+                IntradayDetails::new(bar, reference_price, indicators.session.get(index).copied());
+            let x = timeline.x(market::bar_wall_minute(bar), geometry);
+            Some(intraday_inspection_card(
+                details,
+                geometry,
+                x,
+                self.symbol.currency(),
+                cx,
+            ))
+        });
         let latest = self.data.last().map(|b| b.close);
 
         div()
@@ -597,6 +638,7 @@ impl Render for MarketChart {
                                     viewport: this.viewport,
                                     moved: false,
                                     click_count: event.click_count,
+                                    inspection_was_active: this.inspecting,
                                 });
                             } else if this.period == Period::Intraday {
                                 this.clear_inspection();
@@ -612,18 +654,22 @@ impl Render for MarketChart {
                             };
                             let was_dragged = this.last_gesture_dragged;
                             this.last_gesture_dragged = drag.moved;
-                            if !drag.moved
-                                && let Some(index) = this.locate(event.position)
-                                && drag.click_count == 2
-                                && !was_dragged
-                                && this.period == Period::Day
-                                && !this.historical
-                            {
-                                cx.emit(ChartEvent::InspectDay {
-                                    symbol: this.symbol,
-                                    day_index: index,
-                                    tick: this.tick,
-                                });
+                            if !drag.moved {
+                                if this.period == Period::Intraday && drag.inspection_was_active {
+                                    // A second click dismisses the whole inspection, even on another minute.
+                                    this.clear_inspection();
+                                } else if let Some(index) = this.locate(event.position)
+                                    && drag.click_count == 2
+                                    && !was_dragged
+                                    && this.period == Period::Day
+                                    && !this.historical
+                                {
+                                    cx.emit(ChartEvent::InspectDay {
+                                        symbol: this.symbol,
+                                        day_index: index,
+                                        tick: this.tick,
+                                    });
+                                }
                             }
                             cx.notify();
                         }),
@@ -680,6 +726,7 @@ impl Render for MarketChart {
                         .size_full(),
                     )
                     .children(details_card)
+                    .children(intraday_card)
                     .children(selected_time.map(|time| {
                         div()
                             .id("chart-selected-time")
@@ -694,6 +741,154 @@ impl Render for MarketChart {
                     })),
             )
     }
+}
+
+fn intraday_card_on_left(x: f32, geometry: Geometry) -> bool {
+    x >= geometry.left + geometry.width / 2.
+}
+
+fn intraday_inspection_card(
+    details: IntradayDetails,
+    geometry: Geometry,
+    selected_x: f32,
+    currency: &'static str,
+    cx: &mut Context<MarketChart>,
+) -> impl IntoElement + use<> {
+    let color = match details.change {
+        Some(change) if change > 0.000_001 => UP,
+        Some(change) if change < -0.000_001 => DOWN,
+        _ => MUTED,
+    };
+    let fields = [
+        ("latest", "最新", format!("{:.3}", details.latest), color),
+        (
+            "change",
+            "涨跌",
+            details
+                .change
+                .map(|value| format!("{value:+.3}"))
+                .unwrap_or_else(|| "—".into()),
+            color,
+        ),
+        (
+            "percent",
+            "涨幅",
+            details
+                .percent
+                .map(|value| format!("{value:+.2}%"))
+                .unwrap_or_else(|| "—".into()),
+            color,
+        ),
+        (
+            "average",
+            "均价",
+            details
+                .average
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "—".into()),
+            VWAP,
+        ),
+        (
+            "volume",
+            "成交量",
+            format!("{}股", volume_label(details.volume)),
+            BLUE,
+        ),
+        (
+            "turnover",
+            "成交额",
+            format!(
+                "{} {currency}",
+                volume_label(details.turnover.round() as u64)
+            ),
+            BLUE,
+        ),
+    ];
+    let width = 174_f32.min((geometry.width - 8.).max(128.));
+    let on_left = intraday_card_on_left(selected_x, geometry);
+    let left = if on_left {
+        59.
+    } else {
+        55. + geometry.width - width - 4.
+    };
+    div()
+        .id("chart-intraday-card")
+        .test_support()
+        .absolute()
+        .left(px(left.max(4.)))
+        .top(px(28.))
+        .w(px(width))
+        .max_h(px((geometry.price_height - 8.).max(64.)))
+        .overflow_y_scroll()
+        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, _, cx| {
+            cx.stop_propagation();
+            if let gpui_kit::ClickEvent::Mouse(event) = event
+                && (event.up.position - event.down.position).magnitude() > 4.
+            {
+                return;
+            }
+            this.clear_inspection();
+            cx.notify();
+        }))
+        .border_1()
+        .border_color(rgb(0xCAD8EB))
+        .rounded_sm()
+        .bg(rgba(0xFFFFFFF0))
+        .px_2()
+        .py_1()
+        .text_size(px(11.))
+        .child(
+            div()
+                .id(if on_left {
+                    "chart-intraday-left"
+                } else {
+                    "chart-intraday-right"
+                })
+                .test_support()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pb_1()
+                .mb_1()
+                .border_b_1()
+                .border_color(rgb(GRID))
+                .child(div().text_color(rgb(MUTED)).child("时间"))
+                .child(
+                    div()
+                        .id("chart-intraday-time")
+                        .test_support()
+                        .aria_label(details.time.clone())
+                        .text_color(rgb(0x233348))
+                        .child(details.time),
+                ),
+        )
+        .children(fields.into_iter().map(|(key, name, value, color)| {
+            div()
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(div().text_color(rgb(MUTED)).child(name))
+                .child(
+                    div()
+                        .id(format!("chart-intraday-{key}"))
+                        .test_support()
+                        .aria_label(value.clone())
+                        .text_color(rgb(color))
+                        .child(value),
+                )
+        }))
+        .child(
+            div()
+                .pt_1()
+                .text_size(px(10.))
+                .text_color(rgb(MUTED))
+                .child("分钟成交"),
+        )
 }
 
 /// Place the card on the half opposite the inspected candle, keeping the pointer clear.
@@ -1716,6 +1911,11 @@ fn paint_series(
     stroke(&points, 1., color, false, window);
 }
 
+fn bar_turnover(bar: &Bar) -> f64 {
+    let mean_cents = ((bar.open + bar.high + bar.low + bar.close) * 100.).round() as u64 / 4;
+    (mean_cents * bar.volume) as f64 / 100.
+}
+
 fn session_averages(bars: &[Bar]) -> Vec<f64> {
     let mut value = 0.;
     let mut volume = 0.;
@@ -1724,9 +1924,7 @@ fn session_averages(bars: &[Bar]) -> Vec<f64> {
             let weight = bar.volume as f64;
             // The local feed estimates minute turnover from OHLC in integer
             // cents. Use that same convention so the chart and quote agree.
-            let mean_cents =
-                ((bar.open + bar.high + bar.low + bar.close) * 100.).round() as u64 / 4;
-            value += mean_cents as f64 / 100. * weight;
+            value += bar_turnover(bar);
             volume += weight;
             if volume > 0. {
                 value / volume
@@ -1879,6 +2077,72 @@ mod tests {
         ChartViewport, Indicators, change_percent, moving_average, price_extent, session_averages,
     };
     use crate::market::{self, Bar, Period, Symbol};
+
+    #[test]
+    fn minute_inspection_uses_that_minutes_amount_and_the_vwap_prefix() {
+        let bars: Vec<_> = [
+            ("09:30", 10., 100),
+            ("09:31", 12., 300),
+            ("09:32", 99., 9000),
+        ]
+        .into_iter()
+        .map(|(time, close, volume)| Bar {
+            time: time.into(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume,
+        })
+        .collect();
+        let indicators = Indicators::new(&bars);
+        let detail = super::IntradayDetails::new(&bars[1], 10., Some(indicators.session[1]));
+        assert_eq!(detail.time, "09:31");
+        assert_eq!(detail.latest, 12.);
+        assert_eq!(detail.change, Some(2.));
+        assert_eq!(detail.percent, Some(20.));
+        assert_eq!(detail.volume, 300);
+        assert_eq!(detail.turnover, 3600.);
+        assert_eq!(detail.average, Some(11.5));
+        assert_ne!(detail.average, indicators.session.last().copied());
+        let fractional = Bar {
+            time: "09:33".into(),
+            open: 10.01,
+            high: 10.03,
+            low: 9.99,
+            close: 10.02,
+            volume: 3,
+        };
+        assert!((super::bar_turnover(&fractional) - 30.03).abs() < 0.000_001);
+        assert!((session_averages(&[fractional])[0] - 10.01).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn intraday_card_side_uses_the_fixed_clock_instead_of_available_bar_count() {
+        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let geometry = super::Geometry::new(gpui_kit::Bounds::new(
+            gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(0.)),
+            gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(600.)),
+        ));
+        let morning = market::bars(Symbol::Yinli, Period::Intraday, 0);
+        let latest_morning = morning.last().unwrap();
+        assert_eq!(latest_morning.time, "10:00");
+        assert!(!super::intraday_card_on_left(
+            timeline.x(market::bar_wall_minute(latest_morning), geometry),
+            geometry
+        ));
+        assert!(super::intraday_card_on_left(
+            timeline.x(840, geometry),
+            geometry
+        ));
+        // Even after the session fills, the same 10:00 point keeps its card on the right.
+        let closed = market::bars(Symbol::Yinli, Period::Intraday, 300);
+        let same_minute = closed.iter().find(|bar| bar.time == "10:00").unwrap();
+        assert!(!super::intraday_card_on_left(
+            timeline.x(market::bar_wall_minute(same_minute), geometry),
+            geometry
+        ));
+    }
 
     #[test]
     fn fixed_session_coordinates_keep_prices_volumes_and_future_minutes_in_place() {

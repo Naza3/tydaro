@@ -176,7 +176,8 @@ impl Render for HistoryView {
             .bg(rgb(0xffffff))
             .text_color(rgb(0x233348))
             .text_size(px(12.))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            // Let an active chart inspector consume Escape before closing this viewer.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "pageup" => this.navigate(false, cx),
                     "pagedown" => this.navigate(true, cx),
@@ -279,7 +280,7 @@ impl Render for HistoryView {
                             .map(|bar| bar.time.as_str())
                             .unwrap_or("—")
                     ))
-                    .child("PageUp / PageDown 切换交易日 · Esc 关闭"),
+                    .child("单击切换定位 · PageUp / PageDown 翻日 · Esc 退出"),
             )
     }
 }

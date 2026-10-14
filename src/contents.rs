@@ -1427,7 +1427,7 @@ impl PanelContent {
                     .child(if self.period == Period::Day {
                         "单击查看数据 · ← → 逐日定位 · 双击查看当日分时 · Esc 退出定位"
                     } else if self.period == Period::Intraday {
-                        "当日分时 · 固定全天时轴 · 单击查看数据 · Esc 退出定位"
+                        "单击显示 / 隐藏定位 · 移动鼠标查看 · Esc 退出"
                     } else {
                         "单击查看数据 · 滚轮缩放 · 拖动平移 · Esc 退出定位"
                     }),
