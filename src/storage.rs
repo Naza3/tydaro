@@ -14,11 +14,11 @@ use anyhow::{Context, Result, bail, ensure};
 use gpui_kit::component::dock::{DockAreaState, PanelInfo, PanelState};
 use serde::{Deserialize, Serialize};
 
-use crate::model::PanelModel;
+use crate::{boards::BoardSetFile, model::PanelModel};
 
 pub const SCHEMA_VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_STABLE_ID: u64 = u64::MAX / 2;
+pub(crate) const MAX_STABLE_ID: u64 = u64::MAX / 2;
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -189,6 +189,31 @@ pub fn read(path: &Path) -> Result<WorkspaceFile> {
     decode(&read_bytes(path)?).with_context(|| format!("Cannot load {}", path.display()))
 }
 
+fn decode_board_set(bytes: &[u8]) -> Result<BoardSetFile> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("Invalid workspace JSON")?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    let state = match version {
+        Some(version) if version == u64::from(SCHEMA_VERSION) => {
+            let legacy: WorkspaceFile =
+                serde_json::from_value(value).context("Invalid legacy workspace")?;
+            BoardSetFile::from_legacy(legacy)
+        }
+        Some(version) if version == u64::from(crate::boards::SCHEMA_VERSION) => {
+            serde_json::from_value(value).context("Invalid board workspace")?
+        }
+        _ => bail!("Unsupported workspace schema {version:?}"),
+    };
+    crate::boards::validate(&state)?;
+    Ok(state)
+}
+
+/// Read all boards, wrapping a schema 1 workspace in the default board without
+/// changing its windows, content, identities or on-disk bytes.
+pub fn read_board_set(path: &Path) -> Result<BoardSetFile> {
+    decode_board_set(&read_bytes(path)?).with_context(|| format!("Cannot load {}", path.display()))
+}
+
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -257,6 +282,23 @@ impl Drop for TemporaryFile {
 pub fn write(path: &Path, state: &WorkspaceFile) -> Result<()> {
     validate(state)?;
     let bytes = serde_json::to_vec_pretty(state).context("Cannot serialize workspace")?;
+    write_validated(path, &bytes, |previous| decode(previous).is_ok())
+}
+
+/// Save a board set using the same atomic replacement and recovery semantics as
+/// a single-board template. A valid schema 1 predecessor remains byte-for-byte
+/// available in `.bak` on the first schema 2 save.
+pub fn write_board_set(path: &Path, state: &BoardSetFile) -> Result<()> {
+    crate::boards::validate(state)?;
+    let bytes = serde_json::to_vec_pretty(state).context("Cannot serialize board workspace")?;
+    write_validated(path, &bytes, |previous| decode_board_set(previous).is_ok())
+}
+
+fn write_validated(
+    path: &Path,
+    bytes: &[u8],
+    previous_is_valid: impl FnOnce(&[u8]) -> bool,
+) -> Result<()> {
     ensure!(
         bytes.len() as u64 <= MAX_FILE_BYTES,
         "Workspace file exceeds 8 MiB"
@@ -268,10 +310,10 @@ pub fn write(path: &Path, state: &WorkspaceFile) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("Cannot create {}", parent.display()))?;
 
     let mut pending = TemporaryFile::create(path, "tmp")?;
-    pending.store(&bytes)?;
+    pending.store(bytes)?;
     match read_bytes(path) {
         Ok(previous) => {
-            if decode(&previous).is_ok() {
+            if previous_is_valid(&previous) {
                 let backup_path = with_suffix(path, ".bak");
                 let mut backup = TemporaryFile::create(&backup_path, "tmp")?;
                 backup.store(&previous)?;
@@ -301,7 +343,7 @@ pub fn write(path: &Path, state: &WorkspaceFile) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::PanelKind;
+    use crate::{boards::SavedBoard, model::PanelKind};
     use gpui_kit::{
         component::dock::{DockPlacement, DockState},
         px,
@@ -358,6 +400,167 @@ mod tests {
                 },
             }],
         }
+    }
+
+    fn board_fixture() -> BoardSetFile {
+        let mut workspace = fixture();
+        workspace.windows[0].id = 0;
+        BoardSetFile::from_legacy(workspace)
+    }
+
+    fn preserved_files(dir: &TestDirectory) -> Vec<PathBuf> {
+        fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+                    .then_some(path)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_migration_retains_all_content_and_backs_up_original_bytes() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let mut legacy = board_fixture().boards.remove(0).workspace;
+        let mut floating = legacy.windows[0].clone();
+        // Legacy panel and window IDs occupy separate namespaces; migration
+        // must still accept a floating window matching the main panel's ID.
+        floating.id = 2;
+        floating.locked = true;
+        floating.dock.center = PanelState {
+            panel_name: "future.extension".into(),
+            children: vec![panel(7)],
+            info: PanelInfo::Panel(serde_json::json!({"custom": ["preserve", 3]})),
+        };
+        legacy.windows.push(floating);
+        legacy.paused = true;
+        legacy.next_id = 50;
+        // Noncanonical whitespace verifies that migration backs up the actual
+        // prior file, not a fresh serialization of its decoded representation.
+        let original = format!(" \n{}\n\n", serde_json::to_string(&legacy).unwrap()).into_bytes();
+        fs::write(&path, &original).unwrap();
+        let migrated = read_board_set(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(migrated.active_board, 1);
+        assert_eq!(migrated.next_board_id, 2);
+        assert_eq!(migrated.boards[0].name, "默认看板");
+        assert_eq!(
+            serde_json::to_value(&migrated.boards[0].workspace).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
+        write_board_set(&path, &migrated).unwrap();
+        assert_eq!(fs::read(with_suffix(&path, ".bak")).unwrap(), original);
+        assert_eq!(
+            serde_json::to_value(read_board_set(&path).unwrap()).unwrap(),
+            serde_json::to_value(migrated).unwrap()
+        );
+        assert!(
+            read(&path).is_err(),
+            "schema 2 must not be mistaken for a single-board template"
+        );
+    }
+
+    #[test]
+    fn board_order_active_selection_and_independent_snapshots_roundtrip() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let mut state = board_fixture();
+        let mut other = state.boards[0].workspace.clone();
+        other.paused = true;
+        other.windows[0].locked = true;
+        other.windows[0].dock.center = panel(21);
+        other.next_id = 22;
+        state.boards.insert(
+            0,
+            SavedBoard {
+                id: 8,
+                name: "竞价观察".into(),
+                workspace: other,
+            },
+        );
+        state.active_board = 8;
+        state.next_board_id = 9;
+        write_board_set(&path, &state).unwrap();
+        assert_eq!(
+            serde_json::to_value(read_board_set(&path).unwrap()).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        state.boards.swap(0, 1);
+        state.active_board = 1;
+        write_board_set(&path, &state).unwrap();
+        let saved = read_board_set(&path).unwrap();
+        assert_eq!(
+            saved
+                .boards
+                .iter()
+                .map(|board| board.id)
+                .collect::<Vec<_>>(),
+            vec![1, 8]
+        );
+        assert_eq!(saved.active_board, 1);
+        assert_eq!(
+            read_board_set(&with_suffix(&path, ".bak"))
+                .unwrap()
+                .active_board,
+            8
+        );
+    }
+
+    #[test]
+    fn corrupt_or_future_workspace_cannot_replace_the_last_good_board_backup() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let state = board_fixture();
+        write_board_set(&path, &state).unwrap();
+        write_board_set(&path, &state).unwrap();
+        let backup_path = with_suffix(&path, ".bak");
+        let backup = fs::read(&backup_path).unwrap();
+        let invalid_legacy = b"{\"version\":1,\"next_id\":5,\"paused\":false,\"windows\":[";
+        let future = b"{\"version\":99,\"future_data\":\"retain me\"}";
+        for original in [invalid_legacy.as_slice(), future.as_slice()] {
+            fs::write(&path, original).unwrap();
+            assert!(read_board_set(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            write_board_set(&path, &state).unwrap();
+            assert_eq!(fs::read(&backup_path).unwrap(), backup);
+            assert!(
+                preserved_files(&dir)
+                    .iter()
+                    .any(|preserved| fs::read(preserved).unwrap() == original)
+            );
+        }
+        assert_eq!(preserved_files(&dir).len(), 2);
+    }
+
+    #[test]
+    fn invalid_and_oversized_board_sets_leave_the_previous_file_unchanged() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let state = board_fixture();
+        write_board_set(&path, &state).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut invalid = state.clone();
+        invalid.active_board = 999;
+        assert!(write_board_set(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        invalid = state;
+        invalid.boards[0].workspace.windows[0].dock.center = PanelState {
+            panel_name: "future.large-panel".into(),
+            children: vec![],
+            info: PanelInfo::Panel(
+                serde_json::json!({"data": "x".repeat(MAX_FILE_BYTES as usize)}),
+            ),
+        };
+        assert!(write_board_set(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+        fs::write(&path, vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
+        assert!(read_board_set(&path).is_err());
     }
 
     #[test]

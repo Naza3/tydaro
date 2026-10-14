@@ -1,5 +1,7 @@
 //! Native workspaces, persistent dock trees and cross-window panel ownership.
 use crate::{
+    board_bar::BoardBar,
+    boards::{self, BoardSetFile, SavedBoard},
     contents::{ContentEvent, PanelContent},
     model::{PanelKind, PanelModel},
     storage::{self, SavedPanel, SavedWindow, WorkspaceFile},
@@ -35,6 +37,8 @@ struct Session {
     drag: DragCoordinator,
     history: Vec<WorkspaceFile>,
     last: Option<WorkspaceFile>,
+    boards: Option<BoardSetFile>,
+    board_histories: HashMap<u64, Vec<WorkspaceFile>>,
 }
 impl Global for Session {}
 fn allocate(cx: &mut App) -> u64 {
@@ -143,7 +147,12 @@ impl StockPanel {
             let sub = cx.subscribe(&content, |this, _, event, cx| match *event {
                 ContentEvent::SymbolSelected(symbol) => {
                     let id = this.model.id;
-                    cx.defer(move |cx| select_symbol(id, symbol, cx));
+                    let entity_id = cx.entity_id();
+                    cx.defer(move |cx| {
+                        if panel(id, cx).is_some_and(|p| p.entity_id() == entity_id) {
+                            select_symbol(id, symbol, cx);
+                        }
+                    });
                 }
                 ContentEvent::PeriodChanged(period) => {
                     this.model.period = period;
@@ -504,6 +513,7 @@ pub(crate) struct Workspace {
     pub(crate) handle: AnyWindowHandle,
     pub(crate) dock: Entity<DockArea>,
     bounds: [f32; 4],
+    board_bar: Option<Entity<BoardBar>>,
     _subscriptions: Vec<Subscription>,
 }
 impl Workspace {
@@ -557,6 +567,7 @@ impl Workspace {
             handle: window.window_handle(),
             dock,
             bounds: window_bounds(window),
+            board_bar: (id == 0).then(|| cx.new(|cx| BoardBar::new(window, cx))),
             _subscriptions: vec![sub, bounds_sub, active],
         }
     }
@@ -1105,6 +1116,424 @@ pub(crate) fn snapshot(cx: &App) -> WorkspaceFile {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BoardPreset {
+    Empty,
+    Standard,
+    DualChart,
+}
+
+pub(crate) fn active_board_id(cx: &App) -> u64 {
+    cx.global::<Session>()
+        .boards
+        .as_ref()
+        .map_or(1, |state| state.active_board)
+}
+
+pub(crate) fn board_summaries(cx: &App) -> Vec<(u64, String)> {
+    cx.global::<Session>().boards.as_ref().map_or_else(
+        || vec![(1, "默认看板".into())],
+        |state| {
+            state
+                .boards
+                .iter()
+                .map(|b| (b.id, b.name.clone()))
+                .collect()
+        },
+    )
+}
+
+fn active_board_name(cx: &App) -> String {
+    let id = active_board_id(cx);
+    board_summaries(cx)
+        .into_iter()
+        .find(|(board, _)| *board == id)
+        .map_or_else(|| "默认看板".into(), |(_, name)| name)
+}
+
+/// Inactive boards remain durable values; only the selected board owns live
+/// windows. Patch the selected value at every snapshot so inputs and viewports
+/// are saved even when they did not emit a layout event.
+pub(crate) fn snapshot_board_set(cx: &App) -> BoardSetFile {
+    let live = snapshot(cx);
+    let Some(mut state) = cx.global::<Session>().boards.clone() else {
+        return BoardSetFile::from_legacy(live);
+    };
+    if let Some(board) = state.boards.iter_mut().find(|b| b.id == state.active_board) {
+        board.workspace = live;
+    }
+    state
+}
+
+fn keep_main_geometry(state: &mut WorkspaceFile, cx: &App) {
+    if let Some(main) = workspace(0, cx)
+        && let Some(saved) = state.windows.iter_mut().find(|w| w.id == 0)
+    {
+        saved.bounds = main.read(cx).bounds;
+    }
+}
+
+/// Validate and load the complete destination before committing its identity or
+/// history. `restore` rolls back all window/panel ownership on a load failure.
+fn activate_board_set(mut state: BoardSetFile, cx: &mut App) -> anyhow::Result<()> {
+    boards::validate(&state)?;
+    let target_id = state.active_board;
+    let source_id = active_board_id(cx);
+    let target = state
+        .boards
+        .iter_mut()
+        .find(|b| b.id == target_id)
+        .expect("validated active board");
+    target.workspace.paused = cx.global::<Session>().paused;
+    keep_main_geometry(&mut target.workspace, cx);
+    let target_workspace = target.workspace.clone();
+    record(cx);
+    // Allocation never goes backwards, including while restoring an older
+    // board or rolling back a failed transition.
+    cx.global_mut::<Session>().next_id = cx.global::<Session>().next_id.max(state.next_entity_id());
+    restore(target_workspace, cx)?;
+    let live = snapshot(cx);
+    let session = cx.global_mut::<Session>();
+    let old_history = std::mem::take(&mut session.history);
+    session.board_histories.insert(source_id, old_history);
+    session.history = session
+        .board_histories
+        .remove(&target_id)
+        .unwrap_or_default();
+    session.last = Some(live);
+    session.boards = Some(state);
+    changed(cx);
+    Ok(())
+}
+
+pub(crate) fn switch_board(id: u64, cx: &mut App) -> anyhow::Result<()> {
+    let mut state = snapshot_board_set(cx);
+    anyhow::ensure!(state.boards.iter().any(|b| b.id == id), "看板不存在");
+    if state.active_board == id {
+        return Ok(());
+    }
+    state.active_board = id;
+    activate_board_set(state, cx)?;
+    status(format!("已切换到 {}", active_board_name(cx)), cx);
+    save_now(cx);
+    Ok(())
+}
+
+fn unique_board_name(
+    name: &str,
+    except: Option<u64>,
+    state: &BoardSetFile,
+) -> anyhow::Result<String> {
+    let name = boards::validate_board_name(name)?;
+    anyhow::ensure!(
+        !state
+            .boards
+            .iter()
+            .any(|b| Some(b.id) != except && b.name == name),
+        "已存在同名看板"
+    );
+    Ok(name)
+}
+
+fn insert_board(name: &str, workspace: WorkspaceFile, cx: &mut App) -> anyhow::Result<u64> {
+    let mut state = snapshot_board_set(cx);
+    let name = unique_board_name(name, None, &state)?;
+    anyhow::ensure!(
+        state.boards.len() < boards::MAX_BOARDS,
+        "最多支持 16 个看板"
+    );
+    anyhow::ensure!(
+        state.next_board_id < storage::MAX_STABLE_ID,
+        "看板编号已用尽"
+    );
+    let id = state.next_board_id;
+    state.next_board_id += 1;
+    state.boards.push(SavedBoard {
+        id,
+        name,
+        workspace,
+    });
+    state.active_board = id;
+    activate_board_set(state, cx)?;
+    status(format!("已创建看板 {}", active_board_name(cx)), cx);
+    save_now(cx);
+    Ok(id)
+}
+
+fn empty_tabs() -> PanelState {
+    PanelState {
+        panel_name: "TabPanel".into(),
+        children: vec![],
+        info: PanelInfo::Tabs { active_index: 0 },
+    }
+}
+
+fn next_saved_id(next_id: &mut u64) -> anyhow::Result<u64> {
+    anyhow::ensure!(*next_id < storage::MAX_STABLE_ID, "组件编号已用尽");
+    let id = *next_id;
+    *next_id += 1;
+    Ok(id)
+}
+
+fn preset_workspace(
+    preset: BoardPreset,
+    mut next_id: u64,
+    bounds: [f32; 4],
+    paused: bool,
+) -> anyhow::Result<WorkspaceFile> {
+    fn tabs(kinds: &[PanelKind], next_id: &mut u64) -> anyhow::Result<PanelState> {
+        let mut tab = empty_tabs();
+        for kind in kinds {
+            let saved = SavedPanel {
+                model: PanelModel::new(next_saved_id(next_id)?, *kind),
+                content: serde_json::Value::Null,
+            };
+            tab.children.push(PanelState {
+                panel_name: "tydaro.panel".into(),
+                children: vec![],
+                info: PanelInfo::Panel(serde_json::to_value(saved)?),
+            });
+        }
+        Ok(tab)
+    }
+    fn stack(axis: usize, slots: Vec<(PanelState, f32)>) -> PanelState {
+        let (children, sizes): (Vec<_>, Vec<_>) =
+            slots.into_iter().map(|(p, s)| (p, px(s))).unzip();
+        PanelState {
+            panel_name: "StackPanel".into(),
+            children,
+            info: PanelInfo::Stack { axis, sizes },
+        }
+    }
+    let center = match preset {
+        BoardPreset::Empty => empty_tabs(),
+        BoardPreset::Standard | BoardPreset::DualChart => {
+            let main_width = (bounds[2] - 120. - 232. - 320.).max(320.);
+            let height = (bounds[3] - 73.).max(500.);
+            let watch = tabs(&[PanelKind::Watchlist], &mut next_id)?;
+            let chart = tabs(&[PanelKind::Chart], &mut next_id)?;
+            let chart = if matches!(preset, BoardPreset::DualChart) {
+                stack(
+                    0,
+                    vec![
+                        (chart, main_width / 2.),
+                        (tabs(&[PanelKind::Chart], &mut next_id)?, main_width / 2.),
+                    ],
+                )
+            } else {
+                chart
+            };
+            let bottom = tabs(
+                &[
+                    PanelKind::OrderEntry,
+                    PanelKind::Orders,
+                    PanelKind::Positions,
+                    PanelKind::News,
+                ],
+                &mut next_id,
+            )?;
+            let quote = tabs(&[PanelKind::Quote], &mut next_id)?;
+            let book = tabs(&[PanelKind::OrderBook], &mut next_id)?;
+            let trades = tabs(&[PanelKind::Trades], &mut next_id)?;
+            stack(
+                0,
+                vec![
+                    (watch, 232.),
+                    (
+                        stack(1, vec![(chart, height - 260.), (bottom, 260.)]),
+                        main_width,
+                    ),
+                    (
+                        stack(
+                            1,
+                            vec![
+                                (quote, 320.),
+                                (book, 300.),
+                                (trades, (height - 620.).max(100.)),
+                            ],
+                        ),
+                        320.,
+                    ),
+                ],
+            )
+        }
+    };
+    let state = WorkspaceFile {
+        version: storage::SCHEMA_VERSION,
+        next_id,
+        paused,
+        windows: vec![SavedWindow {
+            id: 0,
+            bounds,
+            locked: false,
+            dock: DockAreaState {
+                version: Some(1),
+                center,
+                ..Default::default()
+            },
+        }],
+    };
+    storage::validate(&state)?;
+    Ok(state)
+}
+
+pub(crate) fn create_board(name: &str, preset: BoardPreset, cx: &mut App) -> anyhow::Result<u64> {
+    let state = snapshot_board_set(cx);
+    unique_board_name(name, None, &state)?;
+    anyhow::ensure!(
+        state.boards.len() < boards::MAX_BOARDS,
+        "最多支持 16 个看板"
+    );
+    let bounds = workspace(0, cx)
+        .map(|w| w.read(cx).bounds)
+        .unwrap_or([40., 40., 1536., 930.]);
+    let workspace = preset_workspace(
+        preset,
+        state.next_entity_id().max(cx.global::<Session>().next_id),
+        bounds,
+        cx.global::<Session>().paused,
+    )?;
+    insert_board(name, workspace, cx)
+}
+
+/// Copy identities as well as window-local entities. Hidden tabs and side docks
+/// participate; payloads of unknown panels stay byte-for-byte equivalent JSON.
+fn remap_workspace_ids(state: &mut WorkspaceFile, mut next_id: u64) -> anyhow::Result<()> {
+    fn remap(panel: &mut PanelState, next_id: &mut u64) -> anyhow::Result<()> {
+        if panel.panel_name == "tydaro.panel"
+            && let PanelInfo::Panel(value) = &mut panel.info
+        {
+            let mut saved: SavedPanel = serde_json::from_value(value.clone())?;
+            saved.model.id = next_saved_id(next_id)?;
+            *value = serde_json::to_value(saved)?;
+        }
+        for child in &mut panel.children {
+            remap(child, next_id)?;
+        }
+        Ok(())
+    }
+    for window in &mut state.windows {
+        if window.id != 0 {
+            window.id = next_saved_id(&mut next_id)?;
+        }
+        remap(&mut window.dock.center, &mut next_id)?;
+        for dock in [
+            &mut window.dock.left_dock,
+            &mut window.dock.right_dock,
+            &mut window.dock.bottom_dock,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mut panel = dock.panel().clone();
+            remap(&mut panel, &mut next_id)?;
+            *dock = DockState::new(panel, dock.placement(), dock.size(), dock.open());
+        }
+    }
+    state.next_id = next_id;
+    storage::validate(state)
+}
+
+pub(crate) fn duplicate_board(name: &str, cx: &mut App) -> anyhow::Result<u64> {
+    let state = snapshot_board_set(cx);
+    unique_board_name(name, None, &state)?;
+    anyhow::ensure!(
+        state.boards.len() < boards::MAX_BOARDS,
+        "最多支持 16 个看板"
+    );
+    let mut copied = snapshot(cx);
+    remap_workspace_ids(
+        &mut copied,
+        state.next_entity_id().max(cx.global::<Session>().next_id),
+    )?;
+    insert_board(name, copied, cx)
+}
+
+pub(crate) fn rename_board(id: u64, name: &str, cx: &mut App) -> anyhow::Result<()> {
+    let mut state = snapshot_board_set(cx);
+    let name = unique_board_name(name, Some(id), &state)?;
+    let board = state
+        .boards
+        .iter_mut()
+        .find(|b| b.id == id)
+        .ok_or_else(|| anyhow::anyhow!("看板不存在"))?;
+    board.name = name;
+    cx.global_mut::<Session>().boards = Some(state);
+    changed(cx);
+    save_now(cx);
+    Ok(())
+}
+
+pub(crate) fn move_board(id: u64, offset: isize, cx: &mut App) -> anyhow::Result<()> {
+    let mut state = snapshot_board_set(cx);
+    let current = state
+        .boards
+        .iter()
+        .position(|b| b.id == id)
+        .ok_or_else(|| anyhow::anyhow!("看板不存在"))?;
+    let target = current
+        .saturating_add_signed(offset)
+        .min(state.boards.len() - 1);
+    if target != current {
+        let board = state.boards.remove(current);
+        state.boards.insert(target, board);
+        cx.global_mut::<Session>().boards = Some(state);
+        changed(cx);
+        save_now(cx);
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_board(id: u64, cx: &mut App) -> anyhow::Result<()> {
+    let mut state = snapshot_board_set(cx);
+    anyhow::ensure!(state.boards.len() > 1, "至少保留一个看板");
+    let index = state
+        .boards
+        .iter()
+        .position(|b| b.id == id)
+        .ok_or_else(|| anyhow::anyhow!("看板不存在"))?;
+    if state.active_board == id {
+        let neighbor = if index + 1 < state.boards.len() {
+            index + 1
+        } else {
+            index - 1
+        };
+        state.active_board = state.boards[neighbor].id;
+        state.boards.remove(index);
+        activate_board_set(state, cx)?;
+    } else {
+        state.boards.remove(index);
+        cx.global_mut::<Session>().boards = Some(state);
+    }
+    cx.global_mut::<Session>().board_histories.remove(&id);
+    changed(cx);
+    status("已删除看板", cx);
+    save_now(cx);
+    Ok(())
+}
+
+pub(crate) fn restore_board_set(mut state: BoardSetFile, cx: &mut App) -> anyhow::Result<()> {
+    boards::validate(&state)?;
+    let target = state
+        .boards
+        .iter_mut()
+        .find(|b| b.id == state.active_board)
+        .expect("validated active board");
+    keep_main_geometry(&mut target.workspace, cx);
+    let workspace = target.workspace.clone();
+    let next_id = state.next_entity_id().max(cx.global::<Session>().next_id);
+    cx.global_mut::<Session>().next_id = next_id;
+    restore(workspace, cx)?;
+    let live = snapshot(cx);
+    let session = cx.global_mut::<Session>();
+    session.boards = Some(state);
+    session.board_histories.clear();
+    session.history.clear();
+    session.last = Some(live);
+    changed(cx);
+    Ok(())
+}
+
 // Undo concerns the workspace arrangement. Market updates, search/form inputs,
 // chart viewports, selected stocks and native window moves remain independently
 // persisted, but must not fill the layout history once every refresh.
@@ -1204,8 +1633,8 @@ fn save_now(cx: &mut App) {
     let Some(path) = cx.global::<Session>().path.clone() else {
         return;
     };
-    let state = snapshot(cx);
-    match storage::write(&path, &state) {
+    let state = snapshot_board_set(cx);
+    match storage::write_board_set(&path, &state) {
         Ok(()) => cx.global_mut::<Session>().dirty = false,
         Err(error) => status(format!("布局保存失败：{error}"), cx),
     }
@@ -1251,7 +1680,11 @@ fn apply_workspace(state: &WorkspaceFile, cx: &mut App) -> anyhow::Result<()> {
                     id: saved.id,
                     bounds: saved.bounds,
                     locked: saved.locked,
-                    dock: DockAreaState::default(),
+                    dock: DockAreaState {
+                        version: Some(1),
+                        center: empty_tabs(),
+                        ..Default::default()
+                    },
                 }),
                 cx,
             )?;
@@ -1404,7 +1837,7 @@ fn preserve_live_state(target: &mut WorkspaceFile, current: &WorkspaceFile) {
     target.next_id = target.next_id.max(current.next_id);
 }
 
-fn undo(cx: &mut App) {
+pub(crate) fn undo(cx: &mut App) {
     // Capture a just-completed drag even if the autosave timer has not fired.
     record(cx);
     let Some(mut state) = cx.global::<Session>().history.last().cloned() else {
@@ -1475,7 +1908,13 @@ fn template(save: bool, cx: &mut App) {
     let result = if save {
         storage::write(&path, &snapshot(cx))
     } else {
-        storage::read(&path).and_then(|state| {
+        storage::read(&path).and_then(|mut state| {
+            // A template may have originated from another board. Assign fresh
+            // identities so its panels cannot alias inactive boards or history.
+            let next_id = snapshot_board_set(cx).next_entity_id();
+            remap_workspace_ids(&mut state, next_id)?;
+            state.paused = cx.global::<Session>().paused;
+            keep_main_geometry(&mut state, cx);
             record(cx);
             let before = snapshot(cx);
             restore(state, cx)?;
@@ -1538,6 +1977,7 @@ impl Render for Workspace {
         let paused = cx.global::<Session>().paused;
         let tick = cx.global::<Session>().tick;
         let message = cx.global::<Session>().status.clone();
+        let board_name = active_board_name(cx);
         let locked = self.dock.read(cx).is_locked();
         let target = cx
             .global::<Session>()
@@ -1561,12 +2001,7 @@ impl Render for Workspace {
                     .text_color(rgb(0x172736))
                     .child("▥ TYDARO"),
             )
-            .child(div().text_xs().text_color(rgb(0x86929f)).child(if id == 0 {
-                "股票工作台"
-            } else {
-                "独立工作区"
-            }))
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0().children(self.board_bar.clone()))
             .child(
                 Button::new("add-component")
                     .label("＋ 添加组件")
@@ -1660,7 +2095,7 @@ impl Render for Workspace {
                     .truncate()
                     .text_size(px(11.))
                     .text_color(rgb(0x86929f))
-                    .child("独立组件"),
+                    .child(format!("{} · 独立组件", board_name)),
             )
             .child(
                 Button::new("add-component")
@@ -1706,16 +2141,19 @@ impl Render for Workspace {
             })
             .collect();
         let panel_count = owned.len();
-        if id != 0 {
+        if id == 0 {
+            window.set_window_title(&format!("Tydaro · {board_name}"));
+        } else {
             let title = if let [model] = owned.as_slice() {
                 format!(
-                    "{} {} · {} · Tydaro",
+                    "{} {} · {} · {} · Tydaro",
                     model.symbol.code(),
                     model.symbol.name(),
-                    model.kind.title()
+                    model.kind.title(),
+                    board_name
                 )
             } else {
-                "Tydaro · 独立工作区".to_owned()
+                format!("Tydaro · {board_name} · 独立工作区")
             };
             window.set_window_title(&title);
         }
@@ -1858,7 +2296,22 @@ impl Render for Workspace {
                                 .left_0()
                                 .size_full(),
                             )
-                            .child(self.dock.clone()),
+                            .child(self.dock.clone())
+                            .when(id == 0 && panel_count == 0, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .text_color(rgb(0x86929f))
+                                        .child(div().text_size(px(16.)).child("自由搭配你的看板"))
+                                        .child("从右上角「添加组件」开始，拖动组件标题插入此处"),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -1952,6 +2405,8 @@ pub(crate) fn init(cx: &mut App, persistent: bool) {
         drag: DragCoordinator::default(),
         history: vec![],
         last: None,
+        boards: None,
+        board_histories: HashMap::new(),
     });
     register_panel(cx, "tydaro.panel", |build, window, cx| {
         let saved = match build.info() {
@@ -1979,12 +2434,8 @@ pub fn run() {
             init(cx, true);
             let path = cx.global::<Session>().path.clone().unwrap();
             let saved = if path.exists() {
-                match storage::read(&path) {
-                    Ok(state) if state.windows.iter().any(|w| w.id == 0) => Some(state),
-                    Ok(_) => {
-                        status("布局缺少主窗口，已使用默认布局；原文件会保留备份", cx);
-                        None
-                    }
+                match storage::read_board_set(&path) {
+                    Ok(state) => Some(state),
                     Err(error) => {
                         status(format!("布局读取失败，已使用默认布局：{error}"), cx);
                         None
@@ -1994,7 +2445,7 @@ pub fn run() {
                 None
             };
             if let Some(state) = saved {
-                let result = restore(state, cx);
+                let result = restore_board_set(state, cx);
                 report(result, cx);
             }
             if workspace(0, cx).is_none()
@@ -2033,7 +2484,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod persistence_tests {
-    use super::{geometry_changed, layout_key, preserve_live_state};
+    use super::{
+        BoardPreset, geometry_changed, layout_key, preserve_live_state, preset_workspace,
+        remap_workspace_ids, saved_panel_ids,
+    };
     use crate::{
         market::{Period, Symbol},
         model::{PanelKind, PanelModel},
@@ -2081,6 +2535,88 @@ mod persistence_tests {
             panic!("expected panel");
         };
         serde_json::from_value(value.clone()).unwrap()
+    }
+
+    #[test]
+    fn board_presets_have_valid_dock_trees_and_bounded_fresh_identities() {
+        for (preset, count) in [
+            (BoardPreset::Empty, 0),
+            (BoardPreset::Standard, 9),
+            (BoardPreset::DualChart, 10),
+        ] {
+            let state = preset_workspace(preset, 100, [40., 40., 1536., 930.], true).unwrap();
+            crate::storage::validate(&state).unwrap();
+            assert_eq!(state.windows.len(), 1);
+            assert_eq!(state.windows[0].id, 0);
+            assert!(state.paused);
+            assert!(!state.windows[0].dock.center.panel_name.is_empty());
+            let ids = saved_panel_ids(&state);
+            assert_eq!(ids.len(), count);
+            assert!(ids.iter().all(|id| *id >= 100));
+            assert_eq!(state.next_id, 100 + count as u64);
+        }
+        assert!(
+            preset_workspace(
+                BoardPreset::Standard,
+                crate::storage::MAX_STABLE_ID - 1,
+                [40., 40., 1536., 930.],
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn board_copy_remaps_floats_hidden_tabs_and_side_docks_without_changing_content() {
+        use gpui_kit::component::dock::{DockPlacement, DockState};
+        let mut state = fixture();
+        let original_panel = state.windows[0].dock.center.children[0].clone();
+        let original_content = payload(&state).content;
+        let mut floating = state.windows[0].clone();
+        floating.id = 20;
+        let mut side_panel = original_panel.clone();
+        let PanelInfo::Panel(value) = &mut side_panel.info else {
+            unreachable!()
+        };
+        value["model"]["id"] = serde_json::json!(21);
+        floating.dock.center = PanelState {
+            panel_name: "TabPanel".into(),
+            children: vec![],
+            info: PanelInfo::Tabs { active_index: 0 },
+        };
+        floating.dock.left_dock = Some(DockState::new(
+            PanelState {
+                panel_name: "future.extension".into(),
+                children: vec![side_panel],
+                info: PanelInfo::Panel(serde_json::json!({"unknown": [1, "keep"]})),
+            },
+            DockPlacement::Left,
+            px(210.),
+            false,
+        ));
+        state.windows.push(floating);
+        let before = state.clone();
+        remap_workspace_ids(&mut state, 100).unwrap();
+        assert_eq!(saved_panel_ids(&state), [100, 102].into_iter().collect());
+        assert_eq!(state.windows[0].id, 0);
+        assert_eq!(state.windows[1].id, 101);
+        assert_eq!(state.next_id, 103);
+        assert_eq!(payload(&state).content, original_content);
+        assert_eq!(state.windows[1].bounds, before.windows[1].bounds);
+        let side = state.windows[1].dock.left_dock.as_ref().unwrap();
+        assert!(!side.open());
+        assert_eq!(side.size(), px(210.));
+        assert_eq!(
+            side.panel().info,
+            before.windows[1]
+                .dock
+                .left_dock
+                .as_ref()
+                .unwrap()
+                .panel()
+                .info
+        );
+        assert!(saved_panel_ids(&before).is_disjoint(&saved_panel_ids(&state)));
     }
 
     #[test]
