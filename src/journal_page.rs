@@ -1505,6 +1505,7 @@ struct JournalReading {
     note: Entity<TextareaState>,
     note_synced: String,
     note_error: Option<String>,
+    close_confirmation_open: bool,
     _subscription: Subscription,
     _release: Subscription,
 }
@@ -1543,6 +1544,7 @@ impl JournalReading {
             note,
             note_synced: text,
             note_error: None,
+            close_confirmation_open: false,
             _subscription: subscription,
             _release: release,
         }
@@ -1556,21 +1558,39 @@ impl JournalReading {
     }
 
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // Native close events and the page button can arrive again while the
+        // confirmation is open. Keep one decision for this window's input.
+        if self.close_confirmation_open {
+            return false;
+        }
         if self.persist_note(cx) {
             return true;
         }
+        self.close_confirmation_open = true;
         let detail = self.note_error.clone().unwrap_or_default();
         let key = format!("journal-note:{:?}", cx.entity_id());
+        let view = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let key = key.clone();
-            dialog.title("笔记修改尚未保存").width(px(460.)).child(
+            let dismissed = view.clone();
+            let keep = view.clone();
+            let discard = view.clone();
+            dialog.title("笔记修改尚未保存").width(px(460.))
+                .on_close(move |_, _, cx| {
+                    let _ = dismissed.update(cx, |this, _| this.close_confirmation_open = false);
+                })
+                .child(
                 div().flex().flex_col().gap_4().child(detail.clone())
                     .child("继续编辑可保留当前输入。放弃后只丢弃本窗口尚未保存的输入，已保存的笔记与预案保持不变。")
                     .child(div().flex().justify_end().gap_2()
                         .child(action("journal-reading-keep", "继续编辑").primary()
-                            .on_click(|_, window, cx| window.close_dialog(cx)))
+                            .on_click(move |_, window, cx| {
+                                let _ = keep.update(cx, |this, _| this.close_confirmation_open = false);
+                                window.close_dialog(cx);
+                            }))
                         .child(action("journal-reading-discard", "放弃输入并关闭")
                             .on_click(move |_, window, cx| {
+                                let _ = discard.update(cx, |this, _| this.close_confirmation_open = false);
                                 desktop_state::report_pending_input(cx, key.clone(), None);
                                 window.close_dialog(cx);
                                 window.remove_window();
@@ -1717,6 +1737,10 @@ pub(crate) fn smoke_rejected_inputs(cx: &mut HeadlessAppContext) -> anyhow::Resu
     use anyhow::ensure;
     use gpui_kit::test::TestWindowExt;
 
+    // This helper also runs from the full smoke entry point, which otherwise
+    // animates dialogs. Test native clicks against stable hit-test bounds.
+    cx.update(|cx| cx.set_reduce_motion(true));
+
     fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle) -> anyhow::Result<()> {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
@@ -1853,17 +1877,42 @@ pub(crate) fn smoke_rejected_inputs(cx: &mut HeadlessAppContext) -> anyhow::Resu
             "One reader cleared another reader's rejected input"
         );
         cx.update_window(reading, |_, window, cx| {
-            ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            for _ in 0..3 {
+                ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            }
             Ok::<_, anyhow::Error>(())
         })??;
         settle(cx, reading)?;
         cx.update_window(reading, |_, window, cx| {
-            window.click("journal-reading-keep", cx)
-        })?;
+            // An unscoped selector must still resolve uniquely after repeated
+            // close requests; narrowing it would conceal duplicate dialogs.
+            ensure!(window.has_active_dialog(cx));
+            ensure!(reader.read(cx).close_confirmation_open);
+            window.click("journal-reading-keep", cx);
+            Ok::<_, anyhow::Error>(())
+        })??;
         settle(cx, reading)?;
-        ensure!(cx.update(|cx| reader.read(cx).note.read(cx).value().as_ref() == oversized_note));
         cx.update_window(reading, |_, window, cx| {
-            ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            ensure!(!window.has_active_dialog(cx));
+            ensure!(!reader.read(cx).close_confirmation_open);
+            ensure!(reader.read(cx).note.read(cx).value().as_ref() == oversized_note);
+            ensure!(!desktop_state::save_now(cx));
+            for _ in 0..3 {
+                ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            }
+            Ok::<_, anyhow::Error>(())
+        })??;
+        settle(cx, reading)?;
+        cx.update_window(reading, |_, window, cx| window.press("escape", cx))?;
+        settle(cx, reading)?;
+        cx.update_window(reading, |_, window, cx| {
+            ensure!(!window.has_active_dialog(cx));
+            ensure!(!reader.read(cx).close_confirmation_open);
+            ensure!(reader.read(cx).note.read(cx).value().as_ref() == oversized_note);
+            ensure!(!desktop_state::save_now(cx));
+            for _ in 0..3 {
+                ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            }
             Ok::<_, anyhow::Error>(())
         })??;
         settle(cx, reading)?;
@@ -1871,6 +1920,8 @@ pub(crate) fn smoke_rejected_inputs(cx: &mut HeadlessAppContext) -> anyhow::Resu
             window.click("journal-reading-discard", cx)
         })?;
         cx.run_until_parked();
+        ensure!(!cx.update(|cx| reader.read(cx).close_confirmation_open));
+        ensure!(cx.update_window(reading, |_, _, _| ()).is_err());
         ensure!(cx.update(desktop_state::save_now));
         ensure!(
             cx.update(|cx| cx.global::<DesktopState>().journal.days[TODAY].note

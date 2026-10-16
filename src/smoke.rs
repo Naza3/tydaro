@@ -77,6 +77,7 @@ fn verify_rejected_inputs(cx: &mut HeadlessAppContext) -> Result<()> {
     crate::journal_page::smoke_rejected_inputs(cx)?;
     crate::research_page::verify_rejected_edits(cx, handle)?;
     crate::watch_page::verify_rejected_edits(cx, handle)?;
+    crate::app::smoke_close_confirmation(cx, handle)?;
     Ok(())
 }
 
