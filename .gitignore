@@ -1,9 +1,38 @@
+# Rust build, packaged previews and native regression output.
+# Keep Cargo.lock and source-controlled screenshots/fixtures.
 /target/
-*.log
-.DS_Store
-Thumbs.db
-
 /dist/
 /artifacts/
 
+# Local application data, including when TYDARO_DATA_DIR is the repo root.
+/.tydaro/
+/workspace.json
+/workspace.json.*
+/desktop.json
+/desktop.json.*
+/template.json
+/template.json.*
+/gallery-preferences.json
+/gallery-preferences.json.*
+
+# Local logs; fixture logs elsewhere remain versionable.
+/*.log
+/logs/
+
+# Python tooling.
+.venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment overrides; documented examples remain versionable.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# OS and Visual Studio caches. Shared editor settings stay versionable.
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vs/
