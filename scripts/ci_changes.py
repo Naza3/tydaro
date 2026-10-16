@@ -28,6 +28,20 @@ def documentation_only(paths: list[str]) -> bool:
     return True
 
 
+def native_build_exempt(paths: list[str]) -> bool:
+    """Known documentation and the isolated React preview need no Rust build.
+
+    Keep the preview workflow exact and leave all unknown files conservative.
+    A mixed change, including a source moved into the preview, still builds.
+    """
+    return bool(paths) and all(
+        documentation_only([path])
+        or path.startswith("design-preview/")
+        or path == ".github/workflows/design-preview.yml"
+        for path in paths
+    )
+
+
 def changes_require_build(event_name: str, event: dict) -> bool:
     if event_name == "pull_request":
         base = event["pull_request"]["base"]["sha"]
@@ -47,7 +61,7 @@ def changes_require_build(event_name: str, event: dict) -> bool:
     except subprocess.CalledProcessError:
         return True  # An unavailable history must never skip verification.
     paths = [path.decode("utf-8", errors="replace") for path in diff.split(b"\0") if path]
-    return not documentation_only(paths)
+    return not native_build_exempt(paths)
 
 
 def matches_push(pull_request: dict, repository: str, sha: str) -> bool:
@@ -130,7 +144,7 @@ def matching_open_pull_request(
 
 def select_build(event_name: str, event: dict) -> tuple[bool, str]:
     if not changes_require_build(event_name, event):
-        return False, "Known documentation only; native jobs skipped."
+        return False, "Known documentation or isolated React preview only; native jobs skipped."
     number = matching_open_pull_request(
         event_name, event, os.environ.get("GITHUB_REPOSITORY", ""),
         os.environ.get("GITHUB_TOKEN", ""),

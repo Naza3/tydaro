@@ -1,0 +1,69 @@
+name: Design preview
+
+on:
+  push:
+    branches: [main, codex/dev]
+    paths:
+      - 'design-preview/**'
+      - '.github/workflows/design-preview.yml'
+  pull_request:
+    paths:
+      - 'design-preview/**'
+      - '.github/workflows/design-preview.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: design-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: React build and interaction checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: design-preview
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Cache npm downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.npm
+          key: design-preview-npm-${{ runner.os }}-node24-${{ hashFiles('design-preview/package-lock.json') }}
+          restore-keys: |
+            design-preview-npm-${{ runner.os }}-node24-
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build the preview
+        run: npm run build
+      - name: Install Chromium and rendering dependencies
+        run: |
+          npx playwright install --with-deps chromium
+          sudo apt-get install --no-install-recommends -y fonts-noto-cjk
+      - name: Check preview interactions
+        run: npm run test:ui
+      - name: Upload preview bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tydaro-design-preview-${{ github.sha }}
+          path: design-preview/dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload interaction evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tydaro-design-preview-evidence-${{ github.sha }}
+          path: design-preview/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

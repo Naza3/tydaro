@@ -6,6 +6,12 @@
 
 ![Tydaro 工作区](docs/preview.png)
 
+## 桌面视觉设计预览
+
+另有独立的 [React 交互样机](design-preview/README.md)，用于评审浅色工作台、看板、股票分组、行情图与组件浮窗的视觉和操作；它不替换 Rust 主程序。构建后可下载并离线打开 `design-preview/dist/tydaro-preview.html`。设计依据和原生复刻路径见 [GPUI 设计交接](docs/design-preview.md)。
+
+![浅色桌面设计预览](docs/design-preview.png)
+
 ## 第一版工作区
 
 行情页顶部是可自定义的看板栏，参考通达信版面的横向切换方式。每个看板独立搭配组件、停靠布局和浮窗；可以从空白看板开始，也可以使用默认行情、双图布局或复制已有看板。默认页面为左侧股票列表、中间图表及交易标签、右侧报价与盘口。

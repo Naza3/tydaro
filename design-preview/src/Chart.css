@@ -1,0 +1,113 @@
+.market-chart {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 200px;
+  min-width: 0;
+  outline: none;
+  overflow: hidden;
+  background: #fff;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.market-chart:focus-visible {
+  box-shadow: inset 0 0 0 2px #a5d8d6;
+  border-radius: 4px;
+}
+.market-chart > svg {
+  display: block;
+  cursor: crosshair;
+  overflow: visible;
+}
+.market-chart text {
+  font-family:
+    "Inter", "SF Pro Text", "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+.chart-axis {
+  font-size: 11px;
+  letter-spacing: -0.15px;
+}
+.chart-svg-legend {
+  font-size: 11px;
+  font-weight: 500;
+}
+.chart-volume-label {
+  font-size: 11px;
+}
+.chart-session-label {
+  fill: #a3aebc;
+  font-size: 10px;
+}
+.market-chart.is-narrow .chart-axis {
+  font-size: 9px;
+}
+.market-chart.is-narrow .chart-svg-legend,
+.market-chart.is-narrow .chart-volume-label {
+  font-size: 9px;
+}
+.market-chart.is-narrow .chart-session-label {
+  font-size: 9px;
+}
+.chart-inspection {
+  position: absolute;
+  top: 44px;
+  width: 170px;
+  max-height: calc(100% - 76px);
+  overflow: auto;
+  padding: 10px 12px 8px;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid #dce5ec;
+  border-radius: 7px;
+  box-shadow: 0 5px 18px #24384912;
+  color: #304258;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  z-index: 2;
+  cursor: pointer;
+}
+.chart-inspection-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  padding-bottom: 8px;
+  margin-bottom: 5px;
+  border-bottom: 1px solid #edf1f4;
+}
+.chart-inspection-heading strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.chart-inspection-heading span {
+  font-size: 10px;
+  color: #8a98a9;
+}
+.chart-inspection-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  line-height: 22px;
+  gap: 14px;
+}
+.chart-inspection-row > span {
+  color: #8b97a6;
+}
+.chart-inspection-row strong {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.chart-inspection-foot {
+  font-size: 10px;
+  white-space: nowrap;
+  color: #a0aab7;
+  padding-top: 7px;
+  margin-top: 4px;
+  border-top: 1px solid #edf1f4;
+}
+@media (prefers-reduced-motion: reduce) {
+  .market-chart * {
+    transition: none !important;
+  }
+}

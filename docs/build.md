@@ -97,3 +97,8 @@ actionlint .github/workflows/build.yml  # 需要另行安装 actionlint
 性能对比应分别记录冷缓存、暖缓存、缓存还原及原生编译耗时，不把 Runner 排队或额外检查耗时混为编译提速。优化前的基线为 Actions `38496661889`（冷）和 `38498201872`（暖）：Windows 任务分别为 14 分 20 秒、1 分 53 秒；暖缓存还原约 59 秒，冷构建中 Debug 测试编译 4 分 08 秒、Release 编译 9 分 17 秒。Linux 任务分别为 3 分 44 秒、1 分钟（优化前不包含 Clippy）。新策略的实际效果以对应 PR 的运行记录为准。
 
 到仓库 **Actions → Desktop build → 对应提交 → Artifacts** 下载 `tydaro-windows-x86_64-<commit>`；解开 GitHub artifact 后再解开内部版本 ZIP。PR 构建的提交号是 GitHub 临时合并提交，打包信息会记录实际构建的提交。产物保留 14 天，工作流不自动创建 GitHub Release。若需手动重建，选择 **Run workflow → codex/dev**。构建成功与真实 Windows 桌面验收分别记录：CI 模型测试与编译不能证明跨屏拖拽、输入法、混合 DPI 等交互已经通过。
+## React 设计预览
+
+独立预览位于 `design-preview/`，使用 Node.js 24 与锁定的 npm 依赖；不需要修改 Rust 工具链。进入该目录运行 `npm ci`、`npm run build`，生成常规静态页面及可离线打开的 `dist/tydaro-preview.html`。开发和浏览器验收步骤见 [预览说明](../design-preview/README.md)。
+
+`Design preview` 工作流对预览目录的 push / PR 执行 TypeScript、构建和 Playwright 交互检查，缓存 npm 下载并上传页面及截图。仅修改预览、其专用 workflow 或既有文档路径时，原生工作流跳过 Rust 重编译；混合原生文件、CI 路径分类器或未知路径改动仍执行 Windows/Linux 检查。不会自动部署网站或创建 PR。
