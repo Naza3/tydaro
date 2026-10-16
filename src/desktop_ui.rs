@@ -1,5 +1,9 @@
 //! Shared native visual vocabulary for the five-page desktop workspace.
-use gpui_kit::{prelude::*, *};
+use gpui_kit::*;
+use tydaro_ui::{
+    surface::{self, SurfaceStyle},
+    tokens::LIGHT,
+};
 
 // Component Assets embeds a small default subset; these workspace icons must
 // also be present in both the native app and its headless renderer.
@@ -35,72 +39,30 @@ impl AssetSource for AppAssets {
     }
 }
 
-pub const INK: u32 = 0x233348;
-pub const MUTED: u32 = 0x677688;
-pub const LINE: u32 = 0xe4e9ef;
-pub const TEAL: u32 = 0x008e8c;
-pub const UP: u32 = 0xc92f57;
-pub const DOWN: u32 = 0x007d78;
-pub const BG: u32 = 0xf4f6f8;
+pub const INK: u32 = LIGHT.text;
+pub const MUTED: u32 = LIGHT.muted;
+pub const LINE: u32 = LIGHT.border;
+pub const TEAL: u32 = LIGHT.accent;
+pub const UP: u32 = LIGHT.error;
+pub const DOWN: u32 = LIGHT.success;
+pub const BG: u32 = LIGHT.background;
 
 pub fn page() -> Div {
-    div()
-        .size_full()
-        .min_h_0()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .p_5()
-        .bg(rgb(BG))
-        .text_size(px(14.))
-        .text_color(rgb(INK))
-        .overflow_hidden()
+    surface::page(LIGHT)
 }
 pub fn panel() -> Div {
-    div()
-        .min_w_0()
-        .bg(rgb(0xffffff))
-        .border_1()
-        .border_color(rgb(LINE))
-        .rounded_lg()
-        .overflow_hidden()
+    surface::surface(LIGHT, SurfaceStyle::Panel)
 }
 pub fn muted(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(12.))
-        .text_color(rgb(MUTED))
-        .child(text.into())
+    tydaro_ui::text::hint(text, LIGHT)
 }
 pub fn tag(text: impl Into<SharedString>, color: u32) -> Div {
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_sm()
-        .text_size(px(11.))
-        .text_color(rgb(color))
-        .bg(rgb(0xedf5f5))
-        .child(text.into())
+    tydaro_ui::text::tag(text, color, LIGHT)
 }
 pub fn heading(
     eyebrow: impl Into<SharedString>,
     title: impl Into<SharedString>,
     subtitle: impl Into<SharedString>,
 ) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(rgb(MUTED))
-                .child(eyebrow.into()),
-        )
-        .child(
-            div()
-                .text_size(px(24.))
-                .font_weight(FontWeight::BOLD)
-                .child(title.into()),
-        )
-        .child(muted(subtitle))
+    tydaro_ui::text::heading(eyebrow, title, subtitle, LIGHT)
 }

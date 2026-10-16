@@ -1,6 +1,6 @@
 //! Interactive control specimens. Values and receipts are local to the gallery.
 use crate::ui_foundation::{
-    ACCENT, BG, DOWN, Family, INK, LINE, MUTED, SOFT, UP, Variant, action, caption, hint, surface,
+    ACCENT, BG, Family, INK, LINE, SOFT, UP, Variant, action, caption, hint, surface,
 };
 use gpui_kit::{
     component::{
@@ -10,6 +10,11 @@ use gpui_kit::{
     },
     prelude::*,
     *,
+};
+use tydaro_ui::{
+    feedback::{self, FeedbackTone},
+    field,
+    tokens::COOL_LIGHT,
 };
 
 pub struct ControlSamples {
@@ -44,14 +49,18 @@ fn validate_name(value: &str) -> Result<String, &'static str> {
 }
 
 fn parse_threshold(value: &str) -> Result<f64, &'static str> {
-    let value = value.trim().parse::<f64>().map_err(|_| "请输入有效数字")?;
-    if !value.is_finite() || !(0.5..=10.).contains(&value) {
-        return Err("范围为 0.5% 至 10.0%");
+    use tydaro_ui::field::{NumberError, NumberRange};
+    NumberRange {
+        min: 0.5,
+        max: 10.,
+        decimals: 1,
     }
-    if (value * 10. - (value * 10.).round()).abs() > 0.000_001 {
-        return Err("请保留最多一位小数");
-    }
-    Ok(value)
+    .parse(value)
+    .map_err(|error| match error {
+        NumberError::Invalid => "请输入有效数字",
+        NumberError::OutsideRange => "范围为 0.5% 至 10.0%",
+        NumberError::Precision => "请保留最多一位小数",
+    })
 }
 
 impl ControlSamples {
@@ -205,34 +214,44 @@ impl ControlSamples {
     }
 
     fn name_input(&self) -> Input {
-        Input::new(&self.name)
-            .id(self.id("name-input"))
-            .aria_label("观察名称")
-            .w_full()
-            .border_color(rgb(if self.input_error.is_some() { UP } else { LINE }))
-            .focus_bordered(self.input_error.is_none())
+        field::validated_input(
+            &self.name,
+            self.id("name-input"),
+            self.input_error.is_some(),
+            COOL_LIGHT,
+        )
+        .aria_label("观察名称")
     }
 
     fn input_status(&self) -> Div {
-        let (text, color) = if let Some(error) = &self.input_error {
-            (error.clone(), UP)
+        let (text, tone) = if let Some(error) = &self.input_error {
+            (error.clone(), FeedbackTone::Error)
         } else if self.input_receipt {
-            (format!("已保存 · {}", self.saved_name), DOWN)
+            (
+                format!("已保存 · {}", self.saved_name),
+                FeedbackTone::Success,
+            )
         } else {
-            ("1–12 个字 · Enter 保存".to_string(), MUTED)
+            ("1–12 个字 · Enter 保存".to_string(), FeedbackTone::Neutral)
         };
-        hint(text).min_h(px(20.)).text_color(rgb(color))
+        feedback::inline(text, tone, COOL_LIGHT)
     }
 
     fn number_status(&self) -> Div {
-        let (text, color) = if let Some(error) = &self.number_error {
-            (error.clone(), UP)
+        let (text, tone) = if let Some(error) = &self.number_error {
+            (error.clone(), FeedbackTone::Error)
         } else if self.number_receipt {
-            (format!("已应用阈值 {:.1}%", self.threshold), DOWN)
+            (
+                format!("已应用阈值 {:.1}%", self.threshold),
+                FeedbackTone::Success,
+            )
         } else {
-            ("允许 0.5%–10.0%，最多一位小数".to_string(), MUTED)
+            (
+                "允许 0.5%–10.0%，最多一位小数".to_string(),
+                FeedbackTone::Neutral,
+            )
         };
-        hint(text).min_h(px(20.)).text_color(rgb(color))
+        feedback::inline(text, tone, COOL_LIGHT)
     }
 
     fn actions(&self, cx: &mut Context<Self>) -> Div {
@@ -398,12 +417,7 @@ impl ControlSamples {
                 .child(div().flex().gap_2().child(save).child(clear))
                 .child(div().h(px(1.)).bg(rgb(LINE)).mt_3())
                 .child(caption("系统分组 · 不可编辑"))
-                .child(
-                    Input::new(&self.locked_name)
-                        .id(self.id("name-locked"))
-                        .w_full()
-                        .disabled(true),
-                )
+                .child(field::input(&self.locked_name, self.id("name-locked")).disabled(true))
                 .child(hint("完整字段边界，校验信息固定在下方。")),
             Variant::Calm => body
                 .child(caption("观察设置"))
@@ -516,17 +530,14 @@ impl ControlSamples {
     fn numbers(&self, cx: &mut Context<Self>) -> Div {
         let variant = self.variant;
         let field = || {
-            Input::new(&self.number)
-                .id(self.id("number-input"))
-                .aria_label("涨幅阈值，百分比")
-                .w_full()
-                .border_color(rgb(if self.number_error.is_some() {
-                    UP
-                } else {
-                    LINE
-                }))
-                .focus_bordered(self.number_error.is_none())
-                .suffix("%")
+            field::validated_input(
+                &self.number,
+                self.id("number-input"),
+                self.number_error.is_some(),
+                COOL_LIGHT,
+            )
+            .aria_label("涨幅阈值，百分比")
+            .suffix("%")
         };
         let apply = action(self.id("number-apply"), variant, "应用阈值")
             .primary()

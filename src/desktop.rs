@@ -3,7 +3,9 @@ use crate::{
     board_bar::BoardBar,
     chart::MarketChart,
     component_gallery::ComponentGallery,
-    desktop_state::{self, DEMO_DATE, DesktopEvent, DesktopState, PageId, SourceContext},
+    desktop_state::{
+        self, Command, CommandResult, DEMO_DATE, DesktopEvent, DesktopState, PageId, SourceContext,
+    },
     desktop_ui::*,
     journal_page::JournalPage,
     market::{self, Period, Symbol},
@@ -40,7 +42,7 @@ pub struct Desktop {
     limit: Entity<LimitPage>,
     theme: Entity<ThemePage>,
     journal: Entity<JournalPage>,
-    gallery: Entity<ComponentGallery>,
+    gallery: Option<Entity<ComponentGallery>>,
     gallery_open: bool,
     search: Entity<InputState>,
     draft_date: Entity<InputState>,
@@ -63,7 +65,6 @@ impl Desktop {
         let limit = cx.new(|cx| LimitPage::new(window, cx));
         let theme = cx.new(|cx| ThemePage::new(window, cx));
         let journal = cx.new(|cx| JournalPage::new(window, cx));
-        let gallery = cx.new(|cx| ComponentGallery::new(window, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索股票、代码或页面"));
         let draft_date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD"));
         let mut subscriptions = vec![
@@ -116,7 +117,7 @@ impl Desktop {
             limit,
             theme,
             journal,
-            gallery,
+            gallery: None,
             gallery_open: false,
             search,
             draft_date,
@@ -147,7 +148,11 @@ impl Desktop {
             cx.notify();
             return;
         }
-        desktop_state::update(cx, |state| state.active_page = page);
+        if let Err(error) = desktop_state::dispatch(cx, Command::Navigate(page)) {
+            self.notice = error.to_string();
+            cx.notify();
+            return;
+        }
         self.gallery_open = false;
         self.notice.clear();
         cx.notify();
@@ -159,6 +164,8 @@ impl Desktop {
             return;
         }
         window.focus(&self.focus, cx);
+        self.gallery
+            .get_or_insert_with(|| cx.new(|cx| ComponentGallery::new(window, cx)));
         self.gallery_open = true;
         self.notice.clear();
         cx.notify();
@@ -294,6 +301,12 @@ impl Desktop {
                 });
                 self.open(Overlay::Draft(context), window, cx);
             }
+            DesktopEvent::CandidateDraft(candidates) => {
+                self.journal.update(cx, |journal, cx| {
+                    journal.receive_candidates(candidates, window, cx)
+                });
+                self.navigate(PageId::Journal, cx);
+            }
             DesktopEvent::OpenTheme(context) => {
                 self.theme
                     .update(cx, |theme, cx| theme.receive(context, window, cx));
@@ -365,7 +378,7 @@ impl Desktop {
                 div().flex().flex_col().gap_3().child(Self::source(&context)).child(muted("目标分组 · 只追加缺少的股票，保留原有成员"))
                 .child(div().id("watch-target-list").max_h(px(180.)).overflow_y_scroll().children(groups.iter().map(|g|{let id=g.id.clone();Button::new(format!("watch-target-{}",g.id)).w_full().label(format!("{} · {} 只",g.name,g.symbols.len())).selected(g.id==self.target_group).on_click(cx.listener(move|this,_,_,cx|{this.target_group=id.clone();cx.refresh_windows();}))})))
                 .child(div().flex().flex_col().gap_2().children(context.symbols.iter().map(|symbol|div().flex().justify_between().child(format!("{} {}",symbol.name(),symbol.code())).child(muted(if target.is_some_and(|g|g.symbols.contains(symbol)){"已存在 · 跳过"}else{"＋ 新增"})))))
-                .child(muted(format!("新增 {added} 只 · 跳过 {exists} 只重复股票"))).child(div().flex().justify_end().gap_2().child(Button::new("watch-add-cancel").label("取消").on_click(cx.listener(|this,_,window,cx|this.close(window,cx)))).child(Button::new("watch-add-confirm").primary().label("确认加入").disabled(target.is_none()||added==0).on_click(cx.listener(move|this,_,window,cx|{let id=this.target_group.clone();let result=desktop_state::update(cx,|state|state.add_to_watch(&id,&context.symbols));match result{Ok(count)=>{this.close(window,cx);this.navigate(PageId::Watch,cx);this.notice=format!("已加入 {count} 只股票");},Err(error)=>this.notice=error.to_string()}cx.notify();})))).into_any_element()
+                .child(muted(format!("新增 {added} 只 · 跳过 {exists} 只重复股票"))).child(div().flex().justify_end().gap_2().child(Button::new("watch-add-cancel").label("取消").on_click(cx.listener(|this,_,window,cx|this.close(window,cx)))).child(Button::new("watch-add-confirm").primary().label("确认加入").disabled(target.is_none()||added==0).on_click(cx.listener(move|this,_,window,cx|{let id=this.target_group.clone();let result=desktop_state::dispatch(cx,Command::AddToWatch{group_id:id,symbols:context.symbols.clone()}).and_then(CommandResult::into_count);match result{Ok(count)=>{this.close(window,cx);this.navigate(PageId::Watch,cx);this.notice=format!("已加入 {count} 只股票");},Err(error)=>this.notice=error.to_string()}cx.notify();})))).into_any_element()
             }
             Overlay::Draft(context)=>{
                 let valid=desktop_state::date_valid(self.draft_date.read(cx).value().trim());
@@ -406,7 +419,7 @@ impl Render for Desktop {
         let state = cx.global::<DesktopState>();
         let unread = state.unread_count();
         let monitoring = state.monitoring;
-        let save_status = state.save_status.clone();
+        let save_status = state.status_message().to_owned();
         let nav =
             div()
                 .w(px(78.))
@@ -527,7 +540,11 @@ impl Render for Desktop {
                     })),
             );
         let content = if self.gallery_open {
-            self.gallery.clone().into_any_element()
+            self.gallery
+                .as_ref()
+                .expect("open gallery is initialized")
+                .clone()
+                .into_any_element()
         } else {
             match page {
                 PageId::Market => div()
@@ -535,7 +552,11 @@ impl Render for Desktop {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(workspace::market_toolbar(&self.board_bar, &self.dock, cx))
+                    .child(workspace::market_toolbar(
+                        &self.board_bar.clone().map(Into::into),
+                        &self.dock,
+                        cx,
+                    ))
                     .child(
                         div()
                             .h(px(46.))

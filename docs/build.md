@@ -8,6 +8,26 @@
 
 Rust 2024 edition 的语言门槛是 1.85，但完整应用还受依赖要求限制。当前 GPUI Kit 0.7.3 锁定依赖中，`oo7 0.6.0` 声明至少需要 1.92，其他依赖也可能使用较新的标准库接口。1.96 是本项目选择的可复现构建基线，不是宣称上游所有包的最低可用版本，也不需要使用环境中的 1.99。升级时同时审查工具链与锁文件，并在 Windows、Linux CI 验证；不要用 `--ignore-rust-version` 绕过依赖检查。
 
+## Workspace 与独立核心验证
+
+仓库包含应用 `tydaro`、纯业务库 `tydaro-core` 和 GPUI 组件库 `tydaro-ui`，共用工具链与锁文件。应用产物仍是原来的 `tydaro` 可执行文件。根目录的完整检查显式包含所有成员：
+
+```bash
+python3 scripts/check_architecture.py
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --features test-support -- -D warnings
+cargo test --locked --workspace --all-targets --features test-support
+```
+
+只验证业务规则和确定性模拟数据时，执行：
+
+```bash
+cargo test --locked -p tydaro-core
+cargo clippy --locked -p tydaro-core --all-targets -- -D warnings
+```
+
+core 不依赖 GPUI 或平台图形库，在普通 Linux Rust runner 上无需安装下方的原生 GUI SDK。Windows 上执行测试仍需 Rust/MSVC 的正常链接环境。独立 core 检查不能替代应用、组件和平台验收。新增 workspace package 需要更新锁文件；不因此升级既有第三方依赖。
+
 ## Windows 本地构建
 
 准备：
@@ -23,7 +43,7 @@ rustup show active-toolchain
 rustup target add x86_64-pc-windows-msvc
 ./scripts/windows-sdk.ps1
 cargo fmt --all -- --check
-cargo test --locked --release --all-targets --target x86_64-pc-windows-msvc
+cargo test --locked --workspace --release --all-targets --target x86_64-pc-windows-msvc
 cargo run --locked --target x86_64-pc-windows-msvc --bin tydaro
 cargo build --locked --release --target x86_64-pc-windows-msvc --bin tydaro
 ./scripts/package-windows.ps1
@@ -44,7 +64,7 @@ sudo apt-get install --no-install-recommends -y \
   libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libvulkan-dev \
   libasound2-dev libssl-dev libzstd-dev mesa-vulkan-drivers \
   fonts-dejavu-core fonts-noto-cjk
-cargo test --locked --all-targets --features test-support
+cargo test --locked --workspace --all-targets --features test-support
 cargo run --locked --bin tydaro
 ```
 
@@ -59,6 +79,7 @@ chmod 700 "$XDG_RUNTIME_DIR"
 export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
 test -n "$VK_DRIVER_FILES"
 cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
+cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test artifacts/tydaro-gallery.png
 ```
 
 受管云环境已经通过 `/workspace/.cloud-setup/activate.sh` 准备本地 sysroot 时，先 `source` 该文件，继续使用既有 checkout。无需创建 Git worktree。`CARGO_TARGET_DIR` 可能位于 checkout 之外；Cargo 输出及打包脚本会使用实际 target 目录。
@@ -69,12 +90,13 @@ Linux 到 Windows GNU 的 `cargo build --locked --target x86_64-pc-windows-gnu -
 
 `.github/workflows/build.yml` 在推送到 `codex/dev` / `main`、Pull Request 和手动 `workflow_dispatch` 时运行；不需要为了获得构建包先创建 PR：
 
-1. `Repository checks`：检查 PR 来自开发分支，验证本地 Git hooks 和变更分类逻辑；需要编译时运行 Rust 格式检查。
-2. Windows Server 2022 原生 MSVC：Release 模型/工作区测试、Release 构建、ZIP 与 SHA-256 校验文件。
-3. Ubuntu 24.04：严格 Clippy（`-D warnings`）、Debug 测试、编译与应用离屏渲染，上传 PNG 证据。使用同一 `test-support` 特性。
-4. `CI`：始终汇总适用检查。需要编译时 Windows/Linux 必须成功；已识别的纯文档修改或交给匹配 PR 验证的重复 push 可跳过原生任务，并记录原因。失败、取消、意外跳过均不能被当作通过；合并仍以 PR 的检查为准。
+1. `Repository checks`：检查 PR 来自开发分支，验证 Git hooks 和变更分类逻辑；需要编译时运行 Rust 格式检查。
+2. `Core / no native SDK`：普通 Ubuntu runner 上执行架构 guard 和 `cargo test --locked -p tydaro-core`，不安装 GPUI 图形构建依赖。
+3. Windows Server 2022 原生 MSVC：Release workspace 测试、应用 Release 构建、ZIP 与 SHA-256 校验文件。
+4. Ubuntu 24.04 原生应用：严格 workspace Clippy（`-D warnings`）、Debug workspace 测试、完整应用离屏 smoke 和独立 Gallery smoke，上传两组 PNG 证据。使用同一 `test-support` 特性。
+5. `CI`：始终汇总适用检查。需要编译时 core、Windows、Linux 都必须成功；已识别的纯文档修改或交给匹配 PR 验证的重复 push 可跳过相应构建任务，并记录原因。失败、取消、意外跳过均不能当作通过；合并仍以 PR 的检查为准。
 
-Windows 和 Linux 在仓库检查后并行；Linux 暂不生成发布安装包。默认权限为 `contents: read`，只有仓库检查任务额外需要 `pull-requests: read`，用于查询是否已有对应阶段 PR；不需要自定义 secret。GitHub Actions 固定到官方提交 SHA。Cargo 命令使用锁文件，失败会使对应任务失败。
+三个构建/测试作业在仓库检查后并行；Linux 暂不生成发布安装包。默认权限为 `contents: read`，只有仓库检查任务额外需要 `pull-requests: read`，用于查询是否已有对应阶段 PR；不需要自定义 secret。GitHub Actions 固定到官方提交 SHA。Cargo 命令使用锁文件，失败会使对应任务失败。上述描述是工作流配置，不是某次提交已经运行或通过的验收证据。
 
 ### 触发与加速策略
 
@@ -91,6 +113,8 @@ Windows 和 Linux 在仓库检查后并行；Linux 暂不生成发布安装包�
 ```bash
 bash scripts/test-git-hooks.sh
 python3 scripts/test_ci_changes.py
+python3 scripts/check_architecture.py --self-test
+python3 scripts/check_architecture.py
 actionlint .github/workflows/build.yml  # 需要另行安装 actionlint
 ```
 

@@ -15,7 +15,8 @@ use gpui_kit::{
 
 use crate::{
     desktop_state::{
-        self, DesktopEvent, DesktopState, PageId, SourceContext, WatchAlert, WatchGroup, WatchRule,
+        self, Command, CommandResult, DesktopEvent, DesktopState, PageId, SourceContext,
+        WatchAlert, WatchGroup, WatchRule,
     },
     desktop_ui::{BG, DOWN, INK, LINE, MUTED, TEAL, UP},
     market::{self, Symbol},
@@ -45,6 +46,7 @@ pub struct WatchPage {
     search: Entity<InputState>,
     rules_editor: Option<Vec<WatchRule>>,
     rule_inputs: Vec<Entity<InputState>>,
+    rule_subscriptions: Vec<Subscription>,
     error: Option<String>,
     demo_counter: usize,
     scroll: ScrollHandle,
@@ -63,6 +65,7 @@ impl WatchPage {
             subscriptions.push(cx.subscribe(input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.error = None;
+                    this.refresh_pending_input(cx);
                     cx.notify();
                 }
             }));
@@ -85,6 +88,7 @@ impl WatchPage {
             search,
             rules_editor: None,
             rule_inputs: Vec::new(),
+            rule_subscriptions: Vec::new(),
             error: None,
             demo_counter: 0,
             scroll: ScrollHandle::new(),
@@ -96,12 +100,77 @@ impl WatchPage {
         self.editor.is_some() || self.rules_editor.is_some()
     }
 
+    fn report_pending(cx: &mut Context<Self>, error: Option<String>) {
+        let key = format!("watch-editor-{:?}", cx.entity_id());
+        desktop_state::report_pending_input(cx, key, error);
+    }
+    fn refresh_pending_input(&self, cx: &mut Context<Self>) {
+        let state = cx.global::<DesktopState>();
+        let group_changed = self.editor.as_ref().is_some_and(|editor| {
+            let name = self.name.read(cx).value();
+            let note = self.note.read(cx).value();
+            if let Some(id) = &editor.id {
+                state
+                    .watch_groups
+                    .iter()
+                    .find(|g| &g.id == id)
+                    .is_none_or(|original| {
+                        name.as_str() != original.name
+                            || note.as_str() != original.note
+                            || editor.symbols != original.symbols
+                            || editor.color != original.color
+                    })
+            } else {
+                !name.is_empty()
+                    || !note.is_empty()
+                    || !editor.symbols.is_empty()
+                    || editor.color != GROUP_COLORS[0]
+            }
+        });
+        let rules_changed = self.rules_editor.as_ref().is_some_and(|rules| {
+            rules.len() != state.rules.len()
+                || rules.iter().zip(&self.rule_inputs).any(|(rule, input)| {
+                    state
+                        .rules
+                        .iter()
+                        .find(|r| r.id == rule.id)
+                        .is_none_or(|original| {
+                            rule.enabled != original.enabled
+                                || input.read(cx).value().as_str()
+                                    != format!("{:.2}", original.threshold)
+                        })
+                })
+        });
+        Self::report_pending(
+            cx,
+            (group_changed || rules_changed).then(|| "盯盘编辑尚未保存，请保存或取消。".into()),
+        );
+    }
+    fn cancel_editor(&mut self, cx: &mut Context<Self>) {
+        self.editor = None;
+        self.rules_editor = None;
+        self.rule_subscriptions.clear();
+        self.error = None;
+        Self::report_pending(cx, None);
+        cx.notify();
+    }
+    fn simple_command(&mut self, command: Command, cx: &mut Context<Self>) {
+        if let Err(error) = desktop_state::dispatch(cx, command) {
+            cx.emit(DesktopEvent::Notice(format!("操作未应用：{error}")));
+            cx.notify();
+        }
+    }
+
     fn begin_group(
         &mut self,
         group: Option<WatchGroup>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_editing() {
+            cx.emit(DesktopEvent::Notice("请先保存或取消当前盯盘编辑".into()));
+            return;
+        }
         let (name, note, editor) = if let Some(group) = group {
             (
                 group.name,
@@ -163,6 +232,7 @@ impl WatchPage {
             };
         if let Some(error) = invalid {
             self.error = Some(error.into());
+            Self::report_pending(cx, Some(error.into()));
             cx.notify();
             return;
         }
@@ -170,23 +240,26 @@ impl WatchPage {
         let symbols = editor.symbols.clone();
         let color = editor.color;
         let count = symbols.len();
-        let mut saved_id = String::new();
-        desktop_state::update(cx, |state| {
-            let id = prior_id.unwrap_or_else(|| state.new_id("watch"));
-            saved_id = id.clone();
-            let group = WatchGroup {
-                id: id.clone(),
+        let saved_id = match desktop_state::dispatch(
+            cx,
+            Command::SaveWatchGroup {
+                id: prior_id,
                 name: name.clone(),
-                symbols,
-                color,
                 note,
-            };
-            if let Some(existing) = state.watch_groups.iter_mut().find(|group| group.id == id) {
-                *existing = group;
-            } else {
-                state.watch_groups.push(group);
+                color,
+                symbols,
+            },
+        )
+        .and_then(CommandResult::into_id)
+        {
+            Ok(id) => id,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                Self::report_pending(cx, self.error.clone());
+                cx.notify();
+                return;
             }
-        });
+        };
         let index = cx
             .global::<DesktopState>()
             .watch_groups
@@ -197,6 +270,7 @@ impl WatchPage {
         self.scroll.scroll_to_item(1 + index / self.actual_columns);
         self.editor = None;
         self.error = None;
+        Self::report_pending(cx, None);
         cx.emit(DesktopEvent::Notice(format!(
             "已保存「{name}」，共 {count} 只股票"
         )));
@@ -207,15 +281,18 @@ impl WatchPage {
         let Some(id) = self.editor.as_ref().and_then(|editor| editor.id.clone()) else {
             return;
         };
-        desktop_state::update(cx, |state| {
-            state.watch_groups.retain(|group| group.id != id)
-        });
+        if let Err(error) = desktop_state::dispatch(cx, Command::DeleteWatchGroup(id.clone())) {
+            self.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         if self.selected_group.as_ref() == Some(&id) {
             self.selected_group = None;
             self.selected_symbol = None;
         }
         self.editor = None;
         self.error = None;
+        Self::report_pending(cx, None);
         cx.emit(DesktopEvent::Notice(
             "已删除盯盘分组，历史异动记录仍保留".into(),
         ));
@@ -223,12 +300,28 @@ impl WatchPage {
     }
 
     fn begin_rules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            cx.emit(DesktopEvent::Notice("请先保存或取消当前盯盘编辑".into()));
+            return;
+        }
         let rules = cx.global::<DesktopState>().rules.clone();
         self.rule_inputs = rules
             .iter()
             .map(|rule| {
                 cx.new(|cx| {
                     InputState::new(window, cx).default_value(format!("{:.2}", rule.threshold))
+                })
+            })
+            .collect();
+        self.rule_subscriptions = self
+            .rule_inputs
+            .iter()
+            .map(|input| {
+                cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.refresh_pending_input(cx);
+                        cx.notify();
+                    }
                 })
             })
             .collect();
@@ -252,14 +345,22 @@ impl WatchPage {
                 }
                 _ => {
                     self.error = Some("规则阈值请输入大于 0、且不超过 100 的数值。".into());
+                    Self::report_pending(cx, self.error.clone());
                     cx.notify();
                     return;
                 }
             }
         }
-        desktop_state::update(cx, |state| state.rules = rules);
+        if let Err(error) = desktop_state::dispatch(cx, Command::ReplaceRules(rules)) {
+            self.error = Some(error.to_string());
+            Self::report_pending(cx, self.error.clone());
+            cx.notify();
+            return;
+        }
         self.rules_editor = None;
+        self.rule_subscriptions.clear();
         self.error = None;
+        Self::report_pending(cx, None);
         cx.emit(DesktopEvent::Notice(
             "已保存演示规则；点击“演示异动”可验证新阈值".into(),
         ));
@@ -286,11 +387,11 @@ impl WatchPage {
     }
 
     fn open_alert(&mut self, alert: WatchAlert, cx: &mut Context<Self>) {
-        desktop_state::update(cx, |state| {
-            if let Some(item) = state.alerts.iter_mut().find(|item| item.id == alert.id) {
-                item.read = true;
-            }
-        });
+        if let Err(error) = desktop_state::dispatch(cx, Command::ReadAlert(alert.id.clone())) {
+            self.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         let group = cx
             .global::<DesktopState>()
             .watch_groups
@@ -367,23 +468,23 @@ impl WatchPage {
             rule.unit,
             count + 1
         );
-        desktop_state::update(cx, |state| {
-            let id = state.new_id("alert");
-            state.alerts.insert(
-                0,
-                WatchAlert {
-                    id,
-                    symbol,
-                    rule_id: rule.id,
-                    title: rule.title,
-                    detail,
-                    group_name,
-                    time: "14:32:00".into(),
-                    read: false,
-                },
-            );
-            state.alerts.truncate(100);
-        });
+        if let Err(error) = desktop_state::dispatch(
+            cx,
+            Command::RecordDemoAlert(WatchAlert {
+                id: String::new(),
+                symbol,
+                rule_id: rule.id,
+                title: rule.title,
+                detail,
+                group_name,
+                time: "14:32:00".into(),
+                read: false,
+            }),
+        ) {
+            self.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         cx.emit(DesktopEvent::Notice(
             "已生成一条模拟异动，行情价格保持不变".into(),
         ));
@@ -896,8 +997,8 @@ impl WatchPage {
                 .child(div().flex_1().child(small("最新在上 · 最多 100 条")))
                 .child(button("watch-demo-alert", "演示异动").icon(IconName::Activity).disabled(!cx.global::<DesktopState>().monitoring).on_click(cx.listener(|this, _, _, cx| this.demo_alert(cx))))
                 .child(icon_button("watch-unread-only", IconName::ListFilter).tooltip(if self.unread_only { "查看全部异动" } else { "只看未读异动" }).text_color(rgb(if self.unread_only { TEAL } else { MUTED })).on_click(cx.listener(|this, _, _, cx| { this.unread_only = !this.unread_only; cx.notify(); })))
-                .child(icon_button("watch-alerts-read", IconName::CheckCheck).tooltip("全部标为已读").disabled(unread == 0).on_click(cx.listener(|_, _, _, cx| desktop_state::update(cx, |state| { for alert in &mut state.alerts { alert.read = true; } }))))
-                .child(icon_button("watch-alerts-clear", IconName::Trash).tooltip("清除已读记录").disabled(!alerts.iter().any(|alert| alert.read)).on_click(cx.listener(|_, _, _, cx| desktop_state::update(cx, |state| state.alerts.retain(|alert| !alert.read))))))
+                .child(icon_button("watch-alerts-read", IconName::CheckCheck).tooltip("全部标为已读").disabled(unread == 0).on_click(cx.listener(|this, _, _, cx| this.simple_command(Command::ReadAllAlerts,cx))))
+                .child(icon_button("watch-alerts-clear", IconName::Trash).tooltip("清除已读记录").disabled(!alerts.iter().any(|alert| alert.read)).on_click(cx.listener(|this, _, _, cx| this.simple_command(Command::ClearReadAlerts,cx)))))
             .child(div().h(px(28.)).px_4().flex().items_center().gap_3().bg(rgb(0xf8fafb)).text_size(px(12.)).text_color(rgb(MUTED))
                 .child(div().w(px(6.))).child(div().w(px(70.)).child("时间")).child(div().w(px(100.)).child("股票")).child(div().w(px(90.)).child("触发规则")).child(div().flex_1().child("规则详情 / 演示测量值")).child(div().w(px(158.)).child("所属分组")))
             .child(body)
@@ -960,6 +1061,7 @@ impl WatchPage {
                                         editor.symbols.push(symbol);
                                     }
                                 }
+                                this.refresh_pending_input(cx);
                                 cx.notify();
                             },
                         )),
@@ -976,6 +1078,7 @@ impl WatchPage {
                                 editor.symbols.push(symbol);
                             }
                         }
+                        this.refresh_pending_input(cx);
                         cx.notify();
                     })),
             );
@@ -1003,6 +1106,7 @@ impl WatchPage {
                         if let Some(editor) = &mut this.editor {
                             editor.color = color;
                         }
+                        this.refresh_pending_input(cx);
                         cx.notify();
                     })),
             );
@@ -1021,9 +1125,7 @@ impl WatchPage {
                 "每个分组独立管理股票，不会修改行情组件中的股票列表。",
                 "watch-group-close",
                 cx.listener(|this, _, _, cx| {
-                    this.editor = None;
-                    this.error = None;
-                    cx.notify();
+                    this.cancel_editor(cx);
                 }),
             ))
             .child(field(
@@ -1090,6 +1192,7 @@ impl WatchPage {
                                     if let Some(editor) = &mut this.editor {
                                         editor.deleting = false;
                                     }
+                                    this.refresh_pending_input(cx);
                                     cx.notify();
                                 }),
                             )),
@@ -1111,6 +1214,7 @@ impl WatchPage {
                                     if let Some(editor) = &mut this.editor {
                                         editor.deleting = true;
                                     }
+                                    this.refresh_pending_input(cx);
                                     cx.notify();
                                 })),
                         )
@@ -1118,9 +1222,7 @@ impl WatchPage {
                     .child(div().flex_1())
                     .child(button("watch-group-cancel", "取消").on_click(cx.listener(
                         |this, _, _, cx| {
-                            this.editor = None;
-                            this.error = None;
-                            cx.notify();
+                            this.cancel_editor(cx);
                         },
                     )))
                     .child(
@@ -1148,9 +1250,7 @@ impl WatchPage {
             "本地演示规则，仅在点击“演示异动”时生成事件。",
             "watch-rules-close",
             cx.listener(|this, _, _, cx| {
-                this.rules_editor = None;
-                this.error = None;
-                cx.notify();
+                this.cancel_editor(cx);
             }),
         ));
         for (index, rule) in rules.iter().enumerate() {
@@ -1190,6 +1290,7 @@ impl WatchPage {
                                         if let Some(rules) = &mut this.rules_editor {
                                             rules[index].enabled = !rules[index].enabled;
                                         }
+                                        this.refresh_pending_input(cx);
                                         cx.notify();
                                     },
                                 )),
@@ -1235,9 +1336,7 @@ impl WatchPage {
                     .gap_2()
                     .child(button("watch-rules-cancel", "取消").on_click(cx.listener(
                         |this, _, _, cx| {
-                            this.rules_editor = None;
-                            this.error = None;
-                            cx.notify();
+                            this.cancel_editor(cx);
                         },
                     )))
                     .child(
@@ -1466,11 +1565,7 @@ impl Render for WatchPage {
                                 })
                                 .tooltip("仅保存静音偏好，本阶段不播放音频")
                                 .on_click(cx.listener(
-                                    |_, _, _, cx| {
-                                        desktop_state::update(cx, |state| {
-                                            state.muted = !state.muted
-                                        })
-                                    },
+                                    |this, _, _, cx| this.simple_command(Command::ToggleMuted, cx),
                                 )),
                             )
                             .child(
@@ -1488,10 +1583,8 @@ impl Render for WatchPage {
                                     IconName::Play
                                 })
                                 .on_click(cx.listener(
-                                    |_, _, _, cx| {
-                                        desktop_state::update(cx, |state| {
-                                            state.monitoring = !state.monitoring
-                                        })
+                                    |this, _, _, cx| {
+                                        this.simple_command(Command::ToggleMonitoring, cx)
                                     },
                                 )),
                             ),
@@ -1518,7 +1611,7 @@ impl Render for WatchPage {
 }
 
 fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    Button::new(id).label(label).small().text_size(px(12.))
+    tydaro_ui::action::action(id, label, tydaro_ui::action::ActionSize::Small)
 }
 fn icon_button(id: impl Into<ElementId>, icon: IconName) -> Button {
     Button::new(id)
@@ -1660,4 +1753,117 @@ fn sparkline(symbol: Symbol, rising: bool, color: u32) -> AnyElement {
     .w(px(66.))
     .h(px(30.))
     .into_any_element()
+}
+
+/// Regression using production native inputs and commands; called by architecture smoke.
+#[cfg(feature = "test-support")]
+pub(crate) fn verify_rejected_edits(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    cx.update_window(handle, |_, window, cx| {
+        let page = cx.new(|cx| WatchPage::new(window, cx));
+        let original_rules = cx.global::<DesktopState>().rules.clone();
+        page.update(cx, |page, cx| -> anyhow::Result<()> {
+            page.begin_group(None, window, cx);
+            let invalid = "组".repeat(25);
+            page.name
+                .update(cx, |input, cx| input.set_value(invalid.clone(), window, cx));
+            let before = serde_json::to_value(&cx.global::<DesktopState>().watch_groups)?;
+            page.save_group(cx);
+            ensure!(
+                page.editor.is_some() && page.error.is_some(),
+                "Rejected group edit closed its editor"
+            );
+            ensure!(
+                page.name.read(cx).value().as_str() == invalid,
+                "Rejected group edit discarded its input"
+            );
+            ensure!(
+                serde_json::to_value(&cx.global::<DesktopState>().watch_groups)? == before,
+                "Rejected group edit changed domain state"
+            );
+            ensure!(
+                !desktop_state::save_now(cx),
+                "Unaccepted group text did not block close"
+            );
+            page.cancel_editor(cx);
+            ensure!(
+                desktop_state::save_now(cx),
+                "Explicit group cancel did not release its close guard"
+            );
+
+            let id = desktop_state::dispatch(
+                cx,
+                Command::SaveWatchGroup {
+                    id: None,
+                    name: "原子编辑回归".into(),
+                    note: String::new(),
+                    color: GROUP_COLORS[0],
+                    symbols: vec![],
+                },
+            )?
+            .into_id()?;
+            let group = cx
+                .global::<DesktopState>()
+                .watch_groups
+                .iter()
+                .find(|g| g.id == id)
+                .unwrap()
+                .clone();
+            page.begin_group(Some(group), window, cx);
+            page.note.update(cx, |input, cx| {
+                input.set_value("用户输入应保留", window, cx)
+            });
+            desktop_state::dispatch(cx, Command::DeleteWatchGroup(id))?;
+            page.save_group(cx);
+            ensure!(
+                page.editor.is_some()
+                    && page.error.as_deref().is_some_and(|e| e.contains("已删除")),
+                "Rejected stale group command reported success"
+            );
+            ensure!(
+                page.note.read(cx).value().as_str() == "用户输入应保留",
+                "Failed group command lost its draft"
+            );
+            page.cancel_editor(cx);
+
+            page.begin_rules(window, cx);
+            page.rule_inputs[0].update(cx, |input, cx| input.set_value("不是数字", window, cx));
+            page.save_rules(cx);
+            ensure!(
+                page.rules_editor.is_some() && page.error.is_some(),
+                "Invalid rule input closed its editor"
+            );
+            ensure!(
+                page.rule_inputs[0].read(cx).value().as_str() == "不是数字",
+                "Invalid rule input was replaced"
+            );
+            ensure!(
+                !desktop_state::save_now(cx),
+                "Unaccepted rule text did not block close"
+            );
+            page.rule_inputs[0].update(cx, |input, cx| input.set_value("2.50", window, cx));
+            page.save_rules(cx);
+            ensure!(
+                page.rules_editor.is_none() && page.error.is_none(),
+                "Corrected rule edit did not complete"
+            );
+            ensure!(
+                cx.global::<DesktopState>().rules[0].threshold == 2.5,
+                "Corrected rule did not reach core"
+            );
+            ensure!(
+                desktop_state::save_now(cx),
+                "Successful rule save left a stale close guard"
+            );
+            desktop_state::dispatch(cx, Command::ReplaceRules(original_rules))?;
+            Ok(())
+        })
+    })??;
+    println!(
+        "PASS: watch rejected input and stale commands preserve native editors; cancel/retry release pending-input guards"
+    );
+    Ok(())
 }

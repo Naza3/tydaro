@@ -2,7 +2,6 @@
 //! have been validated and synced; previous and unreadable layouts are retained.
 
 use std::{
-    collections::HashSet,
     env,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -11,39 +10,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use gpui_kit::component::dock::{DockAreaState, PanelInfo, PanelState};
-use serde::{Deserialize, Serialize};
 
-use crate::{boards::BoardSetFile, model::PanelModel};
+use crate::boards::BoardSetFile;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub(crate) use crate::workspace_snapshot::MAX_STABLE_ID;
+pub use crate::workspace_snapshot::{
+    SCHEMA_VERSION, SavedPanel, SavedWindow, WorkspaceFile, validate,
+};
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-pub(crate) const MAX_STABLE_ID: u64 = u64::MAX / 2;
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SavedPanel {
-    pub model: PanelModel,
-    #[serde(default)]
-    pub content: serde_json::Value,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SavedWindow {
-    pub id: u64,
-    pub bounds: [f32; 4],
-    #[serde(default)]
-    pub locked: bool,
-    pub dock: DockAreaState,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct WorkspaceFile {
-    pub version: u32,
-    pub next_id: u64,
-    pub paused: bool,
-    pub windows: Vec<SavedWindow>,
-}
 
 /// Platform configuration directory; tests and portable installations can set
 /// `TYDARO_DATA_DIR` without changing a user's ordinary workspace.
@@ -74,104 +49,6 @@ pub fn data_dir() -> PathBuf {
     // An explicit local fallback is preferable to selecting another user's
     // profile when a restricted launcher omits all profile variables.
     PathBuf::from(".tydaro")
-}
-
-pub fn validate(state: &WorkspaceFile) -> Result<()> {
-    ensure!(
-        state.version == SCHEMA_VERSION,
-        "Unsupported workspace schema {} (expected {})",
-        state.version,
-        SCHEMA_VERSION
-    );
-    ensure!(
-        state.windows.len() <= 16,
-        "A workspace supports at most 16 windows"
-    );
-    ensure!(
-        state.next_id <= MAX_STABLE_ID,
-        "Invalid next panel/window ID"
-    );
-    let mut window_ids = HashSet::new();
-    let mut panel_ids = HashSet::new();
-    let mut panel_count = 0;
-    for window in &state.windows {
-        ensure!(window.id <= MAX_STABLE_ID, "Invalid window ID");
-        ensure!(
-            window_ids.insert(window.id),
-            "Duplicate window ID {}",
-            window.id
-        );
-        ensure!(
-            window.bounds.iter().all(|value| value.is_finite())
-                && window.bounds[2] > 0.0
-                && window.bounds[3] > 0.0,
-            "Window {} has invalid bounds",
-            window.id
-        );
-        validate_panel(&window.dock.center, &mut panel_ids, &mut panel_count, 0)?;
-        for dock in [
-            &window.dock.left_dock,
-            &window.dock.right_dock,
-            &window.dock.bottom_dock,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let size = f32::from(dock.size());
-            ensure!(size.is_finite() && size >= 0.0, "Invalid side dock size");
-            validate_panel(dock.panel(), &mut panel_ids, &mut panel_count, 0)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_panel(
-    panel: &PanelState,
-    ids: &mut HashSet<u64>,
-    count: &mut usize,
-    depth: usize,
-) -> Result<()> {
-    ensure!(depth <= 64, "Workspace panel nesting exceeds 64 levels");
-    if let PanelInfo::Stack { sizes, axis } = &panel.info {
-        ensure!(*axis <= 1, "Invalid split axis");
-        ensure!(
-            sizes.iter().all(|size| {
-                let size = f32::from(*size);
-                size.is_finite() && size >= 0.0
-            }),
-            "Invalid split size"
-        );
-    }
-    if matches!(panel.info, PanelInfo::Panel(_)) {
-        *count += 1;
-        ensure!(*count <= 128, "A workspace supports at most 128 panels");
-    }
-    if panel.panel_name == "tydaro.panel" {
-        let PanelInfo::Panel(payload) = &panel.info else {
-            bail!("A tydaro.panel must contain a saved panel payload");
-        };
-        let saved: SavedPanel = serde_json::from_value(payload.clone())
-            .context("Invalid saved tydaro.panel payload")?;
-        ensure!(saved.model.id <= MAX_STABLE_ID, "Invalid panel ID");
-        ensure!(saved.model.link_group <= 3, "Invalid panel link group");
-        if let Some(name) = &saved.model.custom_name {
-            ensure!(
-                PanelModel::normalize_name(name)?.as_deref() == Some(name.as_str()),
-                "Invalid custom panel name"
-            );
-        }
-        ensure!(
-            ids.insert(saved.model.id),
-            "Duplicate panel ID {}",
-            saved.model.id
-        );
-    }
-    // Unknown panel names and their JSON payloads remain untouched for future
-    // versions/plugins; their children still participate in identity checks.
-    for child in &panel.children {
-        validate_panel(child, ids, count, depth + 1)?;
-    }
-    Ok(())
 }
 
 fn decode(bytes: &[u8]) -> Result<WorkspaceFile> {
@@ -349,9 +226,13 @@ fn write_validated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{boards::SavedBoard, model::PanelKind};
+    use crate::{
+        boards::SavedBoard,
+        model::{PanelKind, PanelModel},
+        panel_snapshot::ContentSnapshot,
+    };
     use gpui_kit::{
-        component::dock::{DockPlacement, DockState},
+        component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState},
         px,
     };
 
@@ -384,7 +265,7 @@ mod tests {
             info: PanelInfo::Panel(
                 serde_json::to_value(SavedPanel {
                     model: PanelModel::new(id, PanelKind::Chart),
-                    content: serde_json::json!({"zoom": 1.5}),
+                    content: serde_json::to_value(ContentSnapshot::new("100.00".into())).unwrap(),
                 })
                 .unwrap(),
             ),
@@ -685,6 +566,46 @@ mod tests {
         state.windows[0].bounds[2] = f32::NAN;
         assert!(write(&path, &state).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn corrupt_known_content_is_rejected_before_writing_or_restoring() {
+        let dir = TestDirectory::new();
+        let path = dir.workspace();
+        let mut state = fixture();
+        write(&path, &state).unwrap();
+        let original = fs::read(&path).unwrap();
+        let PanelInfo::Panel(payload) = &mut state.windows[0].dock.center.info else {
+            panic!("fixture panel");
+        };
+        payload["content"]["chart"]["bars_visible"] = serde_json::json!("damaged");
+        assert!(write(&path, &state).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+
+        // A syntactically valid JSON document with damaged known content must
+        // fail at the storage boundary, before any workspace view is created.
+        let damaged = serde_json::to_vec(&state).unwrap();
+        fs::write(&path, &damaged).unwrap();
+        let error = read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("Invalid content for panel"));
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn legacy_panels_without_content_keep_the_explicit_default_marker() {
+        let mut state = fixture();
+        let PanelInfo::Panel(payload) = &mut state.windows[0].dock.center.info else {
+            panic!("fixture panel");
+        };
+        payload.as_object_mut().unwrap().remove("content");
+        validate(&state).unwrap();
+        let restored = decode(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let PanelInfo::Panel(payload) = &restored.windows[0].dock.center.info else {
+            panic!("fixture panel");
+        };
+        let saved: SavedPanel = serde_json::from_value(payload.clone()).unwrap();
+        assert!(saved.content.is_null());
     }
 
     #[test]

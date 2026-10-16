@@ -57,6 +57,23 @@ jobs:
         if: steps.changes.outputs.build == 'true'
         run: cargo fmt --all -- --check
 
+  core:
+    name: Core / no native SDK
+    needs: checks
+    if: needs.checks.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: rustup show active-toolchain
+      - name: Verify architecture boundaries
+        run: python3 scripts/check_architecture.py
+      - name: Test core without GUI or platform libraries
+        run: cargo test --locked -p tydaro-core
+
   windows:
     name: Windows x64 / MSVC Release
     needs: checks
@@ -88,14 +105,14 @@ jobs:
             ~/.cargo/git/db
             target/release
             target/x86_64-pc-windows-msvc/release
-          key: rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
+          key: rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'crates/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
           restore-keys: |
             rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Find the Windows SDK shader compiler
         run: ./scripts/windows-sdk.ps1
       - name: Run model and workspace tests in the Release profile
-        run: cargo test --locked --release --all-targets --target x86_64-pc-windows-msvc
+        run: cargo test --locked --workspace --release --all-targets --target x86_64-pc-windows-msvc
       - name: Build the distributable application
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin tydaro
       - name: Package executable and SHA-256 checksum
@@ -145,14 +162,14 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target/debug
-          key: rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
+          key: rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'crates/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
           restore-keys: |
             rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
             rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Check Rust lints
-        run: cargo clippy --locked --all-targets --features test-support -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features test-support -- -D warnings
       - name: Run model and workspace tests
-        run: cargo test --locked --all-targets --features test-support
+        run: cargo test --locked --workspace --all-targets --features test-support
       - name: Build and render the application offscreen
         run: |
           driver=$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)
@@ -161,11 +178,13 @@ jobs:
           mkdir -p artifacts
           cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
           test -s artifacts/tydaro-linux.png
+          cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test artifacts/tydaro-gallery.png
+          test -n "$(find artifacts -name 'tydaro-gallery*.png' -size +0c -print -quit)"
       - name: Upload Linux rendering evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: tydaro-linux-smoke-${{ github.sha }}
-          path: artifacts/tydaro-linux*.png
+          path: artifacts/tydaro-*.png
           if-no-files-found: error
           retention-days: 14
           compression-level: 0 # PNG compression has already done the work.
@@ -173,7 +192,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [checks, windows, linux]
+    needs: [checks, core, windows, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -181,17 +200,20 @@ jobs:
         env:
           CHECKS_RESULT: ${{ needs.checks.result }}
           BUILD_REQUIRED: ${{ needs.checks.outputs.build }}
+          CORE_RESULT: ${{ needs.core.result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
           LINUX_RESULT: ${{ needs.linux.result }}
         run: |
           test "$CHECKS_RESULT" = success
           if [ "$BUILD_REQUIRED" = true ]; then
+            test "$CORE_RESULT" = success
             test "$WINDOWS_RESULT" = success
             test "$LINUX_RESULT" = success
           else
             # Known documentation, or a codex/dev push covered by the matching
             # open PR. PR runs always validate their own merge commit normally.
             test "$BUILD_REQUIRED" = false
+            test "$CORE_RESULT" = skipped
             test "$WINDOWS_RESULT" = skipped
             test "$LINUX_RESULT" = skipped
           fi

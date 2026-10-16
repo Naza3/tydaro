@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use gpui_kit::component::dock::{PanelInfo, PanelState};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{self, MAX_STABLE_ID, SavedPanel, WorkspaceFile};
+use crate::workspace_snapshot::{self, MAX_STABLE_ID, SavedPanel, WorkspaceFile};
 
 pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_BOARDS: usize = 16;
@@ -147,7 +147,7 @@ pub fn validate(state: &BoardSetFile) -> Result<()> {
         let name = validate_board_name(&board.name)?;
         ensure!(name == board.name, "Saved board names must be trimmed");
         ensure!(names.insert(name), "Duplicate board name {}", board.name);
-        storage::validate(&board.workspace)?;
+        workspace_snapshot::validate(&board.workspace)?;
         ensure!(
             board
                 .workspace
@@ -199,7 +199,7 @@ mod tests {
     use super::*;
     use crate::{
         model::{PanelKind, PanelModel},
-        storage::SavedWindow,
+        workspace_snapshot::SavedWindow,
     };
     use gpui_kit::{
         component::dock::{DockAreaState, DockPlacement, DockState},
@@ -213,7 +213,10 @@ mod tests {
             info: PanelInfo::Panel(
                 serde_json::to_value(SavedPanel {
                     model: PanelModel::new(id, PanelKind::Chart),
-                    content: serde_json::json!({"viewport": {"zoom": 2.0}}),
+                    content: serde_json::to_value(crate::panel_snapshot::ContentSnapshot::new(
+                        "100.00".into(),
+                    ))
+                    .unwrap(),
                 })
                 .unwrap(),
             ),
@@ -222,7 +225,7 @@ mod tests {
 
     fn fixture() -> BoardSetFile {
         BoardSetFile::from_legacy(WorkspaceFile {
-            version: storage::SCHEMA_VERSION,
+            version: workspace_snapshot::SCHEMA_VERSION,
             next_id: 5,
             paused: false,
             windows: vec![SavedWindow {

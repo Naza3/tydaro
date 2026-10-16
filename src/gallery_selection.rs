@@ -15,6 +15,7 @@ use gpui_kit::{
     prelude::*,
     *,
 };
+use tydaro_ui::{selection, tokens::COOL_LIGHT};
 
 const CHOICES: [&str; 3] = ["标准", "紧凑", "专注"];
 const CHOICE_NOTES: [&str; 3] = [
@@ -172,15 +173,9 @@ impl SelectionSamples {
                 body = body.child(div().flex().flex_col().gap_2().children(
                     CHOICES.into_iter().enumerate().map(|(index, label)| {
                         let selected = self.choice == index;
-                        Button::new(self.id(&format!("choice-{index}")))
-                            .ghost()
-                            .w_full()
+                        selection::choice(self.id(&format!("choice-{index}")), selected, COOL_LIGHT)
                             .h(px(63.))
                             .px_3()
-                            .border_1()
-                            .border_color(rgb(if selected { ACCENT } else { LINE }))
-                            .bg(rgb(if selected { SOFT } else { SURFACE }))
-                            .rounded_md()
                             .child(
                                 div()
                                     .w_full()
@@ -689,23 +684,22 @@ impl SelectionSamples {
                     .child(hint("筛选条件 · 描边选中"))
                     .child(div().flex().flex_wrap().gap_2().children(
                         FILTERS.into_iter().enumerate().map(|(index, label)| {
-                            Button::new(self.id(&format!("filter-{index}")))
-                                .ghost()
-                                .h(px(33.))
-                                .px_3()
-                                .border_1()
-                                .border_color(rgb(if self.filters[index] { ACCENT } else { LINE }))
-                                .bg(rgb(if self.filters[index] { SOFT } else { SURFACE }))
-                                .rounded_full()
-                                .label(format!(
+                            selection::filter_chip(
+                                self.id(&format!("filter-{index}")),
+                                format!(
                                     "{}{}",
                                     if self.filters[index] { "✓ " } else { "+ " },
                                     label
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                ),
+                                self.filters[index],
+                                COOL_LIGHT,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.filters[index] = !this.filters[index];
                                     cx.notify();
-                                }))
+                                },
+                            ))
                         }),
                     ));
             }

@@ -20,15 +20,20 @@ source /workspace/.cloud-setup/activate.sh
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --features test-support -- -D warnings
-cargo test --locked --all-targets --features test-support
+python3 scripts/check_architecture.py
+cargo clippy --locked --workspace --all-targets --features test-support -- -D warnings
+cargo test --locked --workspace --all-targets --features test-support
 git diff --check
 ```
+
+PowerShell 可用 `python` 替代 `python3`。必须显式使用 `--workspace`，否则在根目录测试默认包不能证明两个库都被独立测试。修改纯业务规则时，先执行 `cargo test --locked -p tydaro-core`；该包不依赖 GPUI 或平台图形库，Linux 核心 CI 无需 GUI SDK；Windows 测试仍使用本机 Rust/MSVC 链接环境。影响 UI、存储和组装的变更仍需完整 workspace 检查。
 
 | 改动范围 | 所需验证 |
 | --- | --- |
 | 纯文档 | diff、链接/命令与现有实现的一致性；无需完整 Rust 编译 |
 | Git hooks、脚本、工作流 | 对应语法/行为检查；工作流改动在开发分支 push、PR 或手动 CI 验证，记录是否真正触发 |
+| core 业务命令、候选规则、数据契约 | 无 GUI 的 core 独立测试；命令失败原子性、非法 DTO、schema 1→2、as_of 截断与被冻结的历史依据 |
+| crate 依赖、组成根、服务初始化 | 架构 guard、自测及 workspace 编译；独立 Gallery、正常启动/退出与测试隔离 |
 | 行情、状态、交易模拟、存储 | 格式、Clippy、受影响逻辑测试；对数据丢失、错误输入和兼容性补充回归 |
 | 面板、图表、布局或输入交互 | 上述 Rust 检查及离屏渲染/事件回归；视觉变化检查截图，窗口行为变化补充原生桌面操作 |
 | 工具链、锁文件、平台代码、发行脚本 | Windows MSVC 和 Linux CI；涉及发行时确认 ZIP 内容与校验，不能只测主机目标 |
@@ -37,6 +42,7 @@ git diff --check
 
 ```bash
 cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
+cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test artifacts/tydaro-gallery.png
 ```
 
 该模式执行实际绘制与 UI 事件，检查面板联动、图表交互、布局迁移及模拟订单，还会验证新增即浮窗、五向回插、锁定与失效目标拒绝、状态保持和行情筛选。看板回归覆盖切换、独立组件与浮窗、复制身份、命名、排序、删除边界、独立撤销及整组持久化；股票列表回归覆盖组件改名、成员增删、空列表、列表隔离与迁移保存；文本导入回归使用真实多行剪贴板事件，覆盖预览/取消、去重/已有/未知、改稿、分组隔离和保存恢复；图表回归覆盖点击数据卡、左右吸附、键盘定位、缩放/平移后的日期、历史分时导航、重复开窗及切板清理；A 股分时通过生产组件切换早盘、午休、午后开盘、收盘竞价与盘后时刻，检查固定坐标、未来/竞价参考区域不误选成交、滚轮/拖动不改变全日轴及盘后不回卷。输出主布局、K 线、行情组件、看板栏、空白看板、股票分组、双侧数据卡、历史分时与文本导入以及 A 股上午/收盘分时及分时双侧数据卡共十八张截图，CI 将它们一同保存。截图不是 Windows 原生桌面验收的替代品。临时输出放在忽略目录；需要更新产品预览时才替换 `docs/preview.png`、`docs/boards/` 和 `docs/components/` 中的示例截图。
@@ -49,6 +55,11 @@ cargo run --locked --features test-support --bin tydaro -- --smoke-test artifact
 
 局部迭代可用 `cargo run --locked --features test-support --bin tydaro -- --desktop-smoke-test artifacts/tydaro-desktop.png` 单独运行五页场景，复用相同初始化；最终仍需完整 smoke。
 
+架构迁移另提供 `cargo run --locked --features test-support --bin tydaro -- --architecture-smoke-test artifacts/architecture`：执行面板资源隔离、可替换图表数据源、窗口关闭、五页输入和候选到草稿等状态/事件断言，不请求截图或像素断言。追加 `--input-only` 可单独定位被拒绝输入的保留、修正与关闭保护。它可用于当前 GPUI 没有离屏渲染器的 Windows；不能代替 Linux 完整绘制回归或 Windows 实机显示验收。
+
+命令失败时，草稿和笔记等未被核心接受的输入保留在原视图，显示错误并阻止隐式关闭/切换丢失；各视图以独立标识登记未保存输入，修正或明确放弃后清理。退出应用必须完成业务及布局 flush，任一失败或仍有未保存输入时显示继续编辑/明确退出选择。
+
+
 新增回归覆盖：
 
 - `Ctrl+K` 股票搜索与页面搜索；五页往返保留行情面板身份、选股、周期和内容。
@@ -60,11 +71,23 @@ cargo run --locked --features test-support --bin tydaro -- --smoke-test artifact
 - 主窗口笔记真实输入并同步到已打开的同日期阅读窗口；主页面随后切日期，阅读窗口笔记仍写入打开时的固定日期；关闭阅读窗口不删除记录。
 - 五页在 1536×960 和 1280×800 的实际原生绘制，以及独立复盘阅读窗口，共十一张新增截图。截图位于同一输出目录，后缀为 `-desktop-{page}-{width}.png` 和 `-desktop-journal-reading.png`。
 
-业务模型、校验和本地文档失败保护另由 `desktop_state.rs` 等模块的 Rust 测试覆盖。测试初始化使用 `persistent = false`，不会读写个人 `desktop.json`；磁盘场景使用独立临时目录。原生截图和自动输入回归不能代替 Windows 字体、中文 IME、DPI、多屏窗口行为及真实磁盘故障的人工验收。
+业务模型和命令测试位于 `tydaro-core`，文档 IO、revision 与失败保护由应用适配层测试；单纯把测试编译进应用不等于执行独立 CLI 场景。测试初始化使用 `persistent = false`，不会读写个人 `desktop.json`；磁盘场景使用独立临时目录。原生截图和自动输入回归不能代替 Windows 字体、中文 IME、DPI、多屏窗口行为及真实磁盘故障的人工验收。
+
+### 架构迁移的回归边界
+
+- 纯核心：旧证券/周期序列化名称及模拟行情不变；分组名称、规则阈值与预案完整性由命令入口统一执行，失败不得改变记录或 ID 分配器。
+- 研究契约：T 日首板候选只使用截至 as_of 已知的事实、归属与人工确认；加入未来修订后重放 T 得到同一结果。未知板数单列，未确认建议不覆盖人工结论，跨题材同股只出现一次并保留所有依据。
+- 真实页面消费：题材页明确标记的固定模拟候选演练，经用户确认进入下一业务日草稿，typed 依据存在且草稿仍需填写触发条件；不把这项验收解释为完整赚钱效应算法通过。
+- 存储迁移：schema 1 预案、手法与原始 source 文字无损读取；保存为 schema 2，`.bak` 保留旧原字节；未知版本、损坏原文和外部改动不被覆盖。研究子文档损坏时其他业务可以继续保存，坏研究原值保持。
+- 异步保存：旧任务晚完成不得覆盖新版本，也不得清除新 dirty；写入失败保留内存，关闭等待最终保存或由用户明确选择退出。布局与桌面文档分别验收。
+- 视图资源：只读面板不创建输入/图表；每种面板只拥有所需实体；跨窗恢复重建控件，坏内容在任何 live 控件变更前失败。旧快照未使用字段仍被保留。
+- 图表投影：注入数据源保持日 K/历史分时及均线前缀一致，后续 tick 不改变已打开的冻结历史；不能在同步投影查询中执行网络 IO。
+
+CI 配置包括无原生 SDK 的 core 作业、Windows/Linux workspace 测试和 Linux 的完整 smoke 与 Gallery smoke。配置存在不代表某次提交已通过；交接分别给出实际运行结果。`check_architecture.py --self-test` 验证 guard 的源码扫描行为，但 guard 不证明所有跨模块语义均正确。
 
 ### 人工验收清单
 
-基础组件实验室有独立的 `--gallery-smoke-test artifacts/gallery.png` 入口（同样开启 `test-support`）。它覆盖三十个样例的输入与点击、焦点、状态保留和返回行情的 Dock 一致性；运行方式及 Windows 离屏截图限制见 [组件实验室](component-gallery.md)。五页回归另外检查侧栏进入 Gallery、返回行情和重新打开后的类别保留。
+基础组件实验室有独立的 `--gallery-smoke-test artifacts/gallery.png` 入口（同样开启 `test-support`），在 Linux CI 显式执行。它覆盖三十个样例的输入与点击、焦点、状态保留和返回行情的 Dock 一致性；运行方式及 Windows 离屏截图限制见 [组件实验室](component-gallery.md)。五页回归另外检查侧栏进入 Gallery、返回行情和重新打开后的类别保留；这几个导航断言不替代完整 Gallery 场景。
 
 使用独立 `TYDARO_DATA_DIR`，避免覆盖自己的布局；示例中 Bash 使用 `export TYDARO_DATA_DIR=/tmp/tydaro-acceptance`，PowerShell 使用 `$env:TYDARO_DATA_DIR = "$env:TEMP\tydaro-acceptance"`。验收记录应包含提交、系统、显示器缩放和结果。
 

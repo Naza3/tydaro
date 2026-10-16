@@ -1,12 +1,14 @@
 //! Native display primitives for the component gallery. All state stays in this view.
 use gpui_kit::{
     component::{
-        Disableable, Selectable, Sizable, WindowExt,
+        Disableable, Sizable, WindowExt,
         button::{Button, ButtonVariants},
     },
     prelude::*,
     *,
 };
+
+use tydaro_ui::{selection, tokens::COOL_LIGHT};
 
 use crate::ui_foundation::{
     ACCENT, DOWN, Family, INK, LINE, SOFT, SURFACE, UP, Variant, action, caption, hint, surface,
@@ -69,22 +71,15 @@ impl DisplaySamples {
     }
 
     fn row_button(&self, index: usize, cx: &mut Context<Self>) -> Button {
-        Button::new(self.id(&format!("list-row-{index}")))
-            .ghost()
-            .w_full()
-            .justify_start()
-            .text_size(px(13.))
-            .text_color(rgb(INK))
-            .bg(rgb(if self.selected == index {
-                SOFT
-            } else {
-                SURFACE
-            }))
-            .selected(self.selected == index)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected = index;
-                cx.notify();
-            }))
+        selection::list_row(
+            self.id(&format!("list-row-{index}")),
+            self.selected == index,
+            COOL_LIGHT,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.selected = index;
+            cx.notify();
+        }))
     }
 
     fn selected_note(&self) -> AnyElement {
@@ -659,9 +654,5 @@ impl Render for DisplaySamples {
 }
 
 fn number(text: impl Into<SharedString>, color: u32) -> Div {
-    div()
-        .font_family("Consolas")
-        .text_size(px(13.))
-        .text_color(rgb(color))
-        .child(text.into())
+    tydaro_ui::text::number(text, color)
 }

@@ -63,7 +63,9 @@
 | --- | --- |
 | `src/desktop.rs` | 统一外壳、五页导航、全局搜索、个股速览及跨页确认 |
 | `src/desktop_ui.rs` | 共用颜色、标题、面板和标签样式 |
-| `src/desktop_state.rs` | 业务模型、输入约束、状态更新及版本化持久化 |
+| `crates/tydaro-core` | 独立业务模型、输入约束、原子命令与模拟候选链 |
+| `src/desktop_state.rs`、`src/desktop_repository.rs` | GPUI 业务适配、后台保存与版本化文档 IO |
+| `crates/tydaro-ui`、`src/app.rs` | 共享基础组件及应用启动装配 |
 | `src/watch_page.rs` | 分组、规则、演示异动及监控界面 |
 | `src/research_page.rs` | 涨停资料与题材研究页面 |
 | `src/journal_page.rs` | 复盘编辑、历史、方法词库及原生阅读窗口 |

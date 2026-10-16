@@ -108,7 +108,7 @@ cargo run --locked --bin tydaro
 
 ```bash
 cargo fmt --all -- --check
-cargo test --locked --all-targets
+cargo test --locked --workspace --all-targets
 ```
 
 无桌面的 Linux 环境可通过 `test-support` 功能进行真实离屏渲染。SDK、完整发行构建、软件 Vulkan 驱动、交叉编译和打包命令见 [docs/build.md](docs/build.md)。

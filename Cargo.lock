@@ -7060,6 +7060,25 @@ dependencies = [
  "gpui-kit",
  "serde",
  "serde_json",
+ "tydaro-core",
+ "tydaro-ui",
+]
+
+[[package]]
+name = "tydaro-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "encoding_rs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tydaro-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
 ]
 
 [[package]]

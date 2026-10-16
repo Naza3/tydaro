@@ -1,0 +1,13 @@
+[package]
+name = "tydaro-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "Window-independent domain rules and deterministic data for Tydaro"
+
+[dependencies]
+anyhow = "1"
+encoding_rs = "=0.8.42"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

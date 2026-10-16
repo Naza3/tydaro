@@ -2,14 +2,15 @@
 //! focus handles belong to one native window only.
 use crate::{
     desktop_state::{
-        self, BuyRecord, DesktopEvent, DesktopState, Draft, Hotspot, PageId, Plan, SourceContext,
+        self, Command, CommandResult, DesktopEvent, DesktopState, Draft, PageId, Plan,
+        SourceContext,
     },
     desktop_ui::{self as ui, BG, DOWN, INK, LINE, MUTED, TEAL, UP},
     market::Symbol,
 };
 use gpui_kit::{
     component::{
-        Sizable,
+        Sizable, WindowExt,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
     },
@@ -60,6 +61,7 @@ pub struct JournalPage {
     date_input: Entity<InputState>,
     note: Entity<TextareaState>,
     note_synced: String,
+    note_error: Option<String>,
     note_subscription: Option<Subscription>,
     editor: Option<Editor>,
     form: Option<RecordForm>,
@@ -123,6 +125,37 @@ fn sync_shared_note(
         });
     }
     *synced = shared.to_string();
+}
+
+fn publish_note(
+    note: &Entity<TextareaState>,
+    synced: &mut String,
+    date: &str,
+    key: String,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    let value = note.read(cx).value().to_string();
+    if value == *synced {
+        desktop_state::report_pending_input(cx, key, None);
+        return Ok(());
+    }
+    match desktop_state::dispatch(
+        cx,
+        Command::SetNote {
+            date: date.to_string(),
+            text: value.clone(),
+        },
+    ) {
+        Ok(_) => {
+            *synced = value;
+            desktop_state::report_pending_input(cx, key, None);
+            Ok(())
+        }
+        Err(error) => {
+            desktop_state::report_pending_input(cx, key, Some(error.to_string()));
+            Err(error)
+        }
+    }
 }
 
 fn action(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
@@ -203,12 +236,10 @@ impl JournalPage {
             window,
             cx,
         );
-        let frozen = date.clone();
-        let subscription = cx.subscribe(&note, move |this, note, event: &InputEvent, cx| {
+        let subscription = cx.subscribe(&note, move |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                let value = note.read(cx).value().to_string();
-                this.note_synced = value.clone();
-                desktop_state::update(cx, |state| state.journal.day_mut(&frozen).note = value);
+                this.persist_note(cx);
+                cx.notify();
             }
         });
         Self {
@@ -216,6 +247,7 @@ impl JournalPage {
             date_input: input(date, "YYYY-MM-DD", window, cx),
             note,
             note_synced: note_text,
+            note_error: None,
             note_subscription: Some(subscription),
             editor: None,
             form: None,
@@ -241,21 +273,62 @@ impl JournalPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.persist_editor(cx) || !self.persist_note(cx) {
+            return;
+        }
         if !desktop_state::valid_date(&date) {
             self.error = Some("复盘日期无效，请使用 YYYY-MM-DD".into());
             cx.notify();
             return;
         }
-        let mut draft_id = String::new();
-        desktop_state::update(cx, |state| {
-            draft_id = state.create_draft(&context, &date);
-        });
+        let draft_id = match desktop_state::dispatch(
+            cx,
+            Command::CreateDraft {
+                context,
+                date: date.clone(),
+            },
+        )
+        .and_then(CommandResult::into_id)
+        {
+            Ok(id) => id,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
         self.select_date(&date, window, cx);
         self.open_draft(&draft_id, window, cx);
         self.message = Some("已建立独立草稿，请补充买入或卖出条件后保存为预案".into());
     }
+    pub fn receive_candidates(
+        &mut self,
+        set: tydaro_core::research::CandidateSet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.persist_editor(cx) || !self.persist_note(cx) {
+            return;
+        }
+        let date = set.applicable_date().as_str().to_owned();
+        match desktop_state::dispatch(cx, Command::CreateCandidateDraft(set))
+            .and_then(CommandResult::into_id)
+        {
+            Ok(id) => {
+                self.select_date(&date, window, cx);
+                self.open_draft(&id, window, cx);
+                self.message = Some("已保存冻结的模拟候选依据，请补充次日触发与放弃条件。".into());
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
     fn select_date(&mut self, date: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.persist_editor(cx);
+        if !self.persist_editor(cx) || !self.persist_note(cx) {
+            return;
+        }
         self.editor = None;
         self.date = date.to_string();
         self.date_input.update(cx, |state, cx| {
@@ -271,14 +344,13 @@ impl JournalPage {
         self.note_subscription = None;
         self.note_synced = text.clone();
         self.note = area(text, "记录盘中观察、执行与复盘", window, cx);
-        let frozen = date.to_string();
+        self.note_error = None;
         self.note_subscription = Some(cx.subscribe(
             &self.note,
-            move |this, note, event: &InputEvent, cx| {
+            move |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    let value = note.read(cx).value().to_string();
-                    this.note_synced = value.clone();
-                    desktop_state::update(cx, |state| state.journal.day_mut(&frozen).note = value);
+                    this.persist_note(cx);
+                    cx.notify();
                 }
             },
         ));
@@ -286,17 +358,20 @@ impl JournalPage {
         cx.notify();
     }
     fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.persist_editor(cx);
+        if !self.persist_editor(cx) {
+            return;
+        }
         let date = self.date.clone();
-        let mut id = String::new();
-        desktop_state::update(cx, |state| {
-            id = state.new_id("draft");
-            let plan = desktop_state::blank_plan(&date, id.clone());
-            state.journal.day_mut(&date).drafts.push(Draft {
-                plan,
-                editing_id: None,
-            });
-        });
+        let id = match desktop_state::dispatch(cx, Command::NewDraft { date })
+            .and_then(CommandResult::into_id)
+        {
+            Ok(id) => id,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
         self.open_draft(&id, window, cx);
     }
     fn open_draft(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -312,33 +387,26 @@ impl JournalPage {
         }
     }
     fn edit_plan(&mut self, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
-        self.persist_editor(cx);
-        let mut draft = None;
-        desktop_state::update(cx, |state| {
-            let existing = state
-                .journal
-                .day_mut(&plan.date)
-                .drafts
-                .iter()
-                .find(|draft| draft.editing_id.as_deref() == Some(&plan.id))
-                .cloned();
-            draft = Some(if let Some(existing) = existing {
-                existing
-            } else {
-                let mut editing = plan.clone();
-                editing.id = state.new_id("draft");
-                let item = Draft {
-                    plan: editing,
-                    editing_id: Some(plan.id.clone()),
-                };
-                state.journal.day_mut(&plan.date).drafts.push(item.clone());
-                item
-            });
-        });
-        if let Some(draft) = draft {
-            self.begin_editor(draft, window, cx);
+        if !self.persist_editor(cx) {
+            return;
+        }
+        match desktop_state::dispatch(
+            cx,
+            Command::EditPlan {
+                date: plan.date,
+                id: plan.id,
+            },
+        )
+        .and_then(CommandResult::into_draft)
+        {
+            Ok(draft) => self.begin_editor(draft, window, cx),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
         }
     }
+
     fn begin_editor(&mut self, draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
         let p = &draft.plan;
         let mut editor = Editor {
@@ -365,7 +433,6 @@ impl JournalPage {
                 .push(cx.subscribe(entity, |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.persist_editor(cx);
-                        this.error = None;
                         cx.notify();
                     }
                 }));
@@ -382,7 +449,6 @@ impl JournalPage {
                 .push(cx.subscribe(entity, |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.persist_editor(cx);
-                        this.error = None;
                         cx.notify();
                     }
                 }));
@@ -409,23 +475,56 @@ impl JournalPage {
         p.hold = e.hold.read(cx).value().to_string();
         Some(draft)
     }
-    fn persist_editor(&self, cx: &mut Context<Self>) {
-        if let Some(draft) = self.editor_draft(cx) {
-            desktop_state::update(cx, |state| {
-                let day = state.journal.day_mut(&draft.plan.date);
-                if let Some(existing) = day
-                    .drafts
-                    .iter_mut()
-                    .find(|item| item.plan.id == draft.plan.id)
-                {
-                    *existing = draft;
-                } else {
-                    day.drafts.push(draft);
-                }
-            });
+    fn persist_note(&mut self, cx: &mut Context<Self>) -> bool {
+        let key = format!("journal-note:{:?}", cx.entity_id());
+        self.note_error = publish_note(&self.note, &mut self.note_synced, &self.date, key, cx)
+            .err()
+            .map(|error| format!("笔记尚未保存：{error}"));
+        self.note_error.is_none()
+    }
+
+    fn persist_editor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(draft) = self.editor_draft(cx) else {
+            return true;
+        };
+        let key = format!("journal-draft:{:?}", cx.entity_id());
+        match desktop_state::dispatch(cx, Command::UpsertDraft(draft)) {
+            Ok(_) => {
+                desktop_state::report_pending_input(cx, key, None);
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                desktop_state::report_pending_input(cx, key, Some(error.to_string()));
+                self.error = Some(format!("草稿尚未保存：{error}"));
+                cx.notify();
+                false
+            }
         }
     }
+
+    fn close_editor(
+        &mut self,
+        retained_message: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.persist_editor(cx) {
+            return;
+        }
+        self.editor = None;
+        self.error = None;
+        if retained_message {
+            self.message = Some("草稿已保留，可在当天继续编辑".into());
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     fn save_plan(&mut self, cx: &mut Context<Self>) {
+        if !self.persist_editor(cx) {
+            return;
+        }
         let Some(draft) = self.editor_draft(cx) else {
             return;
         };
@@ -434,23 +533,9 @@ impl JournalPage {
             cx.notify();
             return;
         }
-        let date = draft.plan.date.clone();
-        let id = draft.plan.id.clone();
-        let mut result = Ok(());
-        desktop_state::update(cx, |state| {
-            result = state
-                .journal
-                .save_plan(draft.plan, draft.editing_id.as_deref());
-            if result.is_ok() {
-                state
-                    .journal
-                    .day_mut(&date)
-                    .drafts
-                    .retain(|item| item.plan.id != id);
-            }
-        });
+        let result = desktop_state::dispatch(cx, Command::SavePlanDraft(draft));
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 self.editor = None;
                 self.error = None;
                 self.message = Some("预案已更新；原有记录按身份更新，不重复追加".into());
@@ -570,68 +655,30 @@ impl JournalPage {
         } else {
             0.
         };
-        let mut too_many = false;
-        desktop_state::update(cx, |state| {
-            if matches!(kind, FormKind::Hotspot)
-                && original_id.is_none()
-                && state.journal.hotspots.len() >= 5
-            {
-                too_many = true;
-                return;
+        let command = match kind {
+            FormKind::Hotspot => Command::SaveHotspot {
+                id: original_id,
+                date: values[0].clone(),
+                sector: values[1].clone(),
+                heights: values[2].clone(),
+            },
+            FormKind::Buy => Command::SaveBuy {
+                id: original_id,
+                date: values[0].clone(),
+                stock: values[1].clone(),
+                sector: values[2].clone(),
+                method: values[3].clone(),
+                profit,
+                note: values[5].clone(),
+            },
+        };
+        match desktop_state::dispatch(cx, command) {
+            Ok(_) => {
+                self.form = None;
+                self.error = None;
+                self.message = Some("手工记录已更新，独立于行情和账户数据".into());
             }
-            let id = original_id
-                .clone()
-                .unwrap_or_else(|| state.new_id("journal-record"));
-            match kind {
-                FormKind::Hotspot => {
-                    let created = state
-                        .journal
-                        .hotspots
-                        .iter()
-                        .map(|item| item.created)
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    let item = Hotspot {
-                        id: id.clone(),
-                        date: values[0].clone(),
-                        sector: values[1].clone(),
-                        heights: values[2].clone(),
-                        created,
-                    };
-                    if let Some(existing) =
-                        state.journal.hotspots.iter_mut().find(|item| item.id == id)
-                    {
-                        *existing = item;
-                    } else {
-                        state.journal.hotspots.push(item);
-                    }
-                }
-                FormKind::Buy => {
-                    let item = BuyRecord {
-                        id: id.clone(),
-                        date: values[0].clone(),
-                        stock: values[1].clone(),
-                        sector: values[2].clone(),
-                        method: values[3].clone(),
-                        profit,
-                        note: values[5].clone(),
-                    };
-                    if let Some(existing) = state.journal.buys.iter_mut().find(|item| item.id == id)
-                    {
-                        *existing = item;
-                    } else {
-                        state.journal.buys.push(item);
-                    }
-                }
-            }
-        });
-        if too_many {
-            self.error = Some("人工热点最多 5 个，请先移除一个".into());
-        } else {
-            self.form = None;
-            self.error = None;
-            self.message = Some("手工记录已更新，独立于行情和账户数据".into());
+            Err(error) => self.error = Some(error.to_string()),
         }
         cx.notify();
     }
@@ -639,21 +686,17 @@ impl JournalPage {
         let Some(target) = self.delete.take() else {
             return;
         };
-        desktop_state::update(cx, |state| match target {
-            DeleteTarget::Plan(date, id) => {
-                let day = state.journal.day_mut(&date);
-                day.plans.retain(|item| item.id != id);
-                day.drafts
-                    .retain(|item| item.editing_id.as_deref() != Some(&id));
-            }
-            DeleteTarget::Draft(date, id) => state
-                .journal
-                .day_mut(&date)
-                .drafts
-                .retain(|item| item.plan.id != id),
-            DeleteTarget::Hotspot(id) => state.journal.hotspots.retain(|item| item.id != id),
-            DeleteTarget::Buy(id) => state.journal.buys.retain(|item| item.id != id),
-        });
+        let command = match target {
+            DeleteTarget::Plan(date, id) => Command::DeletePlan { date, id },
+            DeleteTarget::Draft(date, id) => Command::DeleteDraft { date, id },
+            DeleteTarget::Hotspot(id) => Command::DeleteHotspot(id),
+            DeleteTarget::Buy(id) => Command::DeleteBuy(id),
+        };
+        if let Err(error) = desktop_state::dispatch(cx, command) {
+            self.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         self.message = Some("已删除选中的记录".into());
         cx.notify();
     }
@@ -866,7 +909,7 @@ impl JournalPage {
                 .child(div().p_5().flex_shrink_0().flex().items_center().gap_3().border_b_1().border_color(rgb(LINE))
                     .child(div().flex_1().child(div().text_size(px(21.)).font_weight(FontWeight::SEMIBOLD).child(if e.draft.editing_id.is_some() { "编辑预案" } else { "新的研究预案" }))
                         .child(ui::muted(format!("{} · 草稿自动保留，完整预案需要明确触发条件", e.draft.plan.date))))
-                    .child(action("journal-editor-close", "关闭").ghost().on_click(cx.listener(|this, _, window, cx| { this.persist_editor(cx); this.editor = None; this.error = None; window.focus(&this.focus, cx); cx.notify(); }))))
+                    .child(action("journal-editor-close", "关闭").ghost().on_click(cx.listener(|this, _, window, cx| { this.close_editor(false, window, cx); }))))
                 .child(div().id("journal-editor-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&e.scroll).p_5().flex().flex_col().gap_4()
                     .child(field("板块 / 主题 *", "journal-sector", &e.sector))
                     .child(multiline("研究依据", "journal-basis", &e.basis, 72.))
@@ -895,7 +938,7 @@ impl JournalPage {
                     .child(ui::muted("允许只写买入或只写卖出。已填写的一侧须同时有方法和触发条件；未完成内容请保留草稿。").flex_shrink_0()))
                 .child(div().p_4().flex_shrink_0().border_t_1().border_color(rgb(LINE)).flex().items_center().gap_2()
                     .child(div().flex_1().text_size(px(12.)).text_color(rgb(UP)).child(self.error.clone().unwrap_or_default()))
-                    .child(action("journal-draft-save", "保留草稿").on_click(cx.listener(|this, _, window, cx| { this.persist_editor(cx); this.editor = None; this.error = None; this.message = Some("草稿已保留，可在当天继续编辑".into()); window.focus(&this.focus, cx); cx.notify(); })))
+                    .child(action("journal-draft-save", "保留草稿").on_click(cx.listener(|this, _, window, cx| { this.close_editor(true, window, cx); })))
                     .child(action("journal-plan-save", "保存为预案").primary().on_click(cx.listener(|this, _, window, cx| { this.save_plan(cx); if this.editor.is_none() { window.focus(&this.focus, cx); } }))))).into_any_element()
     }
     fn form_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1031,10 +1074,11 @@ impl JournalPage {
         let sell = parse(editor.sell.read(cx).value().as_ref());
         match (buy, sell) {
             (Ok(buy), Ok(sell)) => {
-                desktop_state::update(cx, |state| {
-                    state.journal.methods = buy;
-                    state.journal.sell_methods = sell;
-                });
+                if let Err(error) = desktop_state::dispatch(cx, Command::SetMethods { buy, sell }) {
+                    self.error = Some(error.to_string());
+                    cx.notify();
+                    return;
+                }
                 self.methods_editor = None;
                 self.error = None;
                 self.message = Some("方法词库已更新；已有预案的文字保持原样".into());
@@ -1445,6 +1489,7 @@ impl Render for JournalPage {
                                     .child(action(SharedString::from(format!("journal-buy-delete-{}", buy.id)), "删除").ghost().text_color(rgb(MUTED)).on_click(cx.listener(move |this, _, _, cx| { this.delete = Some(DeleteTarget::Buy(delete_id.clone())); cx.notify(); }))))
                         })))
                         .child(div().p_3().border_t_1().border_color(rgb(LINE)).child(ui::muted("收益率为手工输入，不代表账户绩效。仅 >10% 加粗。"))))))
+            .when_some(self.note_error.clone(), |el, error| el.child(div().id("journal-note-error").test_support().text_size(px(12.)).text_color(rgb(UP)).child(error)))
             .when(self.message.is_some() || (self.error.is_some() && !self.is_editing()), |el| el.child(div().text_size(px(12.)).text_color(rgb(if self.error.is_some() { UP } else { MUTED })).child(self.error.clone().or(self.message.clone()).unwrap_or_default())))
             .when(self.editor.is_some(), |el| el.child(self.editor_view(cx)))
             .when(self.buys_history, |el| el.child(self.buys_history_view(cx)))
@@ -1459,7 +1504,9 @@ struct JournalReading {
     focus: FocusHandle,
     note: Entity<TextareaState>,
     note_synced: String,
+    note_error: Option<String>,
     _subscription: Subscription,
+    _release: Subscription,
 }
 impl JournalReading {
     fn new(date: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1471,12 +1518,21 @@ impl JournalReading {
             .map(|day| day.note.clone())
             .unwrap_or_default();
         let note = area(text.clone(), "补充当前日期的观察笔记", window, cx);
-        let frozen = date.clone();
-        let subscription = cx.subscribe(&note, move |this, input, event: &InputEvent, cx| {
+        let subscription = cx.subscribe(&note, move |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                let value = input.read(cx).value().to_string();
-                this.note_synced = value.clone();
-                desktop_state::update(cx, |state| state.journal.day_mut(&frozen).note = value);
+                this.persist_note(cx);
+                cx.notify();
+            }
+        });
+        let view = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            view.update(cx, |this, cx| this.request_close(window, cx))
+                .unwrap_or(true)
+        });
+        let key = format!("journal-note:{:?}", cx.entity_id());
+        let release = cx.on_release(move |_, cx| {
+            if cx.has_global::<DesktopState>() {
+                desktop_state::report_pending_input(cx, key.clone(), None);
             }
         });
         let focus = cx.focus_handle();
@@ -1486,8 +1542,42 @@ impl JournalReading {
             focus,
             note,
             note_synced: text,
+            note_error: None,
             _subscription: subscription,
+            _release: release,
         }
+    }
+    fn persist_note(&mut self, cx: &mut Context<Self>) -> bool {
+        let key = format!("journal-note:{:?}", cx.entity_id());
+        self.note_error = publish_note(&self.note, &mut self.note_synced, &self.date, key, cx)
+            .err()
+            .map(|error| format!("笔记尚未保存：{error}"));
+        self.note_error.is_none()
+    }
+
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.persist_note(cx) {
+            return true;
+        }
+        let detail = self.note_error.clone().unwrap_or_default();
+        let key = format!("journal-note:{:?}", cx.entity_id());
+        window.open_dialog(cx, move |dialog, _, _| {
+            let key = key.clone();
+            dialog.title("笔记修改尚未保存").width(px(460.)).child(
+                div().flex().flex_col().gap_4().child(detail.clone())
+                    .child("继续编辑可保留当前输入。放弃后只丢弃本窗口尚未保存的输入，已保存的笔记与预案保持不变。")
+                    .child(div().flex().justify_end().gap_2()
+                        .child(action("journal-reading-keep", "继续编辑").primary()
+                            .on_click(|_, window, cx| window.close_dialog(cx)))
+                        .child(action("journal-reading-discard", "放弃输入并关闭")
+                            .on_click(move |_, window, cx| {
+                                desktop_state::report_pending_input(cx, key.clone(), None);
+                                window.close_dialog(cx);
+                                window.remove_window();
+                            })))
+            )
+        });
+        false
     }
 }
 impl Render for JournalReading {
@@ -1533,8 +1623,13 @@ impl Render for JournalReading {
                             .child(ui::muted("日期固定 · 内容与主窗口同步 · 关窗保留全部记录")),
                     )
                     .child(
-                        action("journal-reading-close", "关闭窗口")
-                            .on_click(|_, window, _| window.remove_window()),
+                        action("journal-reading-close", "关闭窗口").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                if this.request_close(window, cx) {
+                                    window.remove_window();
+                                }
+                            },
+                        )),
                     ),
             )
             .child(
@@ -1601,7 +1696,193 @@ impl Render for JournalReading {
                         "journal-reading-note",
                         &self.note,
                         150.,
-                    ))),
+                    )))
+                    .when_some(self.note_error.clone(), |el, error| {
+                        el.child(
+                            div()
+                                .id("journal-reading-note-error")
+                                .test_support()
+                                .text_color(rgb(UP))
+                                .child(error),
+                        )
+                    }),
             )
     }
+}
+
+/// Exercise rejected input through production native entities and buttons. A
+/// command rejection must not discard the only copy of a user's text.
+#[cfg(feature = "test-support")]
+pub(crate) fn smoke_rejected_inputs(cx: &mut HeadlessAppContext) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    use gpui_kit::test::TestWindowExt;
+
+    fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle) -> anyhow::Result<()> {
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+        Ok(())
+    }
+    let mut handles = Vec::new();
+    let result = (|| -> anyhow::Result<()> {
+        let (main, page) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(20.), px(20.)),
+                        size(px(1536.), px(960.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| JournalPage::new(window, cx)),
+            )
+        })?;
+        handles.push(main);
+        cx.update_window(main, |_, window, cx| {
+            page.update(cx, |page, cx| page.create(window, cx))
+        })?;
+        let oversized_draft = "x".repeat(64 * 1024 + 1);
+        cx.update_window(main, |_, window, cx| {
+            let basis = page.read(cx).editor.as_ref().unwrap().basis.clone();
+            basis.update(cx, |input, cx| {
+                input.replace_all(oversized_draft.clone(), window, cx)
+            });
+        })?;
+        settle(cx, main)?;
+        for button in ["journal-draft-save", "journal-editor-close"] {
+            cx.update_window(main, |_, window, cx| window.click(button, cx))?;
+            settle(cx, main)?;
+            cx.update(|cx| {
+                let page = page.read(cx);
+                ensure!(page.editor.is_some() && page.error.is_some());
+                ensure!(
+                    page.editor
+                        .as_ref()
+                        .unwrap()
+                        .basis
+                        .read(cx)
+                        .value()
+                        .as_ref()
+                        == oversized_draft
+                );
+                ensure!(
+                    !desktop_state::save_now(cx),
+                    "Rejected draft did not protect application close"
+                );
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        cx.update_window(main, |_, window, cx| {
+            page.update(cx, |page, cx| page.select_date("2026-10-15", window, cx));
+            ensure!(page.read(cx).date == TODAY && page.read(cx).editor.is_some());
+            let basis = page.read(cx).editor.as_ref().unwrap().basis.clone();
+            basis.update(cx, |input, cx| {
+                input.replace_all("已修正的研究依据", window, cx)
+            });
+            Ok::<_, anyhow::Error>(())
+        })??;
+        settle(cx, main)?;
+        cx.update_window(main, |_, window, cx| window.click("journal-draft-save", cx))?;
+        settle(cx, main)?;
+        ensure!(cx.update(|cx| page.read(cx).editor.is_none()));
+
+        let oversized_note = "n".repeat(256 * 1024 + 1);
+        cx.update_window(main, |_, window, cx| {
+            let note = page.read(cx).note.clone();
+            note.update(cx, |input, cx| {
+                input.replace_all(oversized_note.clone(), window, cx)
+            });
+        })?;
+        settle(cx, main)?;
+        cx.update(|cx| {
+            ensure!(page.read(cx).note_error.is_some());
+            ensure!(page.read(cx).note.read(cx).value().as_ref() == oversized_note);
+            desktop_state::dispatch(
+                cx,
+                Command::SetNote {
+                    date: TODAY.into(),
+                    text: "另一个窗口的有效笔记".into(),
+                },
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        settle(cx, main)?;
+        cx.update_window(main, |_, window, cx| {
+            page.update(cx, |page, cx| page.select_date("2026-10-15", window, cx));
+            ensure!(page.read(cx).date == TODAY);
+            ensure!(page.read(cx).note.read(cx).value().as_ref() == oversized_note);
+            let note = page.read(cx).note.clone();
+            note.update(cx, |input, cx| {
+                input.replace_all("修正后的笔记", window, cx)
+            });
+            Ok::<_, anyhow::Error>(())
+        })??;
+        settle(cx, main)?;
+        ensure!(cx.update(desktop_state::save_now));
+
+        let (reading, reader) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| JournalReading::new(TODAY.into(), window, cx))
+            })
+        })?;
+        handles.push(reading);
+        let (other, other_reader) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| JournalReading::new(TODAY.into(), window, cx))
+            })
+        })?;
+        handles.push(other);
+        cx.update_window(reading, |_, window, cx| {
+            let note = reader.read(cx).note.clone();
+            note.update(cx, |input, cx| {
+                input.replace_all(oversized_note.clone(), window, cx)
+            });
+        })?;
+        settle(cx, reading)?;
+        cx.update_window(other, |_, window, cx| {
+            let note = other_reader.read(cx).note.clone();
+            note.update(cx, |input, cx| {
+                input.replace_all("保留另一个阅读窗口的记录", window, cx)
+            });
+        })?;
+        settle(cx, other)?;
+        ensure!(
+            !cx.update(desktop_state::save_now),
+            "One reader cleared another reader's rejected input"
+        );
+        cx.update_window(reading, |_, window, cx| {
+            ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            Ok::<_, anyhow::Error>(())
+        })??;
+        settle(cx, reading)?;
+        cx.update_window(reading, |_, window, cx| {
+            window.click("journal-reading-keep", cx)
+        })?;
+        settle(cx, reading)?;
+        ensure!(cx.update(|cx| reader.read(cx).note.read(cx).value().as_ref() == oversized_note));
+        cx.update_window(reading, |_, window, cx| {
+            ensure!(!reader.update(cx, |reader, cx| reader.request_close(window, cx)));
+            Ok::<_, anyhow::Error>(())
+        })??;
+        settle(cx, reading)?;
+        cx.update_window(reading, |_, window, cx| {
+            window.click("journal-reading-discard", cx)
+        })?;
+        cx.run_until_parked();
+        ensure!(cx.update(desktop_state::save_now));
+        ensure!(
+            cx.update(|cx| cx.global::<DesktopState>().journal.days[TODAY].note
+                == "保留另一个阅读窗口的记录")
+        );
+        println!(
+            "PASS: rejected drafts/notes retain native input, block destructive close/date changes, and recover without losing another reader's data"
+        );
+        Ok(())
+    })();
+    for handle in handles {
+        let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+    }
+    result
 }

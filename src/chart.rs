@@ -6,9 +6,11 @@ use gpui_kit::{
     Point, Render, ScrollDelta, TestSupportExt, TextAlign, TextRun, Window, canvas, div, fill,
     point, prelude::*, px, rgb, rgba, size,
 };
-use serde::{Deserialize, Serialize};
 
-use crate::market::{self, Bar, HistoricalSession, IndicativePoint, Period, SessionAxis, Symbol};
+use crate::{
+    market::{self, Bar, IndicativePoint, Period, SessionAxis, SessionPhase, Symbol},
+    market_data::{self, ChartData, ChartSource, HistoricalData},
+};
 
 const BLUE: u32 = 0x397AF6;
 const UP: u32 = 0xF0446D;
@@ -20,22 +22,7 @@ const MA_PERIODS: [usize; 5] = [5, 10, 20, 30, 60];
 // Keep the workspace's light palette; each moving average has a distinct key.
 const MA_COLORS: [u32; 5] = [0x718096, 0xD99935, 0xB260B8, 0x00A89B, BLUE];
 
-/// A viewport is relative to the newest sample and independent for each panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ChartViewport {
-    pub bars_visible: usize,
-    pub offset_from_latest: usize,
-}
-
-impl Default for ChartViewport {
-    fn default() -> Self {
-        Self {
-            bars_visible: 240,
-            offset_from_latest: 0,
-        }
-    }
-}
+pub use crate::panel_snapshot::ChartViewport;
 
 impl ChartViewport {
     fn range(self, len: usize) -> Range<usize> {
@@ -161,6 +148,9 @@ impl IntradayDetails {
 }
 
 pub struct MarketChart {
+    source: ChartSource,
+    axis: SessionAxis,
+    phase: SessionPhase,
     symbol: Symbol,
     period: Period,
     tick: u64,
@@ -184,13 +174,36 @@ impl EventEmitter<ChartEvent> for MarketChart {}
 
 impl MarketChart {
     pub fn new(symbol: Symbol, period: Period, cx: &mut Context<Self>) -> Self {
-        let data = market::bars(symbol, period, 0);
-        let indicators = Indicators::for_market(symbol, period, 0, &data);
+        Self::with_source(symbol, period, market_data::source(cx), cx)
+    }
+
+    fn with_source(
+        symbol: Symbol,
+        period: Period,
+        source: ChartSource,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let projection = source.chart(symbol, period, 0);
+        Self::from_projection(symbol, period, source, projection, false, cx)
+    }
+
+    fn from_projection(
+        symbol: Symbol,
+        period: Period,
+        source: ChartSource,
+        projection: ChartData,
+        historical: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let indicators = Indicators::for_projection(&projection);
         Self {
+            source,
+            axis: projection.axis,
+            phase: projection.phase,
             symbol,
             period,
             tick: 0,
-            data,
+            data: projection.bars,
             indicators,
             viewport: ChartViewport::default(),
             bounds: Rc::new(Cell::new(Bounds::default())),
@@ -200,36 +213,52 @@ impl MarketChart {
             drag: None,
             last_gesture_dragged: false,
             focus: cx.focus_handle(),
-            reference_price: market::quote(symbol, 0).previous_close,
-            historical: false,
-            wall_minute: market::session_state(symbol, 0).wall_minute,
-            indicative: market::auction_indicative(symbol, 0),
+            reference_price: projection.reference_price,
+            historical,
+            wall_minute: projection.wall_minute,
+            indicative: projection.indicative,
         }
     }
 
-    /// A historical inspector owns its frozen session and never follows live ticks.
-    pub fn new_historical(
-        symbol: Symbol,
-        session: &HistoricalSession,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut chart = Self::new(symbol, Period::Intraday, cx);
-        chart.historical = true;
-        chart.set_historical(session, cx);
-        chart
+    pub(crate) fn data_source(&self) -> ChartSource {
+        self.source.clone()
     }
 
-    pub fn set_historical(&mut self, session: &HistoricalSession, cx: &mut Context<Self>) {
+    /// A historical inspector consumes its frozen projection directly. It does
+    /// not request live data while constructing or following later market ticks.
+    pub(crate) fn new_historical(
+        symbol: Symbol,
+        data: &HistoricalData,
+        source: ChartSource,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_projection(
+            symbol,
+            Period::Intraday,
+            source,
+            data.chart_data(),
+            true,
+            cx,
+        )
+    }
+
+    pub(crate) fn set_historical(&mut self, data: &HistoricalData, cx: &mut Context<Self>) {
         self.historical = true;
         self.period = Period::Intraday;
-        self.data = session.bars.clone();
-        self.wall_minute = session.wall_minute;
-        self.indicative = session.indicative.clone();
-        self.indicators = Indicators::new(&self.data);
-        self.reference_price = session.previous_close;
+        self.apply_projection(data.chart_data());
         self.viewport = ChartViewport::default();
         self.clear_inspection();
         cx.notify();
+    }
+
+    fn apply_projection(&mut self, projection: ChartData) {
+        self.indicators = Indicators::for_projection(&projection);
+        self.data = projection.bars;
+        self.wall_minute = projection.wall_minute;
+        self.indicative = projection.indicative;
+        self.reference_price = projection.reference_price;
+        self.axis = projection.axis;
+        self.phase = projection.phase;
     }
 
     pub fn set_market(
@@ -250,11 +279,7 @@ impl MarketChart {
         self.symbol = symbol;
         self.period = period;
         self.tick = tick;
-        self.data = market::bars(symbol, period, tick);
-        self.wall_minute = market::session_state(symbol, tick).wall_minute;
-        self.indicative = market::auction_indicative(symbol, tick);
-        self.indicators = Indicators::for_market(symbol, period, tick, &self.data);
-        self.reference_price = market::quote(symbol, tick).previous_close;
+        self.apply_projection(self.source.chart(symbol, period, tick));
         // Re-find the exact time after a rolling update. Never move to a different date.
         if self.inspection.is_some() && self.selected_index().is_none() {
             self.clear_inspection();
@@ -314,7 +339,7 @@ impl MarketChart {
     fn pointer_index(&self, pointer: Point<Pixels>) -> Option<usize> {
         let geometry = Geometry::new(self.bounds.get());
         if self.period == Period::Intraday {
-            SessionTimeline::new(self.symbol).index(geometry, pointer, &self.data)
+            SessionTimeline::new(self.axis).index(geometry, pointer, &self.data)
         } else {
             let range = self.data_range();
             geometry
@@ -351,7 +376,10 @@ impl MarketChart {
                 return None;
             }
             if self.period == Period::Day {
-                let session = market::historical_session(self.symbol, index, self.tick)?;
+                let session = self
+                    .source
+                    .historical(self.symbol, index, self.tick)?
+                    .session;
                 Some(CandleDetails {
                     date: session.date,
                     weekday: session.weekday.into(),
@@ -435,17 +463,14 @@ impl Render for MarketChart {
                 }
             })
             .unwrap_or_else(|| format!("{}  等待成交", self.symbol.name()));
-        let phase = market::session_at(self.symbol, self.wall_minute)
-            .phase
-            .label()
-            .to_owned();
+        let phase = self.phase.label().to_owned();
         let time_label = market::minute_text(self.wall_minute);
         let latest_time = self
             .data
             .last()
             .map(|bar| bar.time.clone())
             .unwrap_or_else(|| "尚未成交".into());
-        let timeline = intraday.then(|| SessionTimeline::new(self.symbol));
+        let timeline = intraday.then(|| SessionTimeline::new(self.axis));
         let timeline_label = timeline
             .as_ref()
             .map(SessionTimeline::legend)
@@ -463,11 +488,9 @@ impl Render for MarketChart {
                 on_volume: inspection.on_volume,
             })
         });
-        let selected_date = self.selected_index().and_then(|index| {
-            (self.period == Period::Day)
-                .then(|| market::daily_date(index))
-                .flatten()
-        });
+        let selected_date = (self.period == Period::Day)
+            .then(|| self.details.as_ref().map(|details| details.date.clone()))
+            .flatten();
         let details_card = selection
             .zip(self.details.as_ref())
             .map(|(index, details)| inspection_card(details, geometry, index, visible.len()));
@@ -1112,10 +1135,8 @@ struct SessionTimeline {
 }
 
 impl SessionTimeline {
-    fn new(symbol: Symbol) -> Self {
-        Self {
-            axis: market::session_axis(symbol),
-        }
+    fn new(axis: SessionAxis) -> Self {
+        Self { axis }
     }
 
     fn cash_start(&self) -> u16 {
@@ -1333,14 +1354,17 @@ struct Indicators {
 }
 
 impl Indicators {
-    fn for_market(symbol: Symbol, period: Period, tick: u64, bars: &[Bar]) -> Self {
-        if matches!(period, Period::Intraday | Period::Minute1) {
-            let session = market::session_bars(symbol, tick);
-            let tail = session.len().saturating_sub(bars.len())..session.len();
-            Self::new(&session).slice(tail)
-        } else {
-            Self::new(bars)
+    fn for_projection(data: &ChartData) -> Self {
+        if data.indicator_prefix.is_empty() {
+            return Self::new(&data.bars);
         }
+        let complete: Vec<_> = data
+            .indicator_prefix
+            .iter()
+            .chain(&data.bars)
+            .cloned()
+            .collect();
+        Self::new(&complete).slice(data.indicator_prefix.len()..complete.len())
     }
 
     fn new(bars: &[Bar]) -> Self {
@@ -2071,6 +2095,120 @@ fn label(
     );
 }
 
+/// Prove the native chart consumes injected data, and historical views stay
+/// frozen without fetching live mock data during construction or later ticks.
+#[cfg(feature = "test-support")]
+pub(crate) fn smoke_data_source(cx: &mut gpui_kit::HeadlessAppContext) -> anyhow::Result<()> {
+    use crate::{market::HistoricalSession, market_data::ChartDataProvider};
+    use anyhow::ensure;
+    use gpui_kit::AppContext as _;
+    use std::sync::{Arc, Mutex};
+
+    struct Fake(Arc<Mutex<Vec<(bool, u64)>>>);
+    impl ChartDataProvider for Fake {
+        fn chart(&self, _: Symbol, _: Period, tick: u64) -> ChartData {
+            self.0.lock().unwrap().push((false, tick));
+            ChartData {
+                bars: vec![Bar {
+                    time: "2099-01-02".into(),
+                    open: 777.,
+                    high: 900.,
+                    low: 700.,
+                    close: 777. + tick as f64,
+                    volume: 50,
+                }],
+                indicator_prefix: Vec::new(),
+                reference_price: 700.,
+                wall_minute: 600,
+                indicative: Vec::new(),
+                axis: SessionAxis {
+                    start: 500,
+                    end: 900,
+                    lunch: None,
+                    opening_auction: None,
+                    closing_auction: None,
+                },
+                phase: SessionPhase::Morning,
+            }
+        }
+        fn historical(&self, _: Symbol, day_index: usize, tick: u64) -> Option<HistoricalData> {
+            self.0.lock().unwrap().push((true, tick));
+            let bar = Bar {
+                time: "10:00".into(),
+                open: 555.,
+                high: 600.,
+                low: 500.,
+                close: 555. + tick as f64,
+                volume: 30,
+            };
+            Some(HistoricalData {
+                session: HistoricalSession {
+                    day_index,
+                    date: "2099-01-02".into(),
+                    weekday: "星期五",
+                    daily: bar.clone(),
+                    previous_close: 500.,
+                    bars: vec![bar],
+                    indicative: Vec::new(),
+                    wall_minute: 600,
+                    turnover: 100.,
+                    turnover_rate: 1.,
+                    previous_day: None,
+                    next_day: None,
+                },
+                axis: SessionAxis {
+                    start: 500,
+                    end: 900,
+                    lunch: None,
+                    opening_auction: None,
+                    closing_auction: None,
+                },
+                phase: SessionPhase::Morning,
+            })
+        }
+    }
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let source = ChartSource::new(Fake(queries.clone()));
+    cx.update(|cx| {
+        let chart =
+            cx.new(|cx| MarketChart::with_source(Symbol::Aapl, Period::Day, source.clone(), cx));
+        ensure!(chart.read(cx).data[0].close == 777.);
+        ensure!(chart.read(cx).axis.start == 500);
+        chart.update(cx, |chart, cx| {
+            chart.set_market(Symbol::Aapl, Period::Day, 9, cx)
+        });
+        ensure!(chart.read(cx).data[0].close == 786.);
+        chart.update(cx, |chart, _| {
+            chart.inspection = Some(Inspection {
+                time: chart.data[0].time.clone(),
+                y_fraction: 0.5,
+                on_volume: false,
+            });
+            chart.refresh_details();
+        });
+        ensure!(chart.read(cx).details.as_ref().unwrap().date == "2099-01-02");
+        chart.update(cx, |chart, _| chart.clear_inspection());
+        let frozen = source.historical(Symbol::Aapl, 0, 9).unwrap();
+        let history =
+            cx.new(|cx| MarketChart::new_historical(Symbol::Aapl, &frozen, source.clone(), cx));
+        chart.update(cx, |chart, cx| {
+            chart.set_market(Symbol::Aapl, Period::Day, 40, cx)
+        });
+        history.update(cx, |chart, cx| {
+            chart.set_market(Symbol::Aapl, Period::Intraday, 100, cx)
+        });
+        ensure!(
+            history.read(cx).data == frozen.session.bars,
+            "History followed the live feed"
+        );
+        ensure!(
+            *queries.lock().unwrap() == [(false, 0), (false, 9), (true, 9), (true, 9), (false, 40)],
+            "A frozen chart queried live data"
+        );
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2119,7 +2257,7 @@ mod tests {
 
     #[test]
     fn intraday_card_side_uses_the_fixed_clock_instead_of_available_bar_count() {
-        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let timeline = super::SessionTimeline::new(market::session_axis(Symbol::Yinli));
         let geometry = super::Geometry::new(gpui_kit::Bounds::new(
             gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(0.)),
             gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(600.)),
@@ -2146,7 +2284,7 @@ mod tests {
 
     #[test]
     fn fixed_session_coordinates_keep_prices_volumes_and_future_minutes_in_place() {
-        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let timeline = super::SessionTimeline::new(market::session_axis(Symbol::Yinli));
         let geometry = super::Geometry::new(gpui_kit::Bounds::new(
             gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)),
             gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(600.)),
@@ -2174,7 +2312,7 @@ mod tests {
 
     #[test]
     fn paused_and_indicative_regions_never_snap_to_trades_even_on_ultrawide_charts() {
-        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let timeline = super::SessionTimeline::new(market::session_axis(Symbol::Yinli));
         let all = market::bars(Symbol::Yinli, Period::Intraday, 300);
         for width in [240., 1000., 4000., 8000.] {
             let geometry = super::Geometry::new(gpui_kit::Bounds::new(
@@ -2205,7 +2343,7 @@ mod tests {
 
     #[test]
     fn the_opening_match_has_a_pixel_hit_target_without_making_the_wait_gap_a_trade() {
-        let timeline = super::SessionTimeline::new(Symbol::Yinli);
+        let timeline = super::SessionTimeline::new(market::session_axis(Symbol::Yinli));
         let bars = market::bars(Symbol::Yinli, Period::Intraday, 0);
         let geometry = super::Geometry::new(gpui_kit::Bounds::new(
             gpui_kit::point(gpui_kit::px(0.4), gpui_kit::px(0.)),
@@ -2321,7 +2459,8 @@ mod tests {
     fn minute_candle_average_keeps_session_prefix_when_history_rolls() {
         let bars = market::bars(Symbol::Aapl, Period::Minute1, 70);
         let session = market::session_bars(Symbol::Aapl, 70);
-        let indicators = Indicators::for_market(Symbol::Aapl, Period::Minute1, 70, &bars);
+        let projection = crate::market_data::mock_source().chart(Symbol::Aapl, Period::Minute1, 70);
+        let indicators = Indicators::for_projection(&projection);
         let session_means = session_averages(&session);
         let start = session.len() - bars.len();
         assert!(start > 0);

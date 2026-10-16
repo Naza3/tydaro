@@ -1,20 +1,22 @@
 //! Experimental native foundations. The three variants share semantic colors;
 //! structure and interaction, rather than a palette swap, distinguish them.
-use gpui_kit::{
-    component::button::{Button, ButtonVariants},
-    prelude::*,
-    *,
+use gpui_kit::{component::button::Button, *};
+use tydaro_ui::{
+    action::{self as buttons, ActionSize},
+    surface::{self as surfaces, SurfaceStyle},
+    tokens::COOL_LIGHT,
 };
 
-pub const BG: u32 = 0xf3f5f7;
-pub const SURFACE: u32 = 0xffffff;
-pub const INK: u32 = 0x263549;
-pub const MUTED: u32 = 0x697789;
-pub const LINE: u32 = 0xdce3ea;
-pub const ACCENT: u32 = 0x008987;
-pub const SOFT: u32 = 0xe9f5f3;
-pub const UP: u32 = 0xc73655;
-pub const DOWN: u32 = 0x007d78;
+// Experiment metadata stays here; reusable primitives do not know A/B/C.
+pub const BG: u32 = COOL_LIGHT.background;
+pub const SURFACE: u32 = COOL_LIGHT.surface;
+pub const INK: u32 = COOL_LIGHT.text;
+pub const MUTED: u32 = COOL_LIGHT.muted;
+pub const LINE: u32 = COOL_LIGHT.border;
+pub const ACCENT: u32 = COOL_LIGHT.accent;
+pub const SOFT: u32 = COOL_LIGHT.subtle;
+pub const UP: u32 = COOL_LIGHT.error;
+pub const DOWN: u32 = COOL_LIGHT.success;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant {
@@ -189,34 +191,28 @@ impl Family {
 }
 
 pub fn hint(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(12.))
-        .text_color(rgb(MUTED))
-        .child(text.into())
+    tydaro_ui::text::hint(text, COOL_LIGHT)
 }
 pub fn caption(text: impl Into<SharedString>) -> Div {
-    div()
-        .text_size(px(13.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(text.into())
+    tydaro_ui::text::caption(text)
 }
 pub fn surface(variant: Variant) -> Div {
-    let base = div().min_w_0().bg(rgb(SURFACE)).text_color(rgb(INK));
-    match variant {
-        Variant::Precision => base.border_1().border_color(rgb(LINE)).rounded_sm(),
-        Variant::Calm => base.rounded_lg(),
-        Variant::Context => base.border_l_2().border_color(rgb(LINE)),
-    }
+    let style = match variant {
+        Variant::Precision => SurfaceStyle::Compact,
+        Variant::Calm => SurfaceStyle::Plain,
+        Variant::Context => SurfaceStyle::LeadingRule,
+    };
+    surfaces::surface(COOL_LIGHT, style)
 }
 pub fn action(
     id: impl Into<ElementId>,
     variant: Variant,
     label: impl Into<SharedString>,
 ) -> Button {
-    let button = Button::new(id).label(label).text_size(px(13.));
-    match variant {
-        Variant::Precision => button.h(px(30.)).rounded_sm().px_2(),
-        Variant::Calm => button.h(px(38.)).rounded_lg().px_4(),
-        Variant::Context => button.ghost().h(px(34.)).rounded_md().px_3(),
-    }
+    let size = match variant {
+        Variant::Precision => ActionSize::Compact,
+        Variant::Calm => ActionSize::Comfortable,
+        Variant::Context => ActionSize::Inline,
+    };
+    buttons::action(id, label, size)
 }

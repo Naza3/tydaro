@@ -2,7 +2,7 @@
 //! editing imported rows never silently recalculates the independent theme examples.
 use gpui_kit::{
     component::{
-        Disableable, Sizable,
+        Disableable,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         menu::{DropdownMenu, PopupMenuItem},
@@ -10,10 +10,10 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use serde::{Deserialize, Serialize};
+use tydaro_core::research::ResearchRow;
 
 use crate::{
-    desktop_state::{self, DesktopEvent, DesktopState, PageId, SourceContext},
+    desktop_state::{self, Command, DesktopEvent, DesktopState, PageId, SourceContext},
     desktop_ui::{BG, LINE, MUTED, TEAL, heading, muted, page, panel as base_panel, tag},
     market::Symbol,
 };
@@ -47,23 +47,6 @@ const ORDERS: [[usize; 4]; 6] = [
     [3, 2, 0, 1],
     [1, 2, 3, 0],
 ];
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct ResearchRow {
-    id: String,
-    date: String,
-    sector: String,
-    symbol: Symbol,
-    name: String,
-    board: String,
-    reason: String,
-    source: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ResearchSaved {
-    rows: Vec<ResearchRow>,
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Field {
@@ -243,11 +226,7 @@ fn source(rows: &[ResearchRow], origin: PageId) -> SourceContext {
     }
 }
 fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    Button::new(id)
-        .label(label)
-        .small()
-        .flex_shrink_0()
-        .text_size(px(12.))
+    tydaro_ui::action::action(id, label, tydaro_ui::action::ActionSize::Small).flex_shrink_0()
 }
 fn panel() -> Div {
     // Pages scroll as a whole. Intrinsic cards must retain their content height
@@ -326,32 +305,34 @@ impl LimitPage {
                 }
                 cx.notify();
             }),
-            cx.subscribe(&edit_name, |_, _, _: &InputEvent, cx| cx.notify()),
-            cx.subscribe(&edit_board, |_, _, _: &InputEvent, cx| cx.notify()),
-        ];
-        let saved = cx.global::<DesktopState>().research.clone();
-        let (rows, load_error) = if saved.is_null() {
-            (seed_rows(), None)
-        } else {
-            match serde_json::from_value::<ResearchSaved>(saved) {
-                Ok(saved)
-                    if saved.rows.len() <= 100_000
-                        && saved.rows.iter().all(|row| {
-                            valid_date(&row.date)
-                                && !row.id.is_empty()
-                                && !row.sector.trim().is_empty()
-                        }) =>
-                {
-                    (saved.rows, None)
+            cx.subscribe(&edit_name, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_pending_input(cx);
                 }
-                _ => (
-                    Vec::new(),
-                    Some(
-                        "研究资料格式无法读取，原值已保留；本页暂停修改，请检查本地工作台文档。"
-                            .to_owned(),
-                    ),
-                ),
-            }
+                cx.notify();
+            }),
+            cx.subscribe(&edit_board, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_pending_input(cx);
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&edit_reason, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_pending_input(cx);
+                }
+                cx.notify();
+            }),
+        ];
+        let (rows, load_error) = match cx.global::<DesktopState>().research_document() {
+            Ok(None) => (seed_rows(), None),
+            Ok(Some(document)) => (document.rows.clone(), None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "研究资料格式无法读取，原值已保留；本页暂停修改：{error}"
+                )),
+            ),
         };
         let selected_date = rows
             .first()
@@ -379,16 +360,75 @@ impl LimitPage {
             _subscriptions: subscriptions,
         }
     }
-    fn persist(&self, cx: &mut Context<Self>) {
-        if self.load_error.is_some() {
-            return;
+    fn pending_key(cx: &Context<Self>) -> String {
+        format!("limit-editor-{:?}", cx.entity_id())
+    }
+    fn report_pending(cx: &mut Context<Self>, error: Option<String>) {
+        let key = Self::pending_key(cx);
+        desktop_state::report_pending_input(cx, key, error);
+    }
+    fn refresh_pending_input(&self, cx: &mut Context<Self>) {
+        let pending = match &self.editing {
+            Some(LimitEdit::Row(id)) => self.rows.iter().find(|r| &r.id == id).is_none_or(|row| {
+                self.edit_name.read(cx).value().as_str() != row.name
+                    || self.edit_board.read(cx).value().as_str() != row.board
+                    || self.edit_reason.read(cx).value().as_str() != row.reason
+            }),
+            _ => false,
+        };
+        Self::report_pending(
+            cx,
+            pending.then(|| "涨停资料编辑尚未确认，请保存或取消。".into()),
+        );
+    }
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.error = None;
+        Self::report_pending(cx, None);
+        cx.notify();
+    }
+    /// Commit a candidate copy; rejection never replaces the displayed source or editor inputs.
+    fn persist(&mut self, rows: Vec<ResearchRow>, cx: &mut Context<Self>) -> bool {
+        if let Some(error) = self.load_error.clone() {
+            self.error = Some(error.clone());
+            cx.emit(DesktopEvent::Notice(error));
+            return false;
         }
-        if let Ok(value) = serde_json::to_value(ResearchSaved {
-            rows: self.rows.clone(),
-        }) {
-            desktop_state::update(cx, |state| state.research = value);
+        match desktop_state::dispatch(cx, Command::ReplaceResearchRows(rows.clone())) {
+            Ok(_) => {
+                self.rows = rows;
+                true
+            }
+            Err(error) => {
+                let message = format!("研究修改未应用：{error}");
+                self.error = Some(message.clone());
+                if matches!(self.editing, Some(LimitEdit::Row(_))) {
+                    Self::report_pending(cx, Some(message.clone()));
+                }
+                cx.emit(DesktopEvent::Notice(message));
+                cx.notify();
+                false
+            }
         }
     }
+    fn undo_delete(&mut self, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
+        let mut rows = self.rows.clone();
+        restore_rows(&mut rows, self.deleted.clone());
+        if self.persist(rows, cx) {
+            if let Some(row) = self.deleted.first() {
+                self.selected_date = row.date.clone();
+                self.selected_sector = row.sector.clone();
+            }
+            self.deleted.clear();
+            self.error = None;
+            cx.emit(DesktopEvent::Notice("已恢复整日资料".into()));
+        }
+        cx.notify();
+    }
+
     fn dates(&self) -> Vec<String> {
         let mut dates: Vec<_> = self.rows.iter().map(|r| r.date.clone()).collect();
         dates.sort();
@@ -465,50 +505,66 @@ impl LimitPage {
         if self.load_error.is_some() {
             return;
         }
+        let mut rows = self.rows.clone();
+        let mut selection = None;
+        let mut deleted = None;
+        let mut imported = false;
         match self.editing.as_ref() {
             Some(LimitEdit::Import) => {
-                if !self.rows.iter().any(|r| r.date == "2026-10-15") {
-                    let mut rows = sample_rows("2026-10-15", 0);
-                    rows.append(&mut self.rows);
-                    self.rows = rows;
-                    self.selected_date = "2026-10-15".into();
-                    self.selected_sector = SECTORS[0].into();
-                    self.search_tab = false;
+                if !rows.iter().any(|r| r.date == "2026-10-15") {
+                    let mut incoming = sample_rows("2026-10-15", 0);
+                    incoming.append(&mut rows);
+                    rows = incoming;
+                    selection = Some(("2026-10-15".to_owned(), SECTORS[0].to_owned()));
+                    imported = true;
                 }
             }
             Some(LimitEdit::Delete(date)) => {
-                self.deleted = self
-                    .rows
-                    .iter()
-                    .filter(|r| &r.date == date)
-                    .cloned()
-                    .collect();
-                self.rows.retain(|r| &r.date != date);
-                if let Some(row) = self.rows.first() {
-                    self.selected_date = row.date.clone();
-                    self.selected_sector = row.sector.clone();
+                deleted = Some(rows.iter().filter(|r| &r.date == date).cloned().collect());
+                rows.retain(|r| &r.date != date);
+                if let Some(row) = rows.first() {
+                    selection = Some((row.date.clone(), row.sector.clone()));
                 }
             }
             Some(LimitEdit::Row(id)) => {
                 let name = self.edit_name.read(cx).value().trim().to_owned();
                 let board = self.edit_board.read(cx).value().trim().to_owned();
                 if name.is_empty() || board.is_empty() {
-                    self.error = Some("请填写名称和连板字段；空白原因可以保留。".into());
+                    let message = "请填写名称和连板字段；空白原因可以保留。".to_owned();
+                    self.error = Some(message.clone());
+                    Self::report_pending(cx, Some(message));
                     cx.notify();
                     return;
                 }
-                let reason = self.edit_reason.read(cx).value().to_string();
-                if let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) {
-                    row.name = name;
-                    row.board = board;
-                    row.reason = reason;
-                }
+                let Some(row) = rows.iter_mut().find(|r| &r.id == id) else {
+                    let message = "原研究资料已不存在，请保留输入后取消编辑。".to_owned();
+                    self.error = Some(message.clone());
+                    Self::report_pending(cx, Some(message));
+                    cx.notify();
+                    return;
+                };
+                row.name = name;
+                row.board = board;
+                row.reason = self.edit_reason.read(cx).value().to_string();
             }
             None => return,
         }
-        self.persist(cx);
+        if !self.persist(rows, cx) {
+            return;
+        }
+        if let Some((date, sector)) = selection {
+            self.selected_date = date;
+            self.selected_sector = sector;
+        }
+        if let Some(deleted) = deleted {
+            self.deleted = deleted;
+        }
+        if imported {
+            self.search_tab = false;
+        }
         self.editing = None;
         self.error = None;
+        Self::report_pending(cx, None);
         cx.emit(DesktopEvent::Notice(
             "涨停资料已修改；题材页独立示例不会自动重算".into(),
         ));
@@ -584,9 +640,7 @@ impl LimitPage {
                     .gap_2()
                     .child(button("limit-edit-cancel", "取消").on_click(cx.listener(
                         |this, _, _, cx| {
-                            this.editing = None;
-                            this.error = None;
-                            cx.notify();
+                            this.cancel_edit(cx);
                         },
                     )))
                     .child(
@@ -1058,18 +1112,9 @@ impl Render for LimitPage {
                         .gap_3()
                         .child(muted(format!("已删除 {} 条资料", self.deleted.len())))
                         .child(
-                            button("limit-undo-delete", "撤销整日删除").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    let restored = std::mem::take(&mut this.deleted);
-                                    if let Some(row) = restored.first() {
-                                        this.selected_date = row.date.clone();
-                                        this.selected_sector = row.sector.clone();
-                                    }
-                                    restore_rows(&mut this.rows, restored);
-                                    this.persist(cx);
-                                    cx.notify();
-                                },
-                            )),
+                            button("limit-undo-delete", "撤销整日删除")
+                                .disabled(self.editing.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| this.undo_delete(cx))),
                         ),
                 )
             })
@@ -1910,9 +1955,127 @@ impl Render for ThemePage {
                 }))))
             .when(!valid_date(&from) || !valid_date(&requested) || from > requested, |view| view.child(div().flex_shrink_0().text_color(rgb(0xc92f57)).child("请输入有效日期 YYYY-MM-DD，起始日不能晚于截止日。")))
             .when_some(self.incoming.as_ref(), |view, incoming| view.child(div().flex_shrink_0().px_3().py_2().rounded(px(4.)).bg(rgb(0xeaf7f4)).text_size(px(12.)).text_color(rgb(TEAL)).child(format!("来自涨停资料：{} · {} · {}", incoming.date, incoming.sector, incoming.reason))))
+            .child(panel().p_3().flex_shrink_0().flex().flex_wrap().items_center().gap_3()
+                .child(div().flex_1().min_w(px(300.)).child(div().font_weight(FontWeight::SEMIBOLD).child("模拟候选演练"))
+                    .child(muted("固定样例：10 月 14 日首板东方财富，确认示例题材强势后，生成 10 月 15 日观察草稿。独立于上方资料。")))
+                .child(button("theme-demo-candidate", "确认示例强势 · 生成候选草稿").on_click(cx.listener(|_,_,_,cx| {
+                    match tydaro_core::research::demonstration_candidates() {
+                        Ok(set)=>cx.emit(DesktopEvent::CandidateDraft(set)),
+                        Err(error)=>cx.emit(DesktopEvent::Notice(format!("模拟候选未生成：{error}"))),
+                    }
+                }))))
             .child(content)
             .child(muted("四板对象、梯队与关键词是固定研究样例；日期用于筛选和解释，不代表已实现旧系统计算算法。").flex_shrink_0())
     }
+}
+
+/// Regression using production native inputs and commands; called by architecture smoke.
+#[cfg(feature = "test-support")]
+pub(crate) fn verify_rejected_edits(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+) -> anyhow::Result<()> {
+    use anyhow::ensure;
+    cx.update_window(handle, |_, window, cx| {
+        let page = cx.new(|cx| LimitPage::new(window, cx));
+        page.update(cx, |page, cx| -> anyhow::Result<()> {
+            let original = page.rows.clone();
+            let row = page
+                .rows
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Research regression needs a fixture row"))?
+                .clone();
+            let id = row.id.clone();
+            page.begin_edit(row, window, cx);
+            let oversized = "x".repeat(64 * 1024 + 1);
+            page.edit_reason.update(cx, |input, cx| {
+                input.set_value(oversized.clone(), window, cx)
+            });
+            let before = cx.global::<DesktopState>().research.clone();
+            page.confirm_edit(cx);
+            ensure!(
+                page.editing.is_some() && page.error.is_some(),
+                "Rejected research save closed the editor or cleared its error"
+            );
+            ensure!(
+                page.edit_reason.read(cx).value().as_str() == oversized,
+                "Rejected research save discarded original input"
+            );
+            ensure!(
+                cx.global::<DesktopState>().research == before,
+                "Rejected research save changed domain data"
+            );
+            ensure!(
+                serde_json::to_value(&page.rows)? == serde_json::to_value(&original)?,
+                "Rejected research save replaced displayed rows"
+            );
+            ensure!(
+                !desktop_state::save_now(cx),
+                "Unaccepted research text did not block close"
+            );
+            page.edit_reason
+                .update(cx, |input, cx| input.set_value("修正后原因", window, cx));
+            page.confirm_edit(cx);
+            ensure!(
+                page.editing.is_none() && page.error.is_none(),
+                "Corrected research save did not finish"
+            );
+            ensure!(
+                page.rows.iter().find(|r| r.id == id).unwrap().reason == "修正后原因",
+                "Corrected research input was not committed"
+            );
+            ensure!(
+                desktop_state::save_now(cx),
+                "Successful research save left a stale close guard"
+            );
+
+            let mut deleted = original[0].clone();
+            deleted.id = "regression-undo-row".into();
+            deleted.date = "2026-10-15".into();
+            deleted.reason = oversized.clone();
+            page.deleted = vec![deleted];
+            let stable = serde_json::to_value(&page.rows)?;
+            page.undo_delete(cx);
+            ensure!(
+                page.deleted.len() == 1 && page.deleted[0].reason == oversized,
+                "Rejected undo consumed the recovery cache"
+            );
+            ensure!(
+                serde_json::to_value(&page.rows)? == stable && page.error.is_some(),
+                "Rejected undo mutated rows or hid failure"
+            );
+            page.deleted[0].reason = "可重试恢复".into();
+            page.undo_delete(cx);
+            ensure!(
+                page.deleted.is_empty() && page.rows.iter().any(|r| r.id == "regression-undo-row"),
+                "Successful retry failed to consume undo cache"
+            );
+
+            let row = page.rows.iter().find(|r| r.id == id).unwrap().clone();
+            page.begin_edit(row, window, cx);
+            page.edit_reason
+                .update(cx, |input, cx| input.set_value(oversized, window, cx));
+            page.confirm_edit(cx);
+            ensure!(
+                !desktop_state::save_now(cx),
+                "Rejected second edit did not retain close guard"
+            );
+            page.cancel_edit(cx);
+            ensure!(
+                desktop_state::save_now(cx),
+                "Explicit research cancel left close guard"
+            );
+            ensure!(
+                page.persist(original, cx),
+                "Could not restore regression research rows"
+            );
+            Ok(())
+        })
+    })??;
+    println!(
+        "PASS: oversized research edits retain input/errors; correction and cancellation work; failed undo preserves its cache"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

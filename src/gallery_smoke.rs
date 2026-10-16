@@ -86,7 +86,7 @@ pub fn run(path: &str) -> Result<()> {
         gpui_kit::platform::current_headless_renderer,
     );
     cx.update(|cx| {
-        crate::workspace::init(cx, false);
+        crate::app::init(cx, false);
         // Match GPUI Kit's dialog tests: pointer targets must have settled
         // bounds rather than the first frame of a 250 ms entrance animation.
         cx.set_reduce_motion(true);

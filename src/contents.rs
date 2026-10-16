@@ -11,10 +11,11 @@ use gpui_kit::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    chart::{ChartEvent, ChartViewport, MarketChart},
+    chart::{ChartEvent, MarketChart},
     history::{self, HistoryWindow},
     market::{self, Period, Symbol},
     model::PanelKind,
+    panel_snapshot::{ContentSnapshot, OrderFilterSnapshot, Side},
     stock_import::{self, ImportError, ImportPreview},
 };
 
@@ -33,11 +34,6 @@ pub enum ContentEvent {
     ListChanged,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
-enum Side {
-    Buy,
-    Sell,
-}
 impl Side {
     fn label(self) -> &'static str {
         if self == Self::Buy {
@@ -94,6 +90,15 @@ struct DemoBroker {
     next_id: u64,
 }
 impl Global for DemoBroker {}
+
+/// The composition root owns process services. Constructing a view must not
+/// create or reset a shared account as a side effect.
+pub(crate) fn init_broker(cx: &mut App) {
+    if !cx.has_global::<DemoBroker>() {
+        cx.set_global(DemoBroker::default());
+    }
+}
+
 impl Default for DemoBroker {
     fn default() -> Self {
         Self {
@@ -239,17 +244,6 @@ impl DemoBroker {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-struct OrderFilterSnapshot {
-    enabled: bool,
-    min_amount: String,
-    max_amount: String,
-    min_quantity: String,
-    max_quantity: String,
-    direction: u8,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OrderRange {
     min_amount: f64,
@@ -292,40 +286,6 @@ impl OrderRange {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct ContentSnapshot {
-    query: String,
-    price: String,
-    quantity: String,
-    side: Side,
-    sort: u8,
-    chart: ChartViewport,
-    #[serde(default)]
-    order_filter: OrderFilterSnapshot,
-    #[serde(default)]
-    large_trades_only: bool,
-    #[serde(default)]
-    book_queue: bool,
-    #[serde(default = "default_members", deserialize_with = "read_members")]
-    members: Vec<Symbol>,
-}
-
-fn default_members() -> Vec<Symbol> {
-    Symbol::LEGACY_DEFAULTS.to_vec()
-}
-
-fn read_members<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<Symbol>, D::Error> {
-    let mut unique = Vec::new();
-    for symbol in Vec::<Symbol>::deserialize(deserializer)? {
-        if !unique.contains(&symbol) {
-            unique.push(symbol);
-        }
-    }
-    Ok(unique)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StockListPage {
     List,
@@ -333,33 +293,67 @@ enum StockListPage {
     Import,
 }
 
+/// A panel owns only the native controls needed by its kind. These entities
+/// remain window-local and are rebuilt from the durable snapshot on migration.
+enum PanelView {
+    Watchlist {
+        query: Entity<InputState>,
+        catalog_query: Entity<InputState>,
+        import_text: Entity<TextareaState>,
+    },
+    Chart(Entity<MarketChart>),
+    OrderEntry {
+        price: Entity<InputState>,
+        quantity: Entity<InputState>,
+    },
+    OrderDetails {
+        min_amount: Entity<InputState>,
+        max_amount: Entity<InputState>,
+        min_quantity: Entity<InputState>,
+        max_quantity: Entity<InputState>,
+    },
+    ReadOnly,
+}
+
+impl PanelView {
+    fn inputs(&self) -> Vec<&Entity<InputState>> {
+        match self {
+            Self::Watchlist {
+                query,
+                catalog_query,
+                ..
+            } => vec![query, catalog_query],
+            Self::OrderEntry { price, quantity } => vec![price, quantity],
+            Self::OrderDetails {
+                min_amount,
+                max_amount,
+                min_quantity,
+                max_quantity,
+            } => vec![min_amount, max_amount, min_quantity, max_quantity],
+            Self::Chart(_) | Self::ReadOnly => Vec::new(),
+        }
+    }
+}
+
 pub struct PanelContent {
+    view: PanelView,
+    legacy_content: ContentSnapshot,
     kind: PanelKind,
     symbol: Symbol,
     period: Period,
     tick: u64,
-    chart: Entity<MarketChart>,
     history: Option<HistoryWindow>,
-    query: Entity<InputState>,
-    catalog_query: Entity<InputState>,
     stock_list_page: StockListPage,
-    import_text: Entity<TextareaState>,
     import_preview: Result<ImportPreview, ImportError>,
     import_message: Option<(String, bool)>,
     import_loading: bool,
     import_revision: u64,
     import_request: u64,
     members: Vec<Symbol>,
-    price: Entity<InputState>,
-    quantity: Entity<InputState>,
     side: Side,
     sort: u8,
     filter_enabled: bool,
     filter_direction: u8,
-    min_amount: Entity<InputState>,
-    max_amount: Entity<InputState>,
-    min_quantity: Entity<InputState>,
-    max_quantity: Entity<InputState>,
     large_trades_only: bool,
     book_queue: bool,
     feedback: Option<(String, bool)>,
@@ -377,108 +371,104 @@ impl PanelContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        if !cx.has_global::<DemoBroker>() {
-            cx.set_global(DemoBroker::default());
-        }
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("筛选列表 / 代码名称"));
-        let catalog_query =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索股票目录 / 代码名称"));
-        let import_text = cx.new(|cx| {
-            TextareaState::new(window, cx).auto_grow(4, 4).placeholder(
-                "粘贴股票代码或名称，每行一支或用逗号分隔\nAAPL 苹果\n00700 腾讯控股\nMSFT, TSLA",
-            )
-        });
-        let price = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(format!("{:.2}", market::quote(symbol, 0).price))
-        });
-        let quantity = cx.new(|cx| InputState::new(window, cx).default_value("100"));
-        let min_amount = cx.new(|cx| InputState::new(window, cx).placeholder("最低"));
-        let max_amount = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
-        let min_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最低"));
-        let max_quantity = cx.new(|cx| InputState::new(window, cx).placeholder("最高"));
-        let mut subscriptions: Vec<_> = [
-            &query,
-            &catalog_query,
-            &price,
-            &quantity,
-            &min_amount,
-            &max_amount,
-            &min_quantity,
-            &max_quantity,
-        ]
-        .into_iter()
-        .map(|input| {
-            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
+        let initial_price = format!("{:.2}", market::quote(symbol, 0).price);
+        let view = match kind {
+            PanelKind::Watchlist => PanelView::Watchlist {
+                query: cx.new(|cx| InputState::new(window, cx).placeholder("筛选列表 / 代码名称")),
+                catalog_query: cx.new(|cx| InputState::new(window, cx).placeholder("搜索股票目录 / 代码名称")),
+                import_text: cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 4).placeholder(
+                    "粘贴股票代码或名称，每行一支或用逗号分隔\nAAPL 苹果\n00700 腾讯控股\nMSFT, TSLA")),
+            },
+            PanelKind::Chart => PanelView::Chart(cx.new(|cx| MarketChart::new(symbol, period, cx))),
+            PanelKind::OrderEntry => PanelView::OrderEntry {
+                price: cx.new(|cx| InputState::new(window, cx).default_value(initial_price.clone())),
+                quantity: cx.new(|cx| InputState::new(window, cx).default_value("100")),
+            },
+            PanelKind::OrderDetails => PanelView::OrderDetails {
+                min_amount: cx.new(|cx| InputState::new(window, cx).placeholder("最低")),
+                max_amount: cx.new(|cx| InputState::new(window, cx).placeholder("最高")),
+                min_quantity: cx.new(|cx| InputState::new(window, cx).placeholder("最低")),
+                max_quantity: cx.new(|cx| InputState::new(window, cx).placeholder("最高")),
+            },
+            _ => PanelView::ReadOnly,
+        };
+        let mut subscriptions: Vec<_> = view
+            .inputs()
+            .into_iter()
+            .map(|input| {
+                cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
             })
-        })
-        .collect();
-        subscriptions.push(
-            cx.subscribe(&import_text, |this, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.import_revision = this.import_revision.wrapping_add(1);
-                    this.import_message = None;
-                    this.refresh_import(cx);
+            .collect();
+        if let PanelView::Watchlist { import_text, .. } = &view {
+            subscriptions.push(
+                cx.subscribe(import_text, |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.import_revision = this.import_revision.wrapping_add(1);
+                        this.import_message = None;
+                        this.refresh_import(cx);
+                        cx.notify();
+                    }
+                }),
+            );
+        }
+        if let PanelView::Chart(chart) = &view {
+            subscriptions.push(
+                cx.subscribe_in(chart, window, |this, _, event, window, cx| {
+                    let ChartEvent::InspectDay {
+                        symbol,
+                        day_index,
+                        tick,
+                    } = *event;
+                    let source = this.chart_entity().read(cx).data_source();
+                    match history::open(
+                        this.history.as_ref(),
+                        symbol,
+                        day_index,
+                        tick,
+                        source,
+                        window,
+                        cx,
+                    ) {
+                        Ok(view) => {
+                            this.history = Some(view);
+                            this.feedback = None;
+                        }
+                        Err(error) => {
+                            this.feedback = Some((error.to_string(), true));
+                        }
+                    }
                     cx.notify();
+                }),
+            );
+            subscriptions.push(cx.on_release(|this, cx| {
+                if let Some(history) = this.history.take() {
+                    history.close(cx);
                 }
-            }),
-        );
-        let chart = cx.new(|cx| MarketChart::new(symbol, period, cx));
-        subscriptions.push(
-            cx.subscribe_in(&chart, window, |this, _, event, window, cx| {
-                let ChartEvent::InspectDay {
-                    symbol,
-                    day_index,
-                    tick,
-                } = *event;
-                match history::open(this.history.as_ref(), symbol, day_index, tick, window, cx) {
-                    Ok(view) => {
-                        this.history = Some(view);
-                        this.feedback = None;
-                        cx.notify();
-                    }
-                    Err(error) => {
-                        this.feedback = Some((error.to_string(), true));
-                        cx.notify();
-                    }
-                }
-            }),
-        );
-        subscriptions.push(cx.on_release(|this, cx| {
-            if let Some(history) = this.history.take() {
-                history.close(cx);
-            }
-        }));
+            }));
+        }
         Self {
+            view,
+            legacy_content: ContentSnapshot::new(initial_price),
             kind,
             symbol,
             period,
             tick: 0,
-            chart,
             history: None,
-            query,
-            catalog_query,
             stock_list_page: StockListPage::List,
-            import_text,
             import_preview: stock_import::parse("", &[]),
             import_message: None,
             import_loading: false,
             import_revision: 0,
             import_request: 0,
             members: Symbol::ALL.to_vec(),
-            price,
-            quantity,
             side: Side::Buy,
             sort: 0,
             filter_enabled: false,
             filter_direction: 0,
-            min_amount,
-            max_amount,
-            min_quantity,
-            max_quantity,
             large_trades_only: false,
             book_queue: false,
             feedback: None,
@@ -496,66 +486,159 @@ impl PanelContent {
         cx: &mut Context<Self>,
     ) {
         if symbol != self.symbol {
-            self.pending_price = Some(market::quote(symbol, tick).price);
+            if matches!(self.view, PanelView::OrderEntry { .. }) {
+                self.pending_price = Some(market::quote(symbol, tick).price);
+            }
             self.feedback = None;
         }
         self.symbol = symbol;
         self.period = period;
         self.tick = tick;
-        self.chart
-            .update(cx, |chart, cx| chart.set_market(symbol, period, tick, cx));
+        if let PanelView::Chart(chart) = &self.view {
+            chart.update(cx, |chart, cx| chart.set_market(symbol, period, tick, cx));
+        }
         cx.notify();
     }
 
     pub fn snapshot(&self, cx: &App) -> serde_json::Value {
-        serde_json::to_value(ContentSnapshot {
-            query: self.query.read(cx).value().to_string(),
-            price: self.price.read(cx).value().to_string(),
-            quantity: self.quantity.read(cx).value().to_string(),
-            side: self.side,
-            sort: self.sort,
-            chart: self.chart.read(cx).viewport(),
-            order_filter: self.filter_snapshot(cx),
-            large_trades_only: self.large_trades_only,
-            book_queue: self.book_queue,
-            members: self.members.clone(),
-        })
-        .unwrap_or(serde_json::Value::Null)
+        let mut saved = self.legacy_content.clone();
+        match &self.view {
+            PanelView::Watchlist { query, .. } => saved.query = query.read(cx).value().to_string(),
+            PanelView::Chart(chart) => saved.chart = chart.read(cx).viewport(),
+            PanelView::OrderEntry { price, quantity } => {
+                saved.price = price.read(cx).value().to_string();
+                saved.quantity = quantity.read(cx).value().to_string();
+            }
+            PanelView::OrderDetails { .. } => saved.order_filter = self.filter_snapshot(cx),
+            PanelView::ReadOnly => {}
+        }
+        saved.side = self.side;
+        saved.sort = self.sort;
+        saved.large_trades_only = self.large_trades_only;
+        saved.book_queue = self.book_queue;
+        saved.members = self.members.clone();
+        serde_json::to_value(saved).expect("panel snapshots contain only serializable values")
     }
 
+    /// Decode and validate before mutating any live entity. Invalid known
+    /// content is reported to the workspace, never silently replaced by defaults.
     pub fn restore(
         &mut self,
         value: &serde_json::Value,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if let Ok(saved) = serde_json::from_value::<ContentSnapshot>(value.clone()) {
-            self.query
-                .update(cx, |input, cx| input.set_value(saved.query, window, cx));
-            self.price
-                .update(cx, |input, cx| input.set_value(saved.price, window, cx));
-            self.quantity
-                .update(cx, |input, cx| input.set_value(saved.quantity, window, cx));
-            self.side = saved.side;
-            self.sort = saved.sort.min(2);
-            self.filter_enabled = saved.order_filter.enabled;
-            self.filter_direction = saved.order_filter.direction.min(2);
-            self.large_trades_only = saved.large_trades_only;
-            self.book_queue = saved.book_queue;
-            self.members = saved.members;
-            self.leave_stock_import(window, cx);
-            for (input, value) in [
-                (&self.min_amount, saved.order_filter.min_amount),
-                (&self.max_amount, saved.order_filter.max_amount),
-                (&self.min_quantity, saved.order_filter.min_quantity),
-                (&self.max_quantity, saved.order_filter.max_quantity),
-            ] {
-                input.update(cx, |input, cx| input.set_value(value, window, cx));
+    ) -> anyhow::Result<()> {
+        let Some(saved) = ContentSnapshot::decode(value)? else {
+            return Ok(());
+        };
+        match &self.view {
+            PanelView::Watchlist { query, .. } => {
+                query.update(cx, |input, cx| {
+                    input.set_value(saved.query.clone(), window, cx)
+                });
             }
-            self.chart
-                .update(cx, |chart, cx| chart.restore_viewport(saved.chart, cx));
-            self.pending_price = None;
-            cx.notify();
+            PanelView::Chart(chart) => {
+                chart.update(cx, |chart, cx| chart.restore_viewport(saved.chart, cx));
+            }
+            PanelView::OrderEntry { price, quantity } => {
+                price.update(cx, |input, cx| {
+                    input.set_value(saved.price.clone(), window, cx)
+                });
+                quantity.update(cx, |input, cx| {
+                    input.set_value(saved.quantity.clone(), window, cx)
+                });
+            }
+            PanelView::OrderDetails {
+                min_amount,
+                max_amount,
+                min_quantity,
+                max_quantity,
+            } => {
+                for (input, value) in [
+                    (min_amount, &saved.order_filter.min_amount),
+                    (max_amount, &saved.order_filter.max_amount),
+                    (min_quantity, &saved.order_filter.min_quantity),
+                    (max_quantity, &saved.order_filter.max_quantity),
+                ] {
+                    input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                }
+            }
+            PanelView::ReadOnly => {}
+        }
+        self.side = saved.side;
+        self.sort = saved.sort;
+        self.filter_enabled = saved.order_filter.enabled;
+        self.filter_direction = saved.order_filter.direction;
+        self.large_trades_only = saved.large_trades_only;
+        self.book_queue = saved.book_queue;
+        self.members = saved.members.clone();
+        if matches!(self.view, PanelView::Watchlist { .. }) {
+            self.leave_stock_import(window, cx);
+        }
+        self.pending_price = None;
+        self.legacy_content = saved;
+        cx.notify();
+        Ok(())
+    }
+
+    fn chart_entity(&self) -> &Entity<MarketChart> {
+        match &self.view {
+            PanelView::Chart(chart) => chart,
+            _ => unreachable!("chart control on non-chart panel"),
+        }
+    }
+    fn query(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::Watchlist { query, .. } => query,
+            _ => unreachable!("query on non-list panel"),
+        }
+    }
+    fn catalog_query(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::Watchlist { catalog_query, .. } => catalog_query,
+            _ => unreachable!("catalog on non-list panel"),
+        }
+    }
+    fn import_text(&self) -> &Entity<TextareaState> {
+        match &self.view {
+            PanelView::Watchlist { import_text, .. } => import_text,
+            _ => unreachable!("import on non-list panel"),
+        }
+    }
+    fn price(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::OrderEntry { price, .. } => price,
+            _ => unreachable!("price on non-entry panel"),
+        }
+    }
+    fn quantity(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::OrderEntry { quantity, .. } => quantity,
+            _ => unreachable!("quantity on non-entry panel"),
+        }
+    }
+    fn min_amount(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::OrderDetails { min_amount, .. } => min_amount,
+            _ => unreachable!("filter on non-details panel"),
+        }
+    }
+    fn max_amount(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::OrderDetails { max_amount, .. } => max_amount,
+            _ => unreachable!("filter on non-details panel"),
+        }
+    }
+    fn min_quantity(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::OrderDetails { min_quantity, .. } => min_quantity,
+            _ => unreachable!("filter on non-details panel"),
+        }
+    }
+    fn max_quantity(&self) -> &Entity<InputState> {
+        match &self.view {
+            PanelView::OrderDetails { max_quantity, .. } => max_quantity,
+            _ => unreachable!("filter on non-details panel"),
         }
     }
 
@@ -566,7 +649,7 @@ impl PanelContent {
 
     fn show_stock_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stock_list_page = StockListPage::Catalog;
-        self.catalog_query.update(cx, |input, cx| {
+        self.catalog_query().update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
         });
@@ -575,7 +658,7 @@ impl PanelContent {
 
     fn refresh_import(&mut self, cx: &App) {
         self.import_preview =
-            stock_import::parse(&self.import_text.read(cx).value(), &self.members);
+            stock_import::parse(&self.import_text().read(cx).value(), &self.members);
     }
 
     fn leave_stock_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -584,14 +667,14 @@ impl PanelContent {
         self.import_loading = false;
         self.import_message = None;
         self.import_preview = stock_import::parse("", &self.members);
-        self.import_text
+        self.import_text()
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
     fn show_stock_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_stock_import(window, cx);
         self.stock_list_page = StockListPage::Import;
-        self.import_text
+        self.import_text()
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
@@ -683,7 +766,7 @@ impl PanelContent {
                 } else {
                     match result {
                         Ok(Some(text)) => {
-                            this.import_text
+                            this.import_text()
                                 .update(cx, |input, cx| input.set_value(text, window, cx));
                             this.refresh_import(cx);
                         }
@@ -767,7 +850,7 @@ impl PanelContent {
                             .px_2()
                             .flex_shrink_0()
                             .child(
-                                Textarea::new(&self.import_text)
+                                Textarea::new(self.import_text())
                                     .accessibility_id("stock-import-text-input")
                                     .aria_label("待导入股票文本")
                                     .small()
@@ -806,7 +889,7 @@ impl PanelContent {
                                         this.import_request = this.import_request.wrapping_add(1);
                                         this.import_loading = false;
                                         this.import_message = None;
-                                        this.import_text.update(cx, |input, cx| {
+                                        this.import_text().update(cx, |input, cx| {
                                             input.set_value("", window, cx)
                                         });
                                         this.refresh_import(cx);
@@ -964,7 +1047,7 @@ impl PanelContent {
     }
 
     fn stock_catalog(&self, cx: &mut Context<Self>) -> AnyElement {
-        let query = self.catalog_query.read(cx).value().trim().to_lowercase();
+        let query = self.catalog_query().read(cx).value().trim().to_lowercase();
         let symbols: Vec<_> = Symbol::ALL
             .into_iter()
             .filter(|symbol| {
@@ -998,7 +1081,7 @@ impl PanelContent {
             )
             .child(
                 div().p_2().child(
-                    Input::new(&self.catalog_query)
+                    Input::new(self.catalog_query())
                         .id("stock-list-catalog-search")
                         .small()
                         .w_full(),
@@ -1100,7 +1183,7 @@ impl PanelContent {
             StockListPage::Import => return self.stock_import_view(cx),
             StockListPage::List => {}
         }
-        let query = self.query.read(cx).value().trim().to_lowercase();
+        let query = self.query().read(cx).value().trim().to_lowercase();
         let mut symbols: Vec<_> = self
             .members
             .iter()
@@ -1130,7 +1213,7 @@ impl PanelContent {
                     .gap_1()
                     .child(
                         div().flex_1().min_w_0().child(
-                            Input::new(&self.query)
+                            Input::new(self.query())
                                 .id("watchlist-search")
                                 .small()
                                 .w_full(),
@@ -1380,7 +1463,7 @@ impl PanelContent {
                         view.child(
                             control("chart-zoom-out", "−", false)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.chart
+                                    this.chart_entity()
                                         .update(cx, |chart, cx| chart.zoom_step(false, cx));
                                 }))
                                 .test_support(),
@@ -1388,7 +1471,8 @@ impl PanelContent {
                         .child(
                             control("chart-zoom-in", "+", false)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.chart.update(cx, |chart, cx| chart.zoom_step(true, cx));
+                                    this.chart_entity()
+                                        .update(cx, |chart, cx| chart.zoom_step(true, cx));
                                 }))
                                 .test_support(),
                         )
@@ -1405,7 +1489,7 @@ impl PanelContent {
                         )
                         .flex_shrink_0()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.chart.update(cx, |chart, cx| chart.reset(cx));
+                            this.chart_entity().update(cx, |chart, cx| chart.reset(cx));
                         }))
                         .test_support(),
                     ),
@@ -1419,7 +1503,7 @@ impl PanelContent {
                         .child(message.clone()),
                 )
             })
-            .child(div().flex_1().min_h_0().child(self.chart.clone()))
+            .child(div().flex_1().min_h_0().child(self.chart_entity().clone()))
             .child(
                 div()
                     .px_2()
@@ -1989,10 +2073,10 @@ impl PanelContent {
     fn filter_snapshot(&self, cx: &App) -> OrderFilterSnapshot {
         OrderFilterSnapshot {
             enabled: self.filter_enabled,
-            min_amount: self.min_amount.read(cx).value().to_string(),
-            max_amount: self.max_amount.read(cx).value().to_string(),
-            min_quantity: self.min_quantity.read(cx).value().to_string(),
-            max_quantity: self.max_quantity.read(cx).value().to_string(),
+            min_amount: self.min_amount().read(cx).value().to_string(),
+            max_amount: self.max_amount().read(cx).value().to_string(),
+            min_quantity: self.min_quantity().read(cx).value().to_string(),
+            max_quantity: self.max_quantity().read(cx).value().to_string(),
             direction: self.filter_direction,
         }
     }
@@ -2054,28 +2138,28 @@ impl PanelContent {
                             .child(format!("金额（万 {}）", currency(self.symbol))),
                     )
                     .child(
-                        Input::new(&self.min_amount)
+                        Input::new(self.min_amount())
                             .id("market-min-amount")
                             .small()
                             .w(px(66.)),
                     )
                     .child("–")
                     .child(
-                        Input::new(&self.max_amount)
+                        Input::new(self.max_amount())
                             .id("market-max-amount")
                             .small()
                             .w(px(66.)),
                     )
                     .child(div().px_1().text_color(rgb(MUTED)).child("数量（股）"))
                     .child(
-                        Input::new(&self.min_quantity)
+                        Input::new(self.min_quantity())
                             .id("market-min-quantity")
                             .small()
                             .w(px(66.)),
                     )
                     .child("–")
                     .child(
-                        Input::new(&self.max_quantity)
+                        Input::new(self.max_quantity())
                             .id("market-max-quantity")
                             .small()
                             .w(px(66.)),
@@ -2226,8 +2310,8 @@ impl PanelContent {
     }
 
     fn submit_order(&mut self, cx: &mut Context<Self>) {
-        let price = self.price.read(cx).value().trim().parse::<f64>();
-        let quantity = self.quantity.read(cx).value().trim().parse::<u64>();
+        let price = self.price().read(cx).value().trim().parse::<f64>();
+        let quantity = self.quantity().read(cx).value().trim().parse::<u64>();
         let result = match (price, quantity) {
             (Ok(price), Ok(quantity)) => cx.update_global::<DemoBroker, _>(|broker, _| {
                 broker.submit(self.symbol, self.side, price, quantity)
@@ -2249,8 +2333,8 @@ impl PanelContent {
         let broker = cx.global::<DemoBroker>();
         let available_cash = broker.available_cash(self.symbol);
         let available_shares = broker.available_shares(self.symbol);
-        let price = self.price.read(cx).value().parse::<f64>().unwrap_or(0.);
-        let qty = self.quantity.read(cx).value().parse::<u64>().unwrap_or(0);
+        let price = self.price().read(cx).value().parse::<f64>().unwrap_or(0.);
+        let qty = self.quantity().read(cx).value().parse::<u64>().unwrap_or(0);
         let amount = if price.is_finite() && price > 0. {
             price * qty as f64
         } else {
@@ -2307,7 +2391,7 @@ impl PanelContent {
                     .flex_wrap()
                     .child(
                         div().flex_1().min_w(px(125.)).child(label("限价")).child(
-                            Input::new(&self.price)
+                            Input::new(self.price())
                                 .id("order-price")
                                 .small()
                                 .w_full()
@@ -2316,7 +2400,7 @@ impl PanelContent {
                     )
                     .child(
                         div().flex_1().min_w(px(125.)).child(label("数量")).child(
-                            Input::new(&self.quantity)
+                            Input::new(self.quantity())
                                 .id("order-quantity")
                                 .small()
                                 .w_full()
@@ -2595,7 +2679,7 @@ impl PanelContent {
 impl Render for PanelContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(price) = self.pending_price.take() {
-            self.price.update(cx, |input, cx| {
+            self.price().update(cx, |input, cx| {
                 input.set_value(format!("{price:.2}"), window, cx)
             });
         }
@@ -3088,6 +3172,7 @@ pub(crate) fn smoke_demo_orders(cx: &mut HeadlessAppContext) -> anyhow::Result<(
 /// Exercise the reference panel controls through real GPUI input events.
 #[cfg(feature = "test-support")]
 pub(crate) fn smoke_market_panels(cx: &mut HeadlessAppContext) -> anyhow::Result<()> {
+    smoke_panel_state(cx)?;
     use anyhow::ensure;
     use gpui_kit::test::TestWindowExt;
     let mut handles = Vec::new();
@@ -3163,7 +3248,7 @@ pub(crate) fn smoke_market_panels(cx: &mut HeadlessAppContext) -> anyhow::Result
                     cx,
                 )
             });
-            restored.update(cx, |view, cx| view.restore(&snapshot, window, cx));
+            restored.update(cx, |view, cx| view.restore(&snapshot, window, cx))?;
             ensure!(
                 restored.read(cx).snapshot(cx) == snapshot,
                 "Market filter snapshot failed to restore"
@@ -3198,6 +3283,116 @@ pub(crate) fn smoke_market_panels(cx: &mut HeadlessAppContext) -> anyhow::Result
         })??;
         println!(
             "PASS: market order amount/quantity/direction filters, restored filter state, large execution filter and order-book queue controls"
+        );
+        Ok(())
+    })();
+    for handle in handles {
+        let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+    }
+    result
+}
+
+/// Regression for resource isolation and transactional content restoration.
+/// Runs without a screenshot renderer, so Windows can execute it as well.
+#[cfg(feature = "test-support")]
+pub(crate) fn smoke_panel_state(cx: &mut HeadlessAppContext) -> anyhow::Result<()> {
+    crate::chart::smoke_data_source(cx)?;
+    use anyhow::ensure;
+    let mut handles = Vec::new();
+    let result = (|| -> anyhow::Result<()> {
+        for kind in PanelKind::ALL {
+            let open = |cx: &mut App| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| PanelContent::new(kind, Symbol::Aapl, Period::Day, window, cx))
+                })
+            };
+            let (source, view) = cx.update(open)?;
+            handles.push(source);
+            let expected_inputs = match kind {
+                PanelKind::Watchlist | PanelKind::OrderEntry => 2,
+                PanelKind::OrderDetails => 4,
+                _ => 0,
+            };
+            let (snapshot, source_ids) = cx.update_window(source, |_, window, cx| {
+                let panel = view.read(cx);
+                ensure!(
+                    panel.view.inputs().len() == expected_inputs,
+                    "Unexpected native inputs for {kind:?}"
+                );
+                ensure!(
+                    matches!(panel.view, PanelView::Chart(_)) == (kind == PanelKind::Chart),
+                    "Hidden chart allocated for {kind:?}"
+                );
+                ensure!(
+                    matches!(panel.view, PanelView::Watchlist { .. })
+                        == (kind == PanelKind::Watchlist),
+                    "Hidden list editor allocated for {kind:?}"
+                );
+                let source_ids: Vec<_> = panel
+                    .view
+                    .inputs()
+                    .iter()
+                    .map(|input| input.entity_id())
+                    .collect();
+                let mut legacy = panel.snapshot(cx);
+                legacy["query"] = serde_json::json!("legacy-query");
+                legacy["price"] = serde_json::json!("007.50");
+                legacy["quantity"] = serde_json::json!("50");
+                legacy["side"] = serde_json::json!("Sell");
+                legacy["sort"] = serde_json::json!(2);
+                legacy["chart"] = serde_json::json!({"bars_visible": 80, "offset_from_latest": 3});
+                legacy["order_filter"]["min_amount"] = serde_json::json!("unfinished");
+                legacy["order_filter"]["direction"] = serde_json::json!(1);
+                view.update(cx, |panel, cx| panel.restore(&legacy, window, cx))?;
+                let before = view.read(cx).snapshot(cx);
+                ensure!(
+                    before == legacy,
+                    "Unused legacy fields were lost by {kind:?}"
+                );
+                let mut corrupted = before.clone();
+                corrupted["query"] = serde_json::json!(42);
+                ensure!(
+                    view.update(cx, |panel, cx| panel.restore(&corrupted, window, cx))
+                        .is_err()
+                );
+                ensure!(
+                    view.read(cx).snapshot(cx) == before,
+                    "Failed restore mutated live {kind:?}"
+                );
+                view.update(cx, |panel, cx| {
+                    panel.restore(&serde_json::Value::Null, window, cx)
+                })?;
+                ensure!(
+                    view.read(cx).snapshot(cx) == before,
+                    "Absent legacy content changed {kind:?}"
+                );
+                Ok::<_, anyhow::Error>((before, source_ids))
+            })??;
+
+            // Reconstruction uses a different native window and must never
+            // reuse input entities or subscriptions from the source window.
+            let (destination, rebuilt) = cx.update(open)?;
+            handles.push(destination);
+            cx.update_window(destination, |_, window, cx| {
+                rebuilt.update(cx, |panel, cx| panel.restore(&snapshot, window, cx))?;
+                ensure!(
+                    rebuilt.read(cx).snapshot(cx) == snapshot,
+                    "Migration changed {kind:?} content"
+                );
+                ensure!(
+                    rebuilt
+                        .read(cx)
+                        .view
+                        .inputs()
+                        .iter()
+                        .all(|input| !source_ids.contains(&input.entity_id())),
+                    "Migration reused a source input entity"
+                );
+                Ok::<_, anyhow::Error>(())
+            })??;
+        }
+        println!(
+            "PASS: per-kind native resources, invalid content rollback, absent legacy content and cross-window snapshot reconstruction"
         );
         Ok(())
     })();

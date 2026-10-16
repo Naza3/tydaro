@@ -432,29 +432,6 @@ impl Render for ComponentGallery {
     }
 }
 
-/// An isolated entry point for design review. It never opens personal layouts.
-pub fn run() {
-    gpui_kit::application()
-        .with_assets(crate::desktop_ui::AppAssets)
-        .run(|cx| {
-            crate::workspace::init(cx, false);
-            // Persist only the design choices; personal workspaces stay closed.
-            gallery_preferences::init(true, cx);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            if let Err(error) = open(cx) {
-                eprintln!("Cannot open component gallery: {error:#}");
-                cx.quit();
-                return;
-            }
-            cx.activate(true);
-        });
-}
-
 pub(crate) fn open(cx: &mut App) -> anyhow::Result<(AnyWindowHandle, Entity<ComponentGallery>)> {
     let (handle, view) = gpui_kit::open_window(
         WindowOptions {

@@ -6,16 +6,22 @@ rust-version = "1.96"
 description = "A customizable native stock workspace powered by Rust and GPUI"
 license = "MIT"
 
+[workspace]
+members = ["crates/tydaro-core", "crates/tydaro-ui"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1"
 encoding_rs = "=0.8.42"
 gpui-kit = { version = "=0.7.3" }
+tydaro-core = { path = "crates/tydaro-core" }
+tydaro-ui = { path = "crates/tydaro-ui" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [features]
 default = []
-test-support = ["gpui-kit/test-support"]
+test-support = ["gpui-kit/test-support", "tydaro-ui/test-support"]
 
 [profile.dev]
 debug = 0

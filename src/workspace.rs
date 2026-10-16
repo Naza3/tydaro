@@ -1,15 +1,15 @@
 //! Native workspaces, persistent dock trees and cross-window panel ownership.
 use crate::{
-    board_bar::BoardBar,
     boards::{self, BoardSetFile, SavedBoard},
     contents::{ContentEvent, PanelContent},
+    layout_persistence::{self, SaveRevision, SharedWriter, WriteSession},
     model::{PanelKind, PanelModel},
     storage::{self, SavedPanel, SavedWindow, WorkspaceFile},
     transfer::{self, DockSide, DragCoordinator, ScreenPoint, TransferIntent},
 };
 use gpui_kit::{
     component::{
-        Disableable, Placement, Sizable, Theme, ThemeMode, WindowExt,
+        Disableable, Placement, Sizable,
         button::{Button, ButtonVariants},
         dock::*,
         input::{Input, InputEvent, InputState},
@@ -21,10 +21,19 @@ use gpui_kit::{
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
-    time::Duration,
 };
 
+/// The application supplies its shell and close policy. Workspaces do not know
+/// which pages, services or design tools the host application contains.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceHost {
+    pub build_main: fn(Entity<DockArea>, &mut Window, &mut App) -> AnyView,
+    pub close_main: fn(&mut Window, &mut App) -> bool,
+    pub market_visible: fn(&App) -> bool,
+}
+
 struct Session {
+    host: WorkspaceHost,
     windows: BTreeMap<u64, WeakEntity<Workspace>>,
     panels: HashMap<u64, WeakEntity<StockPanel>>,
     next_id: u64,
@@ -34,6 +43,10 @@ struct Session {
     loading: bool,
     building_owner: u64,
     path: Option<PathBuf>,
+    writer: Option<SharedWriter>,
+    save_task: Option<Task<()>>,
+    save_revision: SaveRevision,
+    maintenance_ticks: u64,
     status: String,
     drag: DragCoordinator,
     history: Vec<WorkspaceFile>,
@@ -94,9 +107,14 @@ pub(crate) fn status_message(cx: &App) -> String {
 }
 fn changed(cx: &mut App) {
     if !cx.global::<Session>().loading {
-        cx.global_mut::<Session>().dirty = true;
+        mark_dirty(cx);
     }
     cx.refresh_windows();
+}
+fn mark_dirty(cx: &mut App) {
+    let session = cx.global_mut::<Session>();
+    session.dirty = true;
+    session.save_revision.changed();
 }
 fn report(result: anyhow::Result<()>, cx: &mut App) {
     if let Err(error) = result {
@@ -150,15 +168,23 @@ struct StockPanel {
     _subscriptions: Vec<Subscription>,
 }
 impl StockPanel {
-    fn create(owner: u64, saved: SavedPanel, window: &mut Window, cx: &mut App) -> Entity<Self> {
+    fn create(
+        owner: u64,
+        saved: SavedPanel,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> anyhow::Result<Entity<Self>> {
+        crate::panel_snapshot::validate(&saved.content)?;
         let model = saved.model;
         let id = model.id;
         let entity = cx.new(|cx: &mut Context<Self>| {
             let content =
                 cx.new(|cx| PanelContent::new(model.kind, model.symbol, model.period, window, cx));
-            content.update(cx, |content, cx| {
-                content.restore(&saved.content, window, cx)
-            });
+            content
+                .update(cx, |content, cx| {
+                    content.restore(&saved.content, window, cx)
+                })
+                .expect("panel content was validated before constructing native state");
             let sub = cx.subscribe(&content, |this, _, event, cx| match *event {
                 ContentEvent::SymbolSelected(symbol) => {
                     let id = this.model.id;
@@ -214,7 +240,7 @@ impl StockPanel {
         cx.global_mut::<Session>()
             .panels
             .insert(id, entity.downgrade());
-        entity
+        Ok(entity)
     }
     fn saved(&self, cx: &App) -> SavedPanel {
         SavedPanel {
@@ -697,7 +723,7 @@ pub(crate) struct Workspace {
     pub(crate) handle: AnyWindowHandle,
     pub(crate) dock: Entity<DockArea>,
     bounds: [f32; 4],
-    desktop: Option<Entity<crate::desktop::Desktop>>,
+    main_content: Option<AnyView>,
     _subscriptions: Vec<Subscription>,
 }
 impl Workspace {
@@ -736,46 +762,7 @@ impl Workspace {
         let entity_id = cx.entity_id();
         window.on_window_should_close(cx, move |window, cx| {
             if id == 0 {
-                if !crate::desktop_state::save_now(cx) {
-                    let detail = cx
-                        .global::<crate::desktop_state::DesktopState>()
-                        .save_status
-                        .clone();
-                    window.open_dialog(cx, move |dialog, _, _| {
-                        dialog.title("部分修改尚未保存").width(px(480.)).child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_4()
-                                .child(detail.clone())
-                                .child("继续编辑可保留内存中的修改。仍然退出将丢弃尚未保存的修改。")
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("desktop-quit-cancel")
-                                                .label("继续编辑")
-                                                .primary()
-                                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                                        )
-                                        .child(
-                                            Button::new("desktop-quit-discard")
-                                                .label("仍然退出")
-                                                .on_click(|_, _, cx| {
-                                                    save_now(cx);
-                                                    cx.quit();
-                                                }),
-                                        ),
-                                ),
-                        )
-                    });
-                    return false;
-                }
-                save_now(cx);
-                cx.quit();
-                true
+                (cx.global::<Session>().host.close_main)(window, cx)
             } else {
                 cx.defer(move |cx| {
                     // A queued native request must not dismiss a replacement
@@ -788,16 +775,14 @@ impl Workspace {
                 false
             }
         });
-        let board_bar = (id == 0).then(|| cx.new(|cx| BoardBar::new(window, cx)));
-        let desktop = (id == 0).then(|| {
-            cx.new(|cx| crate::desktop::Desktop::new(dock.clone(), board_bar, window, cx))
-        });
+        let main_content =
+            (id == 0).then(|| (cx.global::<Session>().host.build_main)(dock.clone(), window, cx));
         Self {
             id,
             handle: window.window_handle(),
             dock,
             bounds: window_bounds(window),
-            desktop,
+            main_content,
             _subscriptions: vec![sub, bounds_sub, active],
         }
     }
@@ -828,7 +813,8 @@ fn default_layout(
             },
             window,
             cx,
-        );
+        )
+        .expect("empty content creates a default panel");
         DockLayout::tabs().panel_view(panel_handle(p), cx)
     };
     let watch = one(PanelKind::Watchlist, cx);
@@ -859,7 +845,8 @@ fn default_layout(
             },
             window,
             cx,
-        );
+        )
+        .expect("empty content creates a default panel");
         bottom = bottom.panel_view(panel_handle(p), cx);
     }
     let layout = DockLayout::h_split()
@@ -1043,12 +1030,16 @@ fn create_floating(owner: u64, saved: SavedPanel, cx: &mut App) -> anyhow::Resul
     let w = open_workspace_on_display(destination, None, display, Some(bounds), cx)?;
     let handle = w.read(cx).handle;
     let dock = w.read(cx).dock.clone();
-    if let Err(error) = handle.update(cx, |_, window, cx| {
-        let p = StockPanel::create(destination, saved, window, cx);
-        dock.update(cx, |d, cx| {
-            d.add_panel_view(panel_handle(p), DockPlacement::Center, None, window, cx)
-        });
-    }) {
+    if let Err(error) = handle
+        .update(cx, |_, window, cx| {
+            let p = StockPanel::create(destination, saved, window, cx)?;
+            dock.update(cx, |d, cx| {
+                d.add_panel_view(panel_handle(p), DockPlacement::Center, None, window, cx)
+            });
+            Ok(())
+        })
+        .and_then(|result| result)
+    {
         close_window(destination, cx);
         return Err(error);
     }
@@ -1197,7 +1188,7 @@ pub(crate) fn move_between(
     // Construct the destination before removing the source. The new entity has
     // window-local input/focus handles and the same durable panel identifier.
     let moved = dest_handle.update(cx, |_, window, cx| {
-        let moved = StockPanel::create(destination, saved, window, cx);
+        let moved = StockPanel::create(destination, saved, window, cx)?;
         dest_dock.update(cx, |d, cx| {
             d.add_panel_view(
                 panel_handle(moved.clone()),
@@ -1210,8 +1201,8 @@ pub(crate) fn move_between(
                 d.move_panel(PanelId::from(moved.entity_id()), insertion, window, cx);
             }
         });
-        moved
-    })?;
+        Ok::<_, anyhow::Error>(moved)
+    })??;
     if let Err(err) = source_handle.update(cx, |_, window, cx| {
         source_dock.update(cx, |d, cx| d.remove_panel(p.clone(), window, cx))
     }) {
@@ -1891,7 +1882,7 @@ fn record(cx: &mut App) {
     if let Some(previous) = previous
         && serde_json::to_value(&previous).ok() != serde_json::to_value(&current).ok()
     {
-        cx.global_mut::<Session>().dirty = true;
+        mark_dirty(cx);
         // Resizing a native window also rescales its dock slots. Treat that
         // geometry as one native operation, not a new layout undo entry.
         let ignore_sizes = geometry_changed(&previous, &current);
@@ -1901,18 +1892,56 @@ fn record(cx: &mut App) {
     }
 }
 
+/// Capture entities on the UI thread, then serialize and commit in the background.
+/// One in-flight save bounds the queue; newer edits stay dirty until the next tick.
 fn save_now(cx: &mut App) {
-    if cx.global::<Session>().loading {
+    let session = cx.global::<Session>();
+    if session.loading || session.save_task.is_some() {
         return;
     }
-    let Some(path) = cx.global::<Session>().path.clone() else {
+    let Some(writer) = session.writer.clone() else {
         return;
     };
     let state = snapshot_board_set(cx);
-    match storage::write_board_set(&path, &state) {
-        Ok(()) => cx.global_mut::<Session>().dirty = false,
-        Err(error) => status(format!("布局保存失败：{error}"), cx),
-    }
+    let session = cx.global_mut::<Session>();
+    session.dirty = true;
+    let revision = session.save_revision.begin();
+    let background_writer = writer.clone();
+    let write = cx
+        .background_executor()
+        .spawn(async move { layout_persistence::save(&background_writer, revision, &state) });
+    let task = cx.spawn(async move |cx| {
+        let result = write.await;
+        cx.update(|cx| {
+            if !cx.has_global::<Session>() {
+                return;
+            }
+            let session = cx.global_mut::<Session>();
+            if !session
+                .writer
+                .as_ref()
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &writer))
+            {
+                return;
+            }
+            let Some(current) = session.save_revision.finish(revision) else {
+                return;
+            };
+            session.save_task = None;
+            match result {
+                Ok(()) if current => {
+                    session.dirty = false;
+                    if session.status.starts_with("布局保存失败：") {
+                        session.status = "布局已保存".into();
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => session.status = format!("布局保存失败：{error}"),
+            }
+            cx.refresh_windows();
+        });
+    });
+    cx.global_mut::<Session>().save_task = Some(task);
 }
 
 fn saved_panel_ids(state: &WorkspaceFile) -> std::collections::HashSet<u64> {
@@ -2248,7 +2277,7 @@ pub(crate) fn verify_workspace_persistence(cx: &mut App) -> anyhow::Result<()> {
 }
 
 pub(crate) fn market_toolbar(
-    board_bar: &Option<Entity<BoardBar>>,
+    board_bar: &Option<AnyView>,
     dock: &Entity<DockArea>,
     cx: &App,
 ) -> AnyElement {
@@ -2477,12 +2506,7 @@ impl Render for Workspace {
         }
         let pre = canvas(
             move |_, _, cx| {
-                if id == 0
-                    && cx
-                        .global::<crate::desktop_state::DesktopState>()
-                        .active_page
-                        != crate::desktop_state::PageId::Market
-                {
+                if id == 0 && !(cx.global::<Session>().host.market_visible)(cx) {
                     cx.global_mut::<Session>().drag.remove_window(0);
                     return;
                 }
@@ -2539,7 +2563,7 @@ impl Render for Workspace {
             })
             .child(pre)
             .child(listener)
-            .when_some(self.desktop.clone(), |d, desktop| d.child(desktop))
+            .when_some(self.main_content.clone(), |d, content| d.child(content))
             .when(id != 0, |d| {
                 d.child(floating_header)
                     .child(
@@ -2611,34 +2635,11 @@ impl Render for Workspace {
     }
 }
 
-pub(crate) fn init(cx: &mut App, persistent: bool) {
-    gpui_kit::init(cx);
-    gpui_kit::component::set_locale("zh-CN");
-    Theme::change(ThemeMode::Light, None, cx);
-    Theme::global_mut(cx).font_size = px(14.);
-    {
-        let theme = Theme::global_mut(cx);
-        theme.primary = rgb(0x008e8c).into();
-        theme.primary_hover = rgb(0x007c7a).into();
-        theme.primary_active = rgb(0x006c6a).into();
-        theme.primary_foreground = rgb(0xffffff).into();
-        theme.button_primary_foreground = rgb(0xffffff).into();
-        theme.accent = rgb(0xe7f5f3).into();
-        theme.accent_foreground = rgb(0x007d78).into();
-        theme.ring = rgb(0x008e8c).into();
-        theme.tokens.button_primary = Hsla::from(rgb(0x008e8c)).into();
-        theme.tokens.button_primary_hover = Hsla::from(rgb(0x007c7a)).into();
-        theme.tokens.button_primary_active = Hsla::from(rgb(0x006c6a)).into();
-        theme.tokens.secondary_active = Hsla::from(rgb(0xe7f5f3)).into();
-    }
-    crate::desktop_state::init(persistent, cx);
-    crate::gallery_preferences::init(persistent, cx);
-    Theme::global_mut(cx).font_family = if cfg!(target_os = "windows") {
-        "Microsoft YaHei UI".into()
-    } else {
-        "Noto Sans CJK SC".into()
-    };
+pub(crate) fn init(cx: &mut App, persistent: bool, host: WorkspaceHost) {
+    let path = persistent.then(|| storage::data_dir().join("workspace.json"));
+    let writer = path.clone().map(WriteSession::shared);
     cx.set_global(Session {
+        host,
         windows: BTreeMap::new(),
         panels: HashMap::new(),
         next_id: 1,
@@ -2647,7 +2648,11 @@ pub(crate) fn init(cx: &mut App, persistent: bool) {
         dirty: false,
         loading: false,
         building_owner: 0,
-        path: persistent.then(|| storage::data_dir().join("workspace.json")),
+        path,
+        writer,
+        save_task: None,
+        save_revision: SaveRevision::default(),
+        maintenance_ticks: 0,
         status: String::new(),
         drag: DragCoordinator::default(),
         history: vec![],
@@ -2663,70 +2668,86 @@ pub(crate) fn init(cx: &mut App, persistent: bool) {
             _ => unreachable!("validated panel info"),
         };
         let owner = cx.global::<Session>().building_owner;
-        panel_handle(StockPanel::create(owner, saved, window, cx))
+        panel_handle(
+            StockPanel::create(owner, saved, window, cx)
+                .expect("dock payload was validated before loading"),
+        )
     });
 }
-pub fn run() {
-    #[cfg(feature = "test-support")]
-    if let Some(path) = std::env::args().skip_while(|a| a != "--smoke-test").nth(1) {
-        if let Err(err) = crate::smoke::run(&path) {
-            eprintln!("Smoke test failed: {err:#}");
-            std::process::exit(1);
-        }
+/// Restore the user's workspaces after the application has installed services.
+pub(crate) fn open_initial(cx: &mut App) -> anyhow::Result<()> {
+    let path = cx.global::<Session>().path.clone();
+    let saved =
+        path.filter(|path| path.exists())
+            .and_then(|path| match storage::read_board_set(&path) {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    status(format!("布局读取失败，已使用默认布局：{error}"), cx);
+                    None
+                }
+            });
+    if let Some(state) = saved {
+        let result = restore_board_set(state, cx);
+        report(result, cx);
+    }
+    if workspace(0, cx).is_none() {
+        open_workspace(0, None, cx)?;
+    }
+    cx.global_mut::<Session>().last = Some(snapshot(cx));
+    Ok(())
+}
+
+/// A display update is independent from layout persistence scheduling.
+pub(crate) fn advance_market(cx: &mut App) {
+    let session = cx.global_mut::<Session>();
+    if session.paused {
         return;
     }
-    gpui_kit::application()
-        .with_assets(crate::desktop_ui::AppAssets)
-        .run(|cx| {
-            init(cx, true);
-            let path = cx.global::<Session>().path.clone().unwrap();
-            let saved = if path.exists() {
-                match storage::read_board_set(&path) {
-                    Ok(state) => Some(state),
-                    Err(error) => {
-                        status(format!("布局读取失败，已使用默认布局：{error}"), cx);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(state) = saved {
-                let result = restore_board_set(state, cx);
-                report(result, cx);
+    session.tick += 1;
+    refresh_market(cx);
+    cx.refresh_windows();
+}
+
+pub(crate) fn maintain_layout(cx: &mut App) {
+    let session = cx.global_mut::<Session>();
+    session.maintenance_ticks = session.maintenance_ticks.wrapping_add(1);
+    let should_record = session.dirty || session.maintenance_ticks.is_multiple_of(5);
+    if should_record {
+        record(cx);
+        if cx.global::<Session>().dirty {
+            save_now(cx);
+        }
+    }
+}
+
+/// Closing is a durability boundary. Cancel the callback, wait for any active
+/// write, then persist a fresh snapshot under the same lock before quitting.
+pub(crate) fn flush(cx: &mut App) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cx.global::<Session>().loading,
+        "布局正在恢复，暂时无法保存"
+    );
+    let Some(writer) = cx.global::<Session>().writer.clone() else {
+        return Ok(());
+    };
+    let state = snapshot_board_set(cx);
+    let session = cx.global_mut::<Session>();
+    session.save_task = None;
+    session.dirty = true;
+    let revision = session.save_revision.begin();
+    let result = layout_persistence::save(&writer, revision, &state);
+    let session = cx.global_mut::<Session>();
+    let _ = session.save_revision.finish(revision);
+    match &result {
+        Ok(()) => {
+            session.dirty = false;
+            if session.status.starts_with("布局保存失败：") {
+                session.status = "布局已保存".into();
             }
-            if workspace(0, cx).is_none()
-                && let Err(err) = open_workspace(0, None, cx)
-            {
-                eprintln!("Cannot open Tydaro: {err:#}");
-                cx.quit();
-                return;
-            }
-            cx.global_mut::<Session>().last = Some(snapshot(cx));
-            cx.spawn(async move |cx| {
-                let mut persistence_ticks = 0_u64;
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    persistence_ticks += 1;
-                    cx.update(|cx| {
-                        let s = cx.global_mut::<Session>();
-                        if !s.paused {
-                            s.tick += 1;
-                        }
-                        refresh_market(cx);
-                        if cx.global::<Session>().dirty || persistence_ticks.is_multiple_of(5) {
-                            record(cx);
-                            if cx.global::<Session>().dirty {
-                                save_now(cx);
-                            }
-                        }
-                        cx.refresh_windows();
-                    });
-                }
-            })
-            .detach();
-            cx.activate(true);
-        });
+        }
+        Err(error) => session.status = format!("布局保存失败：{error}"),
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2746,9 +2767,12 @@ mod persistence_tests {
     };
 
     fn fixture() -> WorkspaceFile {
+        let mut content = crate::panel_snapshot::ContentSnapshot::new("100.00".into());
+        content.query = "AAPL".into();
+        content.chart.bars_visible = 80;
         let panel = SavedPanel {
             model: PanelModel::new(7, PanelKind::Chart),
-            content: serde_json::json!({"query": "AAPL", "chart": {"bars_visible": 80}}),
+            content: serde_json::to_value(content).unwrap(),
         };
         WorkspaceFile {
             version: SCHEMA_VERSION,
@@ -2877,7 +2901,8 @@ mod persistence_tests {
         saved.model.symbol = Symbol::Msft;
         saved.model.period = Period::Week;
         saved.model.custom_name = Some("趋势组".into());
-        saved.content = serde_json::json!({"query": "MSFT", "chart": {"bars_visible": 40}});
+        saved.content["query"] = serde_json::json!("MSFT");
+        saved.content["chart"]["bars_visible"] = serde_json::json!(40);
         changed.windows[0].dock.center.children[0].info =
             PanelInfo::Panel(serde_json::to_value(saved).unwrap());
         assert_eq!(layout_key(&original, false), layout_key(&changed, false));
@@ -2901,7 +2926,8 @@ mod persistence_tests {
         saved.model.period = Period::Day;
         saved.model.link_group = 3;
         saved.model.custom_name = Some("科技趋势".into());
-        saved.content = serde_json::json!({"quantity": "500", "chart": {"bars_visible": 120}});
+        saved.content["quantity"] = serde_json::json!("500");
+        saved.content["chart"]["bars_visible"] = serde_json::json!(120);
         live.windows[0].dock.center.children[0].info =
             PanelInfo::Panel(serde_json::to_value(&saved).unwrap());
         live.paused = true;

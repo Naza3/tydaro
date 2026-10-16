@@ -11,7 +11,8 @@ use gpui_kit::{
 
 use crate::{
     chart::MarketChart,
-    market::{self, HistoricalSession, Symbol},
+    market::{HistoricalSession, Symbol},
+    market_data::ChartSource,
 };
 
 #[derive(Clone)]
@@ -37,11 +38,14 @@ pub(crate) fn open(
     symbol: Symbol,
     day_index: usize,
     tick: u64,
+    data_source: ChartSource,
     source: &Window,
     cx: &mut App,
 ) -> Result<HistoryWindow> {
-    let session = market::historical_session(symbol, day_index, tick)
-        .context("所选交易日没有可用的模拟分时数据")?;
+    let data = data_source
+        .historical(symbol, day_index, tick)
+        .context("所选交易日没有可用的分时数据")?;
+    let session = data.session.clone();
     if let Some(existing) = existing
         && let Some(view) = existing.view.upgrade()
         && existing
@@ -50,8 +54,11 @@ pub(crate) fn open(
                 view.update(cx, |view, cx| {
                     view.symbol = symbol;
                     view.tick = tick;
+                    view.source = data_source.clone();
                     // A new source selection can also refer to another symbol.
-                    view.chart = cx.new(|cx| MarketChart::new_historical(symbol, &session, cx));
+                    view.chart = cx.new(|cx| {
+                        MarketChart::new_historical(symbol, &data, data_source.clone(), cx)
+                    });
                     view.session = session.clone();
                     window.focus(&view.focus, cx);
                     cx.notify();
@@ -106,9 +113,12 @@ pub(crate) fn open(
                 let focus = cx.focus_handle();
                 window.focus(&focus, cx);
                 HistoryView {
+                    source: data_source.clone(),
                     symbol,
                     tick,
-                    chart: cx.new(|cx| MarketChart::new_historical(symbol, &session, cx)),
+                    chart: cx.new(|cx| {
+                        MarketChart::new_historical(symbol, &data, data_source.clone(), cx)
+                    }),
                     session,
                     focus,
                 }
@@ -122,6 +132,7 @@ pub(crate) fn open(
 }
 
 struct HistoryView {
+    source: ChartSource,
     symbol: Symbol,
     tick: u64,
     session: HistoricalSession,
@@ -137,11 +148,11 @@ impl HistoryView {
             self.session.previous_day
         };
         if let Some(session) =
-            day.and_then(|day| market::historical_session(self.symbol, day, self.tick))
+            day.and_then(|day| self.source.historical(self.symbol, day, self.tick))
         {
             self.chart
                 .update(cx, |chart, cx| chart.set_historical(&session, cx));
-            self.session = session;
+            self.session = session.session;
             cx.notify();
         }
     }

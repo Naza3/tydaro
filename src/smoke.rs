@@ -32,13 +32,52 @@ fn open_headless_workspace() -> Result<(HeadlessAppContext, Entity<workspace::Wo
         Arc::new(crate::desktop_ui::AppAssets),
         gpui_kit::platform::current_headless_renderer,
     );
-    cx.update(|cx| workspace::init(cx, false));
+    cx.update(|cx| crate::app::init(cx, false));
     let workspace = cx.update(|cx| workspace::open_workspace(0, None, cx))?;
     let handle = cx.update(|cx| workspace.read(cx).handle);
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
     Ok((cx, workspace))
+}
+
+/// Native event/state regression for platforms without a headless pixel renderer.
+/// This entry never claims screenshot or GPU validation; full smoke remains separate.
+pub fn run_architecture(path: &str) -> Result<()> {
+    let (mut cx, initial) = open_headless_workspace()?;
+    cx.update(|cx| cx.set_reduce_motion(true));
+    if std::env::args().any(|arg| arg == "--input-only") {
+        return verify_rejected_inputs(&mut cx);
+    }
+    let handle = cx.update(|cx| initial.read(cx).handle);
+    for id in ["symbol-MSFT", "period-日 K"] {
+        cx.update_window(handle, |_, window, cx| window.click(id, cx))?;
+        render_workspace_windows(&mut cx)?;
+    }
+    crate::contents::smoke_market_panels(&mut cx)?;
+    verify_floating_window_close(&mut cx)?;
+    let current = cx
+        .update(|cx| workspace::workspace(0, cx))
+        .context("Main workspace missing")?;
+    crate::desktop_smoke::verify(&mut cx, &current, Path::new(path), false)?;
+    verify_rejected_inputs(&mut cx)?;
+    println!(
+        "PASS: architecture native input/state regression; no screenshots or pixel assertions requested"
+    );
+    Ok(())
+}
+
+fn verify_rejected_inputs(cx: &mut HeadlessAppContext) -> Result<()> {
+    let handle = cx.update(|cx| {
+        workspace::workspace(0, cx)
+            .expect("main workspace")
+            .read(cx)
+            .handle
+    });
+    crate::journal_page::smoke_rejected_inputs(cx)?;
+    crate::research_page::verify_rejected_edits(cx, handle)?;
+    crate::watch_page::verify_rejected_edits(cx, handle)?;
+    Ok(())
 }
 
 /// Focused iteration of the production desktop pages. Full release validation
@@ -58,7 +97,7 @@ fn verify_desktop_with_failure_capture(
     workspace: &Entity<workspace::Workspace>,
     output: &Path,
 ) -> Result<()> {
-    let result = crate::desktop_smoke::verify(cx, workspace, output);
+    let result = crate::desktop_smoke::verify(cx, workspace, output, true);
     if result.is_err() {
         let handle = cx.update(|cx| workspace.read(cx).handle);
         let stem = output
@@ -238,6 +277,7 @@ pub fn run(path: &str) -> Result<()> {
         .update(|cx| workspace::workspace(0, cx))
         .context("Main workspace missing before desktop checks")?;
     verify_desktop_with_failure_capture(&mut cx, &current, output)?;
+    verify_rejected_inputs(&mut cx)?;
 
     println!(
         "PASS: native workspace {} × {}, {} panels; MSFT link group, 日 K, chart zoom; detach/return state, persistence/undo and demo order interactions. Screenshot: {}",

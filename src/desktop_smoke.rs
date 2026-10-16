@@ -24,6 +24,7 @@ pub(crate) fn verify(
     cx: &mut HeadlessAppContext,
     workspace: &Entity<Workspace>,
     output: &Path,
+    capture: bool,
 ) -> Result<()> {
     let handle = cx.update(|cx| workspace.read(cx).handle);
     click(cx, handle, "desktop-nav-market")?;
@@ -53,7 +54,7 @@ pub(crate) fn verify(
         Ok::<_, anyhow::Error>(())
     })??;
     click(cx, handle, "desktop-nav-market")?;
-    capture_pages(cx, handle, output, 1536, 960)?;
+    capture_pages(cx, handle, output, 1536, 960, capture)?;
     click(cx, handle, "desktop-nav-market")?;
     let market_after = cx.update(|cx| workspace.read(cx).dock.read(cx).dump(cx));
     ensure!(
@@ -63,13 +64,61 @@ pub(crate) fn verify(
 
     verify_watch(cx, handle)?;
     verify_research_handoff(cx, handle)?;
-    verify_journal(cx, handle, output)?;
+    verify_journal(cx, handle, output, capture)?;
+    verify_candidate_handoff(cx, handle)?;
 
-    capture_pages(cx, handle, output, 1280, 800)?;
+    capture_pages(cx, handle, output, 1280, 800, capture)?;
     click(cx, handle, "desktop-nav-market")?;
     resize(cx, handle, 1536, 960)?;
     println!(
         "PASS: five native desktop pages at 1536 × 960 and 1280 × 800; market identity preservation; watch groups and global monitoring; journal validation, sell-only plans, ID updates, independent drafts and native reading-window close"
+    );
+    Ok(())
+}
+
+fn verify_candidate_handoff(cx: &mut HeadlessAppContext, handle: AnyWindowHandle) -> Result<()> {
+    let previous = cx.update(|cx| {
+        cx.global::<DesktopState>()
+            .journal
+            .days
+            .get("2026-10-15")
+            .map_or(0, |day| day.drafts.len())
+    });
+    click(cx, handle, "desktop-nav-theme")?;
+    click(cx, handle, "theme-demo-candidate")?;
+    cx.update(|cx| {
+        let state = cx.global::<DesktopState>();
+        ensure!(
+            state.active_page == PageId::Journal,
+            "Candidate handoff did not open journal"
+        );
+        let day = state
+            .journal
+            .days
+            .get("2026-10-15")
+            .context("Next-day journal missing")?;
+        ensure!(
+            day.drafts.len() == previous + 1,
+            "Candidate handoff did not create an independent draft"
+        );
+        let draft = day.drafts.last().unwrap();
+        let evidence = draft
+            .plan
+            .research_evidence
+            .as_ref()
+            .context("Candidate evidence missing")?;
+        ensure!(evidence.source_date().as_str() == "2026-10-14");
+        ensure!(evidence.applicable_date().as_str() == "2026-10-15");
+        ensure!(!draft.plan.symbols.is_empty());
+        ensure!(
+            draft.plan.validate_complete().is_err(),
+            "A candidate was silently promoted to a complete plan"
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
+    click(cx, handle, "journal-editor-close")?;
+    println!(
+        "PASS: explicit simulated theme confirmation produces a next-day draft with frozen typed evidence"
     );
     Ok(())
 }
@@ -374,6 +423,7 @@ fn verify_journal(
     cx: &mut HeadlessAppContext,
     handle: AnyWindowHandle,
     output: &Path,
+    capture: bool,
 ) -> Result<()> {
     const DATE: &str = "2026-10-15";
     click(cx, handle, "desktop-nav-journal")?;
@@ -569,7 +619,14 @@ fn verify_journal(
     })?;
     let day_before =
         cx.update(|cx| serde_json::to_value(&cx.global::<DesktopState>().journal.days[DATE]))?;
-    save_screenshot(cx, reading, output, "desktop-journal-reading", None)?;
+    save_screenshot(
+        cx,
+        reading,
+        output,
+        "desktop-journal-reading",
+        None,
+        capture,
+    )?;
     cx.update_window(reading, |_, window, cx| {
         window.click("journal-reading-close", cx)
     })?;
@@ -695,6 +752,7 @@ fn capture_pages(
     output: &Path,
     width: u32,
     height: u32,
+    capture: bool,
 ) -> Result<()> {
     resize(cx, handle, width, height)?;
     for page in ["market", "watch", "limit", "theme", "journal"] {
@@ -743,6 +801,7 @@ fn capture_pages(
             output,
             &format!("desktop-{page}-{width}"),
             Some((width, height)),
+            capture,
         )?;
     }
     Ok(())
@@ -754,7 +813,11 @@ fn save_screenshot(
     output: &Path,
     suffix: &str,
     expected_size: Option<(u32, u32)>,
+    capture: bool,
 ) -> Result<()> {
+    if !capture {
+        return Ok(());
+    }
     let screenshot = cx
         .capture_screenshot(handle)
         .context("Native desktop screenshot failed")?;
