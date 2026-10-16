@@ -8,7 +8,10 @@ import { chromium } from 'playwright';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const artifacts = resolve(root, 'artifacts');
-const url = 'http://127.0.0.1:4174';
+const port = process.env.PREVIEW_PORT ?? '4174';
+assert.match(port, /^\d{4,5}$/, 'PREVIEW_PORT must be a valid unprivileged TCP port');
+assert.ok(Number(port) >= 1024 && Number(port) <= 65535, 'PREVIEW_PORT must be between 1024 and 65535');
+const url = `http://127.0.0.1:${port}`;
 const dev = process.env.PREVIEW_DEV === '1';
 const started = Date.now();
 const summary = { mode: dev ? 'development' : 'production', scenarios: [], screenshots: [], pageErrors: [], standalone: dev ? 'checked by production run' : 'not generated' };
@@ -16,7 +19,7 @@ if (!dev) await access(resolve(root, 'dist/index.html'));
 await mkdir(artifacts, { recursive: true });
 
 // Spawn Vite directly so teardown owns one process, without an npm shell child.
-const server = spawn(process.execPath, [resolve(root, 'node_modules/vite/bin/vite.js'), ...(dev ? [] : ['preview']), '--host', '127.0.0.1', '--port', '4174', '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+const server = spawn(process.execPath, [resolve(root, 'node_modules/vite/bin/vite.js'), ...(dev ? [] : ['preview']), '--host', '127.0.0.1', '--port', port, '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
 let serverOutput = '';
 let serverError;
 server.on('error', error => { serverError = error; });
@@ -40,6 +43,7 @@ async function scenario(name, run) {
 async function reset(viewport = { width: 1536, height: 960 }) {
   await page.setViewportSize(viewport);
   await page.goto(url, { waitUntil: 'networkidle' });
+  await page.getByTestId('market-page').waitFor({ state: 'visible' });
   await page.getByRole('heading', { name: '引力传媒', exact: true }).waitFor();
   await page.evaluate(() => document.fonts.ready);
 }
@@ -47,6 +51,15 @@ async function count(locator, expected, message) {
   if (expected === 0) await locator.waitFor({ state: 'hidden' });
   else await locator.first().waitFor({ state: 'visible' });
   assert.equal(await locator.count(), expected, message);
+}
+async function navigate(id) {
+  await page.getByTestId(`nav-${id}`).click();
+  await page.getByTestId(`${id}-page`).waitFor({ state: 'visible' });
+  assert.equal(await page.getByTestId(`nav-${id}`).getAttribute('aria-current'), 'page');
+}
+async function noPageOverflow() {
+  const bounds = await page.evaluate(() => ({ width: innerWidth, scrollWidth: document.documentElement.scrollWidth }));
+  assert.ok(bounds.scrollWidth <= bounds.width + 1, `No page-level horizontal overflow: ${JSON.stringify(bounds)}`);
 }
 async function chartPosition(x = .3, y = .45) {
   const svg = page.getByTestId('market-chart').first().locator('svg');
@@ -235,16 +248,225 @@ try {
     const filter = page.getByRole('textbox', { name: '筛选当前分组', exact: true });
     await filter.focus();
     await page.keyboard.press('Control+k');
-    const dialog = page.getByRole('dialog', { name: '查找股票', exact: true });
+    const dialog = page.getByRole('dialog', { name: '全局搜索', exact: true });
     await dialog.waitFor();
-    const input = page.getByRole('textbox', { name: '搜索股票', exact: true });
+    const input = dialog.getByPlaceholder('搜索股票、代码或页面', { exact: true });
     assert.equal(await input.evaluate(el => el === document.activeElement), true);
     await input.fill('600519');
-    await count(page.locator('.search-result'), 1);
-    assert.match(await page.locator('.search-result').textContent(), /贵州茅台/);
+    await count(dialog.locator('.global-stock-result'), 1);
+    assert.match(await dialog.locator('.global-stock-result').textContent(), /贵州茅台/);
+    await input.dispatchEvent('keydown', { key: 'Escape', isComposing: true, keyCode: 229, bubbles: true });
+    await dialog.waitFor({ state: 'visible' });
     await page.keyboard.press('Escape');
     await count(dialog, 0);
     assert.equal(await filter.evaluate(el => el === document.activeElement), true, 'Focus returns to the original control');
+  });
+
+  await scenario('five work pages share navigation without losing the market selection', async () => {
+    await reset();
+    await page.getByRole('button', { name: '选择宁德时代', exact: true }).click();
+    for (const id of ['watch', 'limit', 'theme', 'journal']) {
+      await navigate(id);
+      assert.equal(await page.getByTestId('market-page').isVisible(), false);
+      await noPageOverflow();
+      await screenshot(`workspace-${id}`);
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+    for (const id of ['watch', 'limit', 'theme', 'journal']) {
+      await navigate(id);
+      await noPageOverflow();
+      if (id === 'watch' || id === 'journal') await screenshot(`workspace-${id}-1280`);
+    }
+    await page.setViewportSize({ width: 1536, height: 960 });
+    await navigate('market');
+    await page.getByTestId('market-page').getByRole('heading', { name: '宁德时代', exact: true }).waitFor();
+    await page.keyboard.press('Control+k');
+    const search = page.getByRole('dialog', { name: '全局搜索', exact: true });
+    await search.getByPlaceholder('搜索股票、代码或页面', { exact: true }).fill('题材');
+    await page.keyboard.press('Enter');
+    await page.getByTestId('theme-page').waitFor({ state: 'visible' });
+    await count(search, 0);
+  });
+
+  await scenario('watch monitoring and unread alerts survive page switches and open the linked stock', async () => {
+    await reset();
+    await navigate('watch');
+    const watch = page.getByTestId('watch-page');
+    await count(watch.getByTestId('watch-group'), 4);
+    await count(watch.getByTestId('watch-alert'), 3);
+    assert.match(await watch.locator('.watch-unread-count').textContent(), /2 条未读/);
+    await watch.getByRole('button', { name: '暂停监控', exact: true }).click();
+    assert.equal(await watch.getByRole('button', { name: '演示异动', exact: true }).isDisabled(), true);
+    await navigate('theme');
+    assert.match(await page.locator('.unified-status').textContent(), /演示监控已暂停/);
+    await navigate('watch');
+    await watch.getByRole('button', { name: '继续监控', exact: true }).click();
+    await watch.getByRole('button', { name: '演示异动', exact: true }).click();
+    await count(watch.getByTestId('watch-alert'), 4);
+    assert.match(await watch.locator('.watch-unread-count').textContent(), /3 条未读/);
+    await watch.getByTestId('watch-alert').first().click();
+    const inspection = page.getByRole('dialog', { name: '个股速览', exact: true });
+    await inspection.getByRole('heading', { name: '引力传媒', exact: true }).waitFor();
+    await page.keyboard.press('Escape');
+    await count(inspection, 0);
+    assert.match(await watch.locator('.watch-unread-count').textContent(), /2 条未读/);
+    await watch.getByRole('button', { name: '全部标为已读', exact: true }).click();
+    assert.match(await watch.locator('.watch-unread-count').textContent(), /0 条未读/);
+    await navigate('limit');
+    await navigate('watch');
+    await count(watch.getByTestId('watch-alert'), 4, 'Reading an alert does not delete the record');
+    await watch.getByRole('button', { name: '打开 阳光乳业 行情', exact: true }).click();
+    await page.getByTestId('market-page').waitFor({ state: 'visible' });
+    await page.getByTestId('market-page').getByRole('heading', { name: '阳光乳业', exact: true }).waitFor();
+    await count(page.getByRole('dialog', { name: '个股速览', exact: true }), 0);
+  });
+
+  await scenario('global search cannot bypass a group editor and resumes when the editor closes', async () => {
+    await reset();
+    await navigate('watch');
+    const watch = page.getByTestId('watch-page');
+    await watch.getByRole('button', { name: '管理分组 传媒 · 情绪观察', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: '管理分组', exact: true });
+    const name = editor.getByLabel('分组名称', { exact: true });
+    await name.fill('尚未提交的分组名称');
+    await page.keyboard.press('Control+k');
+    const search = page.getByRole('dialog', { name: '全局搜索', exact: true });
+    await count(search, 0, 'Global navigation must not leave an editable group snapshot open on another page');
+    assert.equal(await editor.isVisible(), true);
+    assert.equal(await name.inputValue(), '尚未提交的分组名称');
+    assert.equal(await page.getByTestId('nav-watch').getAttribute('aria-current'), 'page');
+    assert.match(await page.locator('.unified-toast').textContent(), /请先完成或关闭当前弹窗/);
+    await editor.getByRole('button', { name: '取消', exact: true }).click();
+    await count(editor, 0);
+    await watch.getByRole('button', { name: '管理分组 传媒 · 情绪观察', exact: true }).waitFor();
+    await page.keyboard.press('Control+k');
+    await search.waitFor();
+    await search.getByPlaceholder('搜索股票、代码或页面', { exact: true }).fill('题材');
+    await page.keyboard.press('Enter');
+    await page.getByTestId('theme-page').waitFor({ state: 'visible' });
+    await count(search, 0);
+  });
+
+  await scenario('historical research retains its date, sector and evidence through stock inspection into a draft', async () => {
+    await reset();
+    await navigate('limit');
+    const limit = page.getByTestId('limit-page');
+    await limit.getByRole('button', { name: '2026-10-08 AI 应用 3 条', exact: true }).click();
+    await limit.locator('.research-stock-button').filter({ hasText: '引力传媒' }).click();
+    const inspection = page.getByRole('dialog', { name: '个股速览', exact: true });
+    await inspection.getByRole('heading', { name: '引力传媒', exact: true }).waitFor();
+    await inspection.getByRole('button', { name: '引用到复盘', exact: true }).click();
+    const handoff = page.getByRole('dialog', { name: '引用为复盘草稿', exact: true });
+    await handoff.waitFor();
+    assert.equal(await handoff.getByLabel('草稿业务日期', { exact: true }).inputValue(), '2026-10-08');
+    assert.match(await handoff.locator('.source-summary').textContent(), /来自涨停.*AI 应用.*资料日期 2026-10-08/s);
+    assert.match(await handoff.locator('.source-summary').textContent(), /AI 营销 \+ 数字传媒 \+ 内容生产/);
+    await handoff.getByRole('button', { name: '创建草稿', exact: true }).click();
+    const editor = page.getByTestId('journal-editor');
+    await editor.waitFor();
+    assert.equal(await page.getByTestId('journal-page').getByLabel('复盘日期', { exact: true }).inputValue(), '2026-10-08');
+    assert.equal(await editor.getByLabel('板块名称', { exact: true }).inputValue(), 'AI 应用');
+    assert.match(await editor.getByLabel('赚钱效应与判断依据', { exact: true }).inputValue(), /资料 2026-10-08.*AI 营销 \+ 数字传媒 \+ 内容生产/s);
+    assert.match(await editor.locator('.journal-editor-context').textContent(), /涨停引用/);
+    assert.match(await editor.locator('.journal-editor-stocks').textContent(), /引力传媒/);
+    await editor.getByRole('button', { name: '保留草稿', exact: true }).click();
+  });
+
+  await scenario('research uses AND filters and appends only missing stocks to the chosen watch group', async () => {
+    await reset();
+    await navigate('limit');
+    const limit = page.getByTestId('limit-page');
+    await limit.getByRole('combobox', { name: '搜索字段', exact: true }).selectOption('sector');
+    await limit.getByRole('textbox', { name: '涨停搜索条件', exact: true }).fill('AI 应用');
+    await page.keyboard.press('Enter');
+    await limit.getByRole('combobox', { name: '搜索字段', exact: true }).selectOption('date');
+    await limit.getByRole('textbox', { name: '涨停搜索条件', exact: true }).fill('2026-10-14');
+    await page.keyboard.press('Enter');
+    await count(limit.locator('.limit-table tbody tr'), 3);
+    assert.match(await limit.locator('.limit-search-summary').textContent(), /2 个条件同时满足，共 3 条资料/);
+    const results = await limit.locator('.limit-table tbody tr').allTextContents();
+    for (const result of results) assert.match(result, /10-14.*AI 应用/s);
+    await limit.getByRole('button', { name: '清空条件', exact: true }).click();
+    await limit.getByRole('button', { name: '加入盯盘', exact: true }).click();
+    const handoff = page.getByRole('dialog', { name: '加入盯盘分组', exact: true });
+    await handoff.getByRole('combobox', { name: '目标盯盘分组', exact: true }).selectOption('media');
+    assert.match(await handoff.locator('.source-summary').textContent(), /来自涨停.*AI 应用.*2026-10-14/s);
+    assert.match(await handoff.locator('.handoff-total').textContent(), /新增 1 只.*跳过 2 只重复股票/s);
+    await screenshot('research-watch-handoff');
+    await handoff.getByRole('button', { name: '确认加入', exact: true }).click();
+    const watch = page.getByTestId('watch-page');
+    await watch.waitFor({ state: 'visible' });
+    const media = watch.getByTestId('watch-group').filter({ hasText: '传媒 · 情绪观察' });
+    await count(media.locator('.watch-stock-row'), 4);
+    const codes = await media.locator('.watch-stock-name small').allTextContents();
+    for (const code of ['603598', '001318', '300059', '002475']) assert.ok(codes.some(text => text.includes(code)), `Watch group retains ${code}`);
+    const technology = watch.getByTestId('watch-group').filter({ hasText: '科技 · 趋势跟踪' });
+    await count(technology.locator('.watch-stock-row'), 3, 'Appending to one group does not change another');
+    await navigate('limit');
+    await limit.getByRole('button', { name: '加入盯盘', exact: true }).click();
+    await handoff.waitFor();
+    assert.match(await handoff.locator('.handoff-total').textContent(), /新增 0 只.*跳过 3 只重复股票/s);
+    assert.equal(await handoff.getByRole('button', { name: '确认加入', exact: true }).isDisabled(), true);
+    await handoff.getByRole('button', { name: '取消', exact: true }).click();
+    await limit.getByRole('button', { name: '查看题材', exact: true }).click();
+    await page.getByTestId('theme-page').waitFor({ state: 'visible' });
+    assert.equal(await page.getByTestId('theme-page').getByLabel('题材请求截止日', { exact: true }).inputValue(), '2026-10-14');
+  });
+
+  await scenario('theme sources become an independent dated draft, survive editing, and persist after reading closes', async () => {
+    await reset();
+    await navigate('theme');
+    const theme = page.getByTestId('theme-page');
+    await theme.getByLabel('题材请求截止日', { exact: true }).fill('2026-10-16');
+    assert.match(await theme.locator('.theme-actual-date').textContent(), /2026-10-14.*已回退至最近导入日/s);
+    await theme.getByRole('button', { name: '引用为预案', exact: true }).click();
+    const handoff = page.getByRole('dialog', { name: '引用为复盘草稿', exact: true });
+    assert.equal(await handoff.getByLabel('草稿业务日期', { exact: true }).inputValue(), '2026-10-14');
+    assert.match(await handoff.locator('.source-summary').textContent(), /来自题材.*AI 应用.*资料日期 2026-10-14/s);
+    await handoff.getByLabel('草稿业务日期', { exact: true }).fill('2026-10-15');
+    await handoff.getByRole('button', { name: '创建草稿', exact: true }).click();
+    const journal = page.getByTestId('journal-page');
+    const editor = page.getByTestId('journal-editor');
+    await editor.waitFor();
+    assert.equal(await journal.getByLabel('复盘日期', { exact: true }).inputValue(), '2026-10-15');
+    assert.match(await editor.locator('.journal-editor-context').textContent(), /2026-10-15.*题材引用/s);
+    assert.equal(await editor.getByLabel('板块名称', { exact: false }).inputValue(), 'AI 应用');
+    assert.match(await editor.getByLabel('赚钱效应与判断依据', { exact: true }).inputValue(), /资料 2026-10-14/);
+    assert.match(await editor.locator('.journal-editor-stocks').textContent(), /引力传媒/);
+    await editor.getByRole('button', { name: '加入当日预案', exact: true }).click();
+    await editor.getByRole('alert').waitFor();
+    await count(journal.locator('.journal-plans-scroll').getByTestId('journal-plan'), 0, 'An incomplete draft does not become a plan');
+    await editor.getByLabel('买点手法', { exact: true }).fill('分歧承接验收');
+    await editor.getByLabel('买入条件', { exact: true }).fill('缩量回踩后，观察放量承接与板块同步。');
+    await screenshot('journal-draft');
+    await editor.getByRole('button', { name: '保留草稿', exact: true }).click();
+    await journal.getByLabel('复盘日期', { exact: true }).fill('2026-10-14');
+    await count(journal.locator('.journal-plans-scroll').getByTestId('journal-plan'), 2, 'Existing plans on another date remain untouched');
+    await journal.getByLabel('复盘日期', { exact: true }).fill('2026-10-15');
+    await journal.locator('.journal-drafts').getByRole('button', { name: 'AI 应用', exact: true }).click();
+    assert.equal(await editor.getByLabel('买点手法', { exact: true }).inputValue(), '分歧承接验收');
+    await editor.getByRole('button', { name: '加入当日预案', exact: true }).click();
+    await count(editor, 0);
+    const plans = journal.locator('.journal-plans-scroll').getByTestId('journal-plan');
+    await count(plans, 1);
+    assert.match(await plans.textContent(), /AI 应用.*分歧承接验收.*缩量回踩后/s);
+    await journal.getByRole('button', { name: '打开复盘阅读浮窗', exact: true }).click();
+    const reading = page.getByTestId('journal-reading-window');
+    await reading.waitFor();
+    await count(reading.getByTestId('journal-plan'), 1);
+    await reading.getByRole('textbox', { name: '浮窗盘中记录', exact: true }).fill('14:40 验证阅读浮窗共享记录，关闭只关闭视图。');
+    await screenshot('journal-reading');
+    await reading.getByRole('button', { name: '关闭复盘阅读浮窗', exact: true }).click();
+    await count(reading, 0);
+    await count(plans, 1, 'Closing the reading view never deletes the document');
+    assert.match(await journal.getByRole('textbox', { name: '盘中记录', exact: true }).inputValue(), /14:40 验证阅读浮窗共享记录/);
+    await journal.getByRole('button', { name: '立即保存复盘', exact: true }).click();
+    assert.match(await journal.locator('.journal-save-state').textContent(), /已保存至浏览器/);
+    await page.reload({ waitUntil: 'networkidle' });
+    await navigate('journal');
+    await journal.getByLabel('复盘日期', { exact: true }).fill('2026-10-15');
+    await count(plans, 1);
+    assert.match(await journal.getByRole('textbox', { name: '盘中记录', exact: true }).inputValue(), /14:40 验证阅读浮窗共享记录/);
   });
 
   const standalone = resolve(root, 'dist/tydaro-preview.html');
@@ -277,9 +499,14 @@ try {
     }
     await page.getByRole('heading', { name: '引力传媒', exact: true }).waitFor();
     await page.keyboard.press('Control+k');
-    await page.getByRole('textbox', { name: '搜索股票', exact: true }).fill('001318');
-    await count(page.locator('.search-result'), 1);
-    assert.match(await page.locator('.search-result').textContent(), /阳光乳业/);
+    await page.getByRole('dialog', { name: '全局搜索', exact: true })
+      .getByPlaceholder('搜索股票、代码或页面', { exact: true }).fill('001318');
+    await count(page.locator('.global-stock-result'), 1);
+    assert.match(await page.locator('.global-stock-result').textContent(), /阳光乳业/);
+    await page.keyboard.press('Enter');
+    await page.getByTestId('market-page').getByRole('heading', { name: '阳光乳业', exact: true }).waitFor();
+    await navigate('journal');
+    await navigate('theme');
     assert.deepEqual(assetRequests, [], 'Standalone HTML must not request separate assets');
     summary.standalone = { fileUrl: fileResult, dependencyRequests: assetRequests };
   });

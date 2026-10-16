@@ -140,6 +140,7 @@ function Modal({
       elements()[0];
     focusTarget?.focus();
     const key = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -332,7 +333,15 @@ const infoItems = [
   },
 ];
 
-export default function App() {
+export default function App({
+  embedded = false,
+  active = true,
+  stockRequest,
+}: {
+  embedded?: boolean;
+  active?: boolean;
+  stockRequest?: { code: string; sequence: number } | null;
+}) {
   const [boards, setBoards] = useState<Board[]>(initialBoards);
   const [activeId, setActiveId] = useState("overview");
   const board = boards.find((b) => b.id === activeId)!;
@@ -381,6 +390,18 @@ export default function App() {
   const notify = (text: string, undo?: () => void) => setToast({ text, undo });
   const selectStock = (code: string) => updateBoard({ selected: code });
   const closeModal = useRef(() => setModal(null)).current;
+  const lastStockRequest = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!stockRequest || lastStockRequest.current === stockRequest.sequence)
+      return;
+    lastStockRequest.current = stockRequest.sequence;
+    setBoards((bs) =>
+      bs.map((b) =>
+        b.id === activeId ? { ...b, selected: stockRequest.code } : b,
+      ),
+    );
+  }, [stockRequest, activeId]);
 
   useEffect(() => {
     if (!toast) return;
@@ -389,7 +410,12 @@ export default function App() {
   }, [toast]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      if (!active || e.isComposing || e.keyCode === 229) return;
+      if (
+        !embedded &&
+        (e.ctrlKey || e.metaKey) &&
+        e.key.toLowerCase() === "k"
+      ) {
         e.preventDefault();
         setQuery("");
         setModal("search");
@@ -403,7 +429,7 @@ export default function App() {
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [modal]);
+  }, [modal, embedded, active]);
   useEffect(() => {
     setListQuery("");
     setFilter("all");
