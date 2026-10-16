@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 import { chromium } from 'playwright';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -84,7 +85,7 @@ try {
   while (Date.now() < deadline) {
     if (serverError || server.exitCode !== null) throw serverError ?? new Error(`Preview server exited: ${serverOutput}`);
     // A service already using the port must not be mistaken for our process.
-    if (!serverOutput.includes(url)) { await pause(100); continue; }
+    if (!stripVTControlCharacters(serverOutput).includes(url)) { await pause(100); continue; }
     try { ready = (await fetch(url, { signal: AbortSignal.timeout(500) })).ok; } catch { /* Startup is bounded by the deadline. */ }
     if (ready) break;
     await pause(100);
