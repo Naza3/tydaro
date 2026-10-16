@@ -4,13 +4,19 @@
 
 当前是前端预览版：启动直接进入工作区，行情、资讯、订单和持仓均使用本地模拟数据，无需登录。没有行情后端、券商连接或真实交易功能，CLI 与后端接入留待后续阶段。
 
-![Tydaro 工作区](docs/preview.png)
+![Tydaro 原生五页工作台](docs/native-design/market.png)
+
+## 五页原生工作台
+
+行情、盯盘、涨停、题材、复盘共用浅色与青绿色外壳、导航、搜索和状态反馈。盯盘支持独立分组与演示异动；涨停支持跨日资料与 AND 筛选；题材展示周期证据和截止日联动；复盘支持按日预案、独立草稿、方法词库、人工记录及原生阅读窗口。资料可经确认加入指定分组或引用为草稿，保留来源日期与依据。
+
+新业务数据保存到独立的 `desktop.json`，原有行情看板与 `workspace.json` 继续兼容。研究算法与行情仍为本地样例，新研究页面采用任务布局。能力范围、截图和验证入口见 [GPUI 实现说明](docs/native-design.md)。
 
 ## 桌面视觉设计预览
 
-另有独立的 [React 交互样机](design-preview/README.md)，用于评审浅色工作台、看板、股票分组、行情图与组件浮窗的视觉和操作；它不替换 Rust 主程序。构建后可下载并离线打开 `design-preview/dist/tydaro-preview.html`。设计依据和原生复刻路径见 [GPUI 设计交接](docs/design-preview.md)。
+另有独立的 [React 交互样机](design-preview/README.md)，保留五页设计对照；原生应用已使用 GPUI 复刻主要页面与操作。构建后可下载并离线打开 `design-preview/dist/tydaro-preview.html`。设计依据和原生映射见 [GPUI 设计交接](docs/design-preview.md)。
 
-![浅色桌面设计预览](docs/design-preview.png)
+![React 设计对照](docs/design-unified/watch.png)
 
 ## 第一版工作区
 
@@ -41,7 +47,7 @@
 
 股票联动组用于同步股票列表、图表、报价等面板当前选择的股票，不共享列表成员。可以同时摆放“科技股”“港股观察”等不同列表，同一股票也可出现在多个列表中。行情图提供周期、均线、成交量和缩放，不包含“诊股、画线、工具”入口。
 
-股票列表的“从文本导入”支持粘贴代码/名称及读取 TXT、CSV 文本，自动预览可添加、已有、重复与目录未收录项目。确认后只向当前分组追加匹配股票；当前目录包含原有六只美港股以及引力传媒（603598）、阳光乳业（001318）两只 A 股模拟样例。
+股票列表的“从文本导入”支持粘贴代码/名称及读取 TXT、CSV 文本，自动预览可添加、已有、重复与目录未收录项目。确认后只向当前分组追加匹配股票；当前目录包含原有六只美港股和十二只 A 股模拟样例，已有列表成员保持原样。
 
 ## 看板与自定义布局
 
@@ -109,6 +115,9 @@ cargo test --locked --all-targets
 
 | 路径 | 职责 |
 | --- | --- |
+| `src/desktop.rs` / `src/desktop_ui.rs` | 五页外壳、搜索、跨页确认及视觉样式 |
+| `src/desktop_state.rs` | 独立业务文档、校验、备份与保存保护 |
+| `src/watch_page.rs` / `src/research_page.rs` / `src/journal_page.rs` | 盯盘、涨停、题材及复盘原生界面 |
 | `src/workspace.rs` | 窗口、Dock、面板实例和联动、工作区操作 |
 | `src/board_bar.rs` | 顶部看板选择、命名和管理交互 |
 | `src/boards.rs` | 看板集合、名称与身份校验、旧布局包装 |

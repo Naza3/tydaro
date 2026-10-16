@@ -26,10 +26,10 @@ use crate::{
 /// Render the real default application and exercise the public UI with native
 /// pointer events. The screenshot uses the real platform headless renderer;
 /// missing GPU/software-renderer support is an error, never a blank fallback.
-pub fn run(path: &str) -> Result<()> {
+fn open_headless_workspace() -> Result<(HeadlessAppContext, Entity<workspace::Workspace>)> {
     let mut cx = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::desktop_ui::AppAssets),
         gpui_kit::platform::current_headless_renderer,
     );
     cx.update(|cx| workspace::init(cx, false));
@@ -38,6 +38,63 @@ pub fn run(path: &str) -> Result<()> {
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    Ok((cx, workspace))
+}
+
+/// Focused iteration of the production desktop pages. Full release validation
+/// still uses `run`, which includes legacy workspace and chart regressions.
+pub fn run_desktop(path: &str) -> Result<()> {
+    let (mut cx, workspace) = open_headless_workspace()?;
+    let output = Path::new(path);
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create screenshot directory {}", parent.display()))?;
+    }
+    verify_desktop_with_failure_capture(&mut cx, &workspace, output)
+}
+
+fn verify_desktop_with_failure_capture(
+    cx: &mut HeadlessAppContext,
+    workspace: &Entity<workspace::Workspace>,
+    output: &Path,
+) -> Result<()> {
+    let result = crate::desktop_smoke::verify(cx, workspace, output);
+    if result.is_err() {
+        let handle = cx.update(|cx| workspace.read(cx).handle);
+        let stem = output
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        let path = output.with_file_name(format!("{stem}-desktop-failure.png"));
+        match cx
+            .capture_screenshot(handle)
+            .and_then(|image| Ok(image.save(&path)?))
+        {
+            Ok(()) => eprintln!("Desktop failure screenshot: {}", path.display()),
+            Err(error) => eprintln!("Could not capture desktop failure: {error:#}"),
+        }
+        let other_windows = cx.update(|cx| cx.windows());
+        for (index, other) in other_windows
+            .into_iter()
+            .filter(|other| *other != handle)
+            .enumerate()
+        {
+            let path = output.with_file_name(format!("{stem}-desktop-failure-window-{index}.png"));
+            match cx
+                .capture_screenshot(other)
+                .and_then(|image| Ok(image.save(&path)?))
+            {
+                Ok(()) => eprintln!("Additional native failure screenshot: {}", path.display()),
+                Err(error) => eprintln!("Could not capture additional native failure: {error:#}"),
+            }
+        }
+    }
+    result
+}
+
+pub fn run(path: &str) -> Result<()> {
+    let (mut cx, workspace) = open_headless_workspace()?;
+    let handle = cx.update(|cx| workspace.read(cx).handle);
     cx.update(workspace::verify_transfer_geometry)?;
     let initial = cx.update(|cx| workspace.read(cx).dock.read(cx).dump(cx));
     let mut initial_panels = Vec::new();
@@ -177,6 +234,10 @@ pub fn run(path: &str) -> Result<()> {
     verify_chart_inspection(&mut cx, output)?;
     verify_stock_import(&mut cx, output)?;
     verify_fixed_intraday(&mut cx, output)?;
+    let current = cx
+        .update(|cx| workspace::workspace(0, cx))
+        .context("Main workspace missing before desktop checks")?;
+    verify_desktop_with_failure_capture(&mut cx, &current, output)?;
 
     println!(
         "PASS: native workspace {} × {}, {} panels; MSFT link group, 日 K, chart zoom; detach/return state, persistence/undo and demo order interactions. Screenshot: {}",
@@ -837,7 +898,7 @@ fn verify_stock_import_interactions(cx: &mut HeadlessAppContext, output: &Path) 
         stock_import_value(cx, id)?.is_empty(),
         "Reopening import retained its cancelled draft"
     );
-    let text = "AAPL 苹果\r\n00700 腾讯控股\r\naapl\r\nTSLA\t特斯拉\n09988 阿里巴巴\nSH603598 引力传媒\n001318 阳光乳业\n603598.SH\n600519 贵州茅台\nGOOG";
+    let text = "AAPL 苹果\r\n00700 腾讯控股\r\naapl\r\nTSLA\t特斯拉\n09988 阿里巴巴\nSH603598 引力传媒\n001318 阳光乳业\n603598.SH\n600520\nGOOG";
     paste_stock_import(cx, id, text)?;
     expect_import_summary(cx, id, "可添加 5 支 · 已有 1 支 · 重复 2 次 · 未收录 2 项")?;
     ensure!(
@@ -906,7 +967,7 @@ fn verify_stock_import_interactions(cx: &mut HeadlessAppContext, output: &Path) 
     );
     paste_stock_import(cx, id, "NVDA")?;
     expect_import_summary(cx, id, "可添加 1 支 · 已有 0 支 · 重复 0 次 · 未收录 0 项")?;
-    paste_stock_import(cx, id, "600519")?;
+    paste_stock_import(cx, id, "600520")?;
     expect_import_summary(cx, id, "可添加 0 支 · 已有 0 支 · 重复 0 次 · 未收录 1 项")?;
     click_list_control(cx, id, "stock-import-confirm")?;
     ensure!(

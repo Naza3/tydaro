@@ -16,6 +16,16 @@ pub enum Symbol {
     Alibaba,
     Yinli,
     Yangguang,
+    Catl,
+    Moutai,
+    Seres,
+    Byd,
+    Eastmoney,
+    Smic,
+    Midea,
+    Luxshare,
+    Cmb,
+    Wuliangye,
 }
 
 impl Symbol {
@@ -28,7 +38,7 @@ impl Symbol {
         Self::Alibaba,
     ];
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 18] = [
         Self::Aapl,
         Self::Msft,
         Self::Nvda,
@@ -37,10 +47,47 @@ impl Symbol {
         Self::Alibaba,
         Self::Yinli,
         Self::Yangguang,
+        Self::Catl,
+        Self::Moutai,
+        Self::Seres,
+        Self::Byd,
+        Self::Eastmoney,
+        Self::Smic,
+        Self::Midea,
+        Self::Luxshare,
+        Self::Cmb,
+        Self::Wuliangye,
+    ];
+
+    /// A-share demonstration directory, in the same order as the design preview.
+    /// Expanding this catalog does not append members to existing saved groups.
+    pub const A_SHARES: [Self; 12] = [
+        Self::Yinli,
+        Self::Yangguang,
+        Self::Catl,
+        Self::Moutai,
+        Self::Seres,
+        Self::Byd,
+        Self::Eastmoney,
+        Self::Smic,
+        Self::Midea,
+        Self::Luxshare,
+        Self::Cmb,
+        Self::Wuliangye,
     ];
 
     pub fn is_a_share(self) -> bool {
-        matches!(self, Self::Yinli | Self::Yangguang)
+        Self::A_SHARES.contains(&self)
+    }
+
+    /// Exact catalog code lookup. Numeric codes stay strings so leading zeroes
+    /// retain their identity; display names and exchange prefixes are handled by
+    /// the separate stock import parser.
+    pub fn from_code(code: &str) -> Option<Self> {
+        let code = code.trim();
+        Self::ALL
+            .into_iter()
+            .find(|symbol| symbol.code().eq_ignore_ascii_case(code))
     }
 
     pub fn code(self) -> &'static str {
@@ -53,6 +100,16 @@ impl Symbol {
             Self::Alibaba => "09988",
             Self::Yinli => "603598",
             Self::Yangguang => "001318",
+            Self::Catl => "300750",
+            Self::Moutai => "600519",
+            Self::Seres => "601127",
+            Self::Byd => "002594",
+            Self::Eastmoney => "300059",
+            Self::Smic => "688981",
+            Self::Midea => "000333",
+            Self::Luxshare => "002475",
+            Self::Cmb => "600036",
+            Self::Wuliangye => "000858",
         }
     }
 
@@ -66,23 +123,56 @@ impl Symbol {
             Self::Alibaba => "阿里巴巴",
             Self::Yinli => "引力传媒",
             Self::Yangguang => "阳光乳业",
+            Self::Catl => "宁德时代",
+            Self::Moutai => "贵州茅台",
+            Self::Seres => "赛力斯",
+            Self::Byd => "比亚迪",
+            Self::Eastmoney => "东方财富",
+            Self::Smic => "中芯国际",
+            Self::Midea => "美的集团",
+            Self::Luxshare => "立讯精密",
+            Self::Cmb => "招商银行",
+            Self::Wuliangye => "五粮液",
+        }
+    }
+
+    pub fn sector(self) -> &'static str {
+        match self {
+            Self::Aapl | Self::Luxshare => "消费电子",
+            Self::Msft => "软件服务",
+            Self::Nvda | Self::Smic => "半导体",
+            Self::Tsla | Self::Seres | Self::Byd => "汽车整车",
+            Self::Tencent | Self::Alibaba => "互联网服务",
+            Self::Yinli => "文化传媒",
+            Self::Yangguang => "食品饮料",
+            Self::Catl => "电池",
+            Self::Moutai | Self::Wuliangye => "白酒",
+            Self::Eastmoney => "证券",
+            Self::Midea => "家用电器",
+            Self::Cmb => "银行",
         }
     }
 
     pub fn market(self) -> &'static str {
         match self {
             Self::Tencent | Self::Alibaba => "HK",
-            Self::Yinli => "SH",
-            Self::Yangguang => "SZ",
-            _ => "US",
+            Self::Yinli | Self::Moutai | Self::Seres | Self::Smic | Self::Cmb => "SH",
+            Self::Yangguang
+            | Self::Catl
+            | Self::Byd
+            | Self::Eastmoney
+            | Self::Midea
+            | Self::Luxshare
+            | Self::Wuliangye => "SZ",
+            Self::Aapl | Self::Msft | Self::Nvda | Self::Tsla => "US",
         }
     }
 
     pub fn currency(self) -> &'static str {
         match self {
             Self::Tencent | Self::Alibaba => "HKD",
-            Self::Yinli | Self::Yangguang => "CNY",
-            _ => "USD",
+            Self::Aapl | Self::Msft | Self::Nvda | Self::Tsla => "USD",
+            _ => "CNY",
         }
     }
 
@@ -96,6 +186,16 @@ impl Symbol {
             Self::Alibaba => 131,
             Self::Yinli => 157,
             Self::Yangguang => 181,
+            Self::Catl => 211,
+            Self::Moutai => 239,
+            Self::Seres => 269,
+            Self::Byd => 293,
+            Self::Eastmoney => 317,
+            Self::Smic => 347,
+            Self::Midea => 373,
+            Self::Luxshare => 401,
+            Self::Cmb => 431,
+            Self::Wuliangye => 457,
         }
     }
 
@@ -109,6 +209,16 @@ impl Symbol {
             Self::Alibaba => 17_160,
             Self::Yinli => 1_992,
             Self::Yangguang => 1_403,
+            Self::Catl => 26_260,
+            Self::Moutai => 147_841,
+            Self::Seres => 11_859,
+            Self::Byd => 10_748,
+            Self::Eastmoney => 2_828,
+            Self::Smic => 9_712,
+            Self::Midea => 7_880,
+            Self::Luxshare => 5_284,
+            Self::Cmb => 4_305,
+            Self::Wuliangye => 12_570,
         }
     }
 
@@ -122,6 +232,16 @@ impl Symbol {
             Self::Alibaba => -164,
             Self::Yinli => 150,
             Self::Yangguang => 92,
+            Self::Catl => 620,
+            Self::Moutai => -961,
+            Self::Seres => 499,
+            Self::Byd => -120,
+            Self::Eastmoney => 103,
+            Self::Smic => 124,
+            Self::Midea => -65,
+            Self::Luxshare => 112,
+            Self::Cmb => -16,
+            Self::Wuliangye => 60,
         }
     }
 
@@ -135,7 +255,11 @@ impl Symbol {
                 Self::Tsla => 87,
                 Self::Tencent => 89,
                 Self::Alibaba => 92,
-                Self::Yinli | Self::Yangguang => 100,
+                Self::Yinli | Self::Yangguang | Self::Moutai | Self::Cmb | Self::Wuliangye => 100,
+                Self::Catl | Self::Midea | Self::Luxshare => 95,
+                Self::Seres | Self::Eastmoney => 90,
+                Self::Byd => 75,
+                Self::Smic => 80,
             }
             / 100
     }
@@ -151,6 +275,16 @@ impl Symbol {
                 Self::Alibaba => 20.85,
                 Self::Yinli => 42.10,
                 Self::Yangguang => 47.01,
+                Self::Catl => 25.60,
+                Self::Moutai => 23.40,
+                Self::Seres => 48.20,
+                Self::Byd => 24.80,
+                Self::Eastmoney => 42.60,
+                Self::Smic => 85.30,
+                Self::Midea => 14.20,
+                Self::Luxshare => 22.80,
+                Self::Cmb => 6.80,
+                Self::Wuliangye => 17.50,
             }
     }
 
@@ -164,6 +298,16 @@ impl Symbol {
             Self::Alibaba => 18_560_000_000,
             Self::Yinli => 267_862_800,
             Self::Yangguang => 283_200_000,
+            Self::Catl => 4_405_000_000,
+            Self::Moutai => 1_256_197_800,
+            Self::Seres => 1_634_000_000,
+            Self::Byd => 9_117_000_000,
+            Self::Eastmoney => 15_838_000_000,
+            Self::Smic => 7_986_000_000,
+            Self::Midea => 7_027_000_000,
+            Self::Luxshare => 7_237_000_000,
+            Self::Cmb => 25_219_845_601,
+            Self::Wuliangye => 3_881_608_005,
         }
     }
 }
@@ -1126,6 +1270,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_codes_round_trip_without_losing_leading_zeroes() {
+        let codes: std::collections::HashSet<_> =
+            Symbol::ALL.iter().map(|symbol| symbol.code()).collect();
+        assert_eq!(codes.len(), Symbol::ALL.len());
+        for symbol in Symbol::ALL {
+            assert_eq!(Symbol::from_code(symbol.code()), Some(symbol));
+            assert!(!symbol.name().is_empty());
+            assert!(!symbol.sector().is_empty());
+        }
+        assert_eq!(Symbol::from_code("  aapl \n"), Some(Symbol::Aapl));
+        assert_eq!(Symbol::from_code("00700"), Some(Symbol::Tencent));
+        assert_eq!(Symbol::from_code("001318"), Some(Symbol::Yangguang));
+        assert_eq!(Symbol::from_code("000333"), Some(Symbol::Midea));
+        assert_eq!(Symbol::from_code("000858"), Some(Symbol::Wuliangye));
+        for unknown in [
+            "",
+            "700",
+            "1318",
+            "333",
+            "858",
+            "SH600519",
+            "贵州茅台",
+            "999999",
+        ] {
+            assert_eq!(Symbol::from_code(unknown), None, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn expanded_catalog_keeps_serialized_legacy_symbols_and_group_defaults() {
+        let legacy = [
+            ("Aapl", Symbol::Aapl),
+            ("Msft", Symbol::Msft),
+            ("Nvda", Symbol::Nvda),
+            ("Tsla", Symbol::Tsla),
+            ("Tencent", Symbol::Tencent),
+            ("Alibaba", Symbol::Alibaba),
+            ("Yinli", Symbol::Yinli),
+            ("Yangguang", Symbol::Yangguang),
+        ];
+        for (index, (serialized, symbol)) in legacy.iter().enumerate() {
+            assert_eq!(Symbol::ALL[index], *symbol);
+            assert_eq!(
+                serde_json::from_value::<Symbol>(serde_json::json!(serialized)).unwrap(),
+                *symbol
+            );
+            assert_eq!(serde_json::to_value(symbol).unwrap(), *serialized);
+        }
+        assert_eq!(&Symbol::ALL[..6], &Symbol::LEGACY_DEFAULTS);
+        for symbol in Symbol::ALL {
+            assert_eq!(
+                serde_json::from_value::<Symbol>(serde_json::to_value(symbol).unwrap()).unwrap(),
+                symbol
+            );
+        }
+    }
+
+    #[test]
+    fn a_share_directory_uses_cny_and_local_exchange_schedules() {
+        let directory: std::collections::HashSet<_> = Symbol::A_SHARES.into_iter().collect();
+        assert_eq!(directory.len(), 12);
+        for symbol in Symbol::A_SHARES {
+            assert!(Symbol::ALL.contains(&symbol));
+            assert!(symbol.is_a_share());
+            assert_eq!(symbol.currency(), "CNY");
+            assert!(matches!(symbol.market(), "SH" | "SZ"));
+            assert_eq!(symbol.code().len(), 6);
+            assert!(symbol.code().bytes().all(|byte| byte.is_ascii_digit()));
+            assert_eq!(session_axis(symbol).lunch, Some((690, 780)));
+            assert_eq!(session_state(symbol, 0).wall_minute, 600);
+            assert_eq!(session_state(symbol, u64::MAX).wall_minute, 900);
+        }
+        assert!(
+            Symbol::LEGACY_DEFAULTS
+                .into_iter()
+                .all(|symbol| !symbol.is_a_share())
+        );
+    }
+
+    #[test]
     fn all_panels_share_one_deterministic_snapshot() {
         for symbol in Symbol::ALL {
             for tick in [0, 1, 76, 210, 211, 10_000, u64::MAX] {
@@ -1494,7 +1718,7 @@ mod tests {
 
     #[test]
     fn a_share_session_boundaries_separate_auction_waiting_and_lunch() {
-        for symbol in [Symbol::Yinli, Symbol::Yangguang] {
+        for symbol in Symbol::A_SHARES {
             for (minute, phase) in [
                 (554, SessionPhase::BeforeOpen),
                 (555, SessionPhase::OpeningAuctionCancelable),
@@ -1549,7 +1773,7 @@ mod tests {
 
     #[test]
     fn auctions_never_contribute_indicative_prices_to_executed_statistics() {
-        for symbol in [Symbol::Yinli, Symbol::Yangguang] {
+        for symbol in Symbol::A_SHARES {
             let indicative = indicative_at(symbol, 564, 20., 21., symbol.seed());
             assert_eq!(indicative.len(), 10);
             assert!(session_bars_at(symbol, 564).is_empty());
@@ -1607,7 +1831,7 @@ mod tests {
 
     #[test]
     fn trade_and_order_timestamps_never_invent_executions_during_a_market_break() {
-        for symbol in [Symbol::Yinli, Symbol::Yangguang, Symbol::Tencent] {
+        for symbol in Symbol::A_SHARES.into_iter().chain([Symbol::Tencent]) {
             let axis = session_axis(symbol);
             let (lunch_start, lunch_end) = axis.lunch.unwrap();
             for tick in [0, 31, 90, 120, 179, 180, 181, 296, 297, 299, 300, u64::MAX] {

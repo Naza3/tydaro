@@ -19,10 +19,11 @@ use crate::{
 };
 
 const INK: u32 = 0x233348;
-const MUTED: u32 = 0x85909f;
+const MUTED: u32 = 0x586879;
 const LINE: u32 = 0xe8ecf0;
 const TEAL: u32 = 0x009b9a;
-const RED: u32 = 0xef4770;
+const DOWN: u32 = 0x007d78;
+const RED: u32 = 0xc92f57;
 
 #[derive(Clone, Debug)]
 pub enum ContentEvent {
@@ -46,7 +47,7 @@ impl Side {
         }
     }
     fn color(self) -> u32 {
-        if self == Self::Buy { RED } else { TEAL }
+        if self == Self::Buy { RED } else { DOWN }
     }
 }
 
@@ -754,7 +755,7 @@ impl PanelContent {
                         div()
                             .px_2()
                             .pb_1()
-                            .text_size(px(10.))
+                            .text_size(px(12.))
                             .text_color(rgb(MUTED))
                             .flex_shrink_0()
                             .child("粘贴代码、名称或表格；支持换行、空格及中英文逗号。"),
@@ -817,7 +818,7 @@ impl PanelContent {
                         div()
                             .px_2()
                             .pb_1()
-                            .text_size(px(10.))
+                            .text_size(px(12.))
                             .text_color(rgb(MUTED))
                             .flex_shrink_0()
                             .child("TXT / CSV · UTF-8、UTF-16、GB18030 · 最多 256 KiB"),
@@ -830,7 +831,7 @@ impl PanelContent {
                             .px_2()
                             .py_1()
                             .bg(rgb(0xe8f6f6))
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .flex_shrink_0()
                             .child(summary),
                     )
@@ -877,7 +878,7 @@ impl PanelContent {
                                         )))
                                         .child(
                                             div()
-                                                .text_size(px(10.))
+                                                .text_size(px(12.))
                                                 .text_color(rgb(if exists { MUTED } else { TEAL }))
                                                 .flex_shrink_0()
                                                 .child(if exists {
@@ -904,7 +905,7 @@ impl PanelContent {
                                             .child(div().flex_1().min_w_0().child(code.clone()))
                                             .child(
                                                 div()
-                                                    .text_size(px(10.))
+                                                    .text_size(px(12.))
                                                     .text_color(rgb(MUTED))
                                                     .flex_shrink_0()
                                                     .child("目录未收录"),
@@ -954,7 +955,7 @@ impl PanelContent {
                     )
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(12.))
                             .text_color(rgb(MUTED))
                             .child("仅匹配当前模拟目录，自动跳过已有和重复股票"),
                     ),
@@ -1022,7 +1023,7 @@ impl PanelContent {
                     .children(symbols.into_iter().map(|symbol| {
                         let exists = self.members.contains(&symbol);
                         div()
-                            .h(px(53.))
+                            .h(px(48.))
                             .px_2()
                             .flex()
                             .items_center()
@@ -1040,7 +1041,7 @@ impl PanelContent {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(10.))
+                                            .text_size(px(12.))
                                             .text_color(rgb(MUTED))
                                             .child(format!(
                                                 "{}  {}",
@@ -1086,7 +1087,7 @@ impl PanelContent {
                     .py_2()
                     .border_t_1()
                     .border_color(rgb(LINE))
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child(format!("模拟股票目录 · 当前列表 {} 支", self.members.len())),
             )
@@ -1215,7 +1216,7 @@ impl PanelContent {
                         let quote = market::quote(symbol, self.tick);
                         div()
                             .id(SharedString::from(format!("symbol-{}", symbol.code())))
-                            .h(px(53.))
+                            .h(px(48.))
                             .px_2()
                             .flex()
                             .items_center()
@@ -1238,13 +1239,14 @@ impl PanelContent {
                                     .child(
                                         div()
                                             .truncate()
+                                            .text_size(px(14.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .child(symbol.name()),
                                     )
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(10.))
+                                            .text_size(px(12.))
                                             .text_color(rgb(MUTED))
                                             .child(format!(
                                                 "{}  {}",
@@ -1330,7 +1332,7 @@ impl PanelContent {
                 div()
                     .px_3()
                     .py_2()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .border_t_1()
                     .border_color(rgb(LINE))
@@ -1351,7 +1353,7 @@ impl PanelContent {
             .child(
                 div()
                     .id("chart-periods")
-                    .h(px(31.))
+                    .h(px(36.))
                     .flex_shrink_0()
                     .px_1()
                     .flex()
@@ -1422,7 +1424,7 @@ impl PanelContent {
                 div()
                     .px_2()
                     .py_1()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child(if self.period == Period::Day {
                         "单击查看数据 · ← → 逐日定位 · 双击查看当日分时 · Esc 退出定位"
@@ -1445,7 +1447,7 @@ impl PanelContent {
             .child(
                 div()
                     .px_2()
-                    .h(px(28.))
+                    .h(px(40.))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1454,7 +1456,7 @@ impl PanelContent {
                     .text_color(movement(q.change))
                     .child(
                         div()
-                            .text_size(px(17.))
+                            .text_size(px(22.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("{:.3}", q.price)),
                     )
@@ -1505,7 +1507,7 @@ impl PanelContent {
                         rgb(RED),
                         "主动卖",
                         compact(q.sell_volume as f64),
-                        rgb(TEAL),
+                        rgb(DOWN),
                     ))
                     .child(metric(
                         "市盈(TTM)",
@@ -1529,10 +1531,10 @@ impl PanelContent {
             .child(
                 div()
                     .px_2()
-                    .h(px(18.))
+                    .h(px(24.))
                     .flex()
                     .items_center()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .border_t_1()
                     .border_color(rgb(LINE))
@@ -1576,7 +1578,7 @@ impl PanelContent {
                 ))
                 .children(pending.iter().map(|order| {
                     div()
-                        .h(px(20.))
+                        .h(px(24.))
                         .px_2()
                         .flex()
                         .items_center()
@@ -1586,7 +1588,7 @@ impl PanelContent {
                             div()
                                 .w(px(36.))
                                 .flex_shrink_0()
-                                .text_color(rgb(if order.buy { RED } else { TEAL }))
+                                .text_color(rgb(if order.buy { RED } else { DOWN }))
                                 .child(if order.buy { "买" } else { "卖" }),
                         )
                         .child(
@@ -1598,7 +1600,7 @@ impl PanelContent {
                         .child(amount_cell(
                             order.size as f64,
                             order.size as f32 / max,
-                            if order.buy { RED } else { TEAL },
+                            if order.buy { RED } else { DOWN },
                             95.,
                         ))
                         .child(
@@ -1611,14 +1613,14 @@ impl PanelContent {
                 }));
         } else {
             depth = depth
-                .child(book_section("卖盘", TEAL))
+                .child(book_section("卖盘", DOWN))
                 .children(asks.iter().enumerate().map(|(index, level)| {
                     book_row(
                         format!("卖 {}", index + 1),
                         level.price,
                         level.size,
                         max_size,
-                        TEAL,
+                        DOWN,
                     )
                 }))
                 .child(book_section("买盘", RED))
@@ -1667,7 +1669,7 @@ impl PanelContent {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(12.))
                             .text_color(rgb(MUTED))
                             .child(format!("股 · {}", currency(self.symbol))),
                     ),
@@ -1675,12 +1677,12 @@ impl PanelContent {
             .child(
                 div()
                     .px_2()
-                    .h(px(18.))
+                    .h(px(24.))
                     .items_center()
                     .flex_shrink_0()
                     .flex()
                     .justify_between()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .child(
                         div()
                             .text_color(rgb(RED))
@@ -1688,7 +1690,7 @@ impl PanelContent {
                     )
                     .child(
                         div()
-                            .text_color(rgb(TEAL))
+                            .text_color(rgb(DOWN))
                             .child(format!("卖盘 {:.1}%", (1. - ratio) * 100.)),
                     ),
             )
@@ -1698,7 +1700,7 @@ impl PanelContent {
                     .h(px(2.))
                     .flex_shrink_0()
                     .flex()
-                    .bg(rgb(TEAL))
+                    .bg(rgb(DOWN))
                     .child(div().h_full().w(relative(ratio)).bg(rgb(RED))),
             )
             .child(
@@ -1706,7 +1708,7 @@ impl PanelContent {
                     .id("best-bid-ask")
                     .mx_2()
                     .flex_shrink_0()
-                    .h(px(20.))
+                    .h(px(24.))
                     .flex()
                     .items_center()
                     .child(
@@ -1731,7 +1733,7 @@ impl PanelContent {
                             .items_center()
                             .justify_between()
                             .bg(rgb(0xe8f8f5))
-                            .text_color(rgb(TEAL))
+                            .text_color(rgb(DOWN))
                             .child("卖一")
                             .child(format!("{:.3}", asks[0].price)),
                     )
@@ -1740,7 +1742,7 @@ impl PanelContent {
             .when(!self.book_queue, |d| {
                 d.child(
                     div()
-                        .h(px(20.))
+                        .h(px(24.))
                         .px_2()
                         .flex()
                         .items_center()
@@ -1757,12 +1759,12 @@ impl PanelContent {
             .child(
                 div()
                     .px_2()
-                    .h(px(18.))
+                    .h(px(24.))
                     .items_center()
                     .border_t_1()
                     .border_color(rgb(LINE))
                     .flex_shrink_0()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .flex()
                     .justify_between()
                     .child(format!("均价 {:.3}", q.turnover / q.volume.max(1) as f64))
@@ -1783,7 +1785,7 @@ impl PanelContent {
             .flex_col()
             .child(
                 div()
-                    .h(px(20.))
+                    .h(px(24.))
                     .px_2()
                     .flex()
                     .items_center()
@@ -1813,7 +1815,7 @@ impl PanelContent {
                             .enumerate()
                             .map(|(index, trade)| {
                                 div()
-                                    .h(px(20.))
+                                    .h(px(24.))
                                     .px_2()
                                     .flex()
                                     .items_center()
@@ -1832,7 +1834,7 @@ impl PanelContent {
                                         div()
                                             .w(px(62.))
                                             .text_right()
-                                            .text_color(rgb(if trade.buy { RED } else { TEAL }))
+                                            .text_color(rgb(if trade.buy { RED } else { DOWN }))
                                             .child(trade.size.to_string()),
                                     )
                                     .child(
@@ -1924,7 +1926,7 @@ impl PanelContent {
                             })
                             .children(executions.iter().map(|trade| {
                                 div()
-                                    .h(px(20.))
+                                    .h(px(24.))
                                     .px_2()
                                     .flex()
                                     .items_center()
@@ -1942,13 +1944,13 @@ impl PanelContent {
                                             .w(px(66.))
                                             .flex_shrink_0()
                                             .text_right()
-                                            .text_color(rgb(if trade.buy { RED } else { TEAL }))
+                                            .text_color(rgb(if trade.buy { RED } else { DOWN }))
                                             .child(format!("{:.3}", trade.price)),
                                     )
                                     .child(amount_cell(
                                         trade.amount,
                                         (trade.amount / max) as f32,
-                                        if trade.buy { RED } else { TEAL },
+                                        if trade.buy { RED } else { DOWN },
                                         76.,
                                     ))
                                     .child(amount_cell(
@@ -1960,7 +1962,7 @@ impl PanelContent {
                                     .child(amount_cell(
                                         trade.sell_order_amount,
                                         (trade.sell_order_amount / max) as f32,
-                                        TEAL,
+                                        DOWN,
                                         66.,
                                     ))
                             })),
@@ -1970,7 +1972,7 @@ impl PanelContent {
                 div()
                     .px_2()
                     .py_1()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .flex_shrink_0()
                     .border_t_1()
@@ -2134,7 +2136,7 @@ impl PanelContent {
                     .flex_shrink_0()
                     .border_t_1()
                     .border_color(rgb(LINE))
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child("市场委托为模拟数据 · 本地账户委托请查看“当日订单”"),
             )
@@ -2195,7 +2197,7 @@ impl PanelContent {
                                     .mb_2()
                                     .child(badge(tag))
                                     .child(
-                                        div().text_size(px(10.)).text_color(rgb(MUTED)).child(time),
+                                        div().text_size(px(12.)).text_color(rgb(MUTED)).child(time),
                                     ),
                             )
                             .child(div().line_height(relative(1.55)).child(title))
@@ -2203,7 +2205,7 @@ impl PanelContent {
                                 d.child(
                                     div()
                                         .mt_2()
-                                        .text_size(px(11.))
+                                        .text_size(px(12.))
                                         .line_height(relative(1.65))
                                         .text_color(rgb(MUTED))
                                         .child(body),
@@ -2328,7 +2330,7 @@ impl PanelContent {
                     .items_center()
                     .justify_between()
                     .mt_2()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child(format!(
                         "可用 {:.2} {}",
@@ -2374,7 +2376,7 @@ impl PanelContent {
                         .mt_2()
                         .p_2()
                         .rounded_md()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .line_height(relative(1.5))
                         .bg(rgb(if *success { 0xe9f7f4 } else { 0xffeff2 }))
                         .text_color(rgb(if *success { TEAL } else { RED }))
@@ -2385,7 +2387,7 @@ impl PanelContent {
             .child(
                 div()
                     .mt_2()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child("仅本地演示 · 手动模拟成交 · 重启后重置账户"),
             )
@@ -2617,7 +2619,7 @@ impl Render for PanelContent {
             .overflow_hidden()
             .bg(rgb(0xffffff))
             .text_color(rgb(INK))
-            .text_size(px(12.))
+            .text_size(px(13.))
             .child(body)
     }
 }
@@ -2625,6 +2627,7 @@ impl Render for PanelContent {
 fn control(id: impl Into<ElementId>, text: impl Into<SharedString>, active: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .text_size(px(13.))
         .px_2()
         .py_1()
         .rounded(px(4.))
@@ -2637,7 +2640,7 @@ fn control(id: impl Into<ElementId>, text: impl Into<SharedString>, active: bool
 fn label(text: &'static str) -> Div {
     div()
         .mb_1()
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(rgb(MUTED))
         .child(text)
 }
@@ -2647,12 +2650,12 @@ fn badge(text: &'static str) -> Div {
         .py(px(2.))
         .rounded(px(3.))
         .bg(rgb(0xf0f5f8))
-        .text_size(px(10.))
+        .text_size(px(12.))
         .text_color(rgb(MUTED))
         .child(text)
 }
 fn movement(change: f64) -> Rgba {
-    rgb(if change >= 0. { RED } else { TEAL })
+    rgb(if change >= 0. { RED } else { DOWN })
 }
 fn currency(symbol: Symbol) -> &'static str {
     symbol.currency()
@@ -2679,7 +2682,7 @@ fn metric_colored(
     right_value: String,
     right_color: Rgba,
 ) -> Div {
-    div().h(px(20.)).flex().items_center().gap_2().children(
+    div().h(px(24.)).flex().items_center().gap_2().children(
         [
             (left, left_value, left_color),
             (right, right_value, right_color),
@@ -2693,19 +2696,19 @@ fn metric_colored(
                 .items_center()
                 .justify_between()
                 .gap_1()
-                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(label))
+                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(label))
                 .child(div().min_w_0().truncate().text_color(color).child(value))
         }),
     )
 }
 fn book_section(title: &'static str, color: u32) -> Div {
     div()
-        .h(px(17.))
+        .h(px(24.))
         .px_2()
         .flex()
         .items_center()
         .bg(rgb(0xf7f9fb))
-        .text_size(px(10.))
+        .text_size(px(12.))
         .text_color(rgb(color))
         .border_t_1()
         .border_color(rgb(LINE))
@@ -2713,7 +2716,7 @@ fn book_section(title: &'static str, color: u32) -> Div {
 }
 fn dense_columns(columns: &[(&'static str, f32)], right: bool) -> Div {
     div()
-        .h(px(20.))
+        .h(px(24.))
         .px_2()
         .flex()
         .items_center()
@@ -2825,9 +2828,9 @@ fn order_detail_table(
                     )
                 })
                 .children(orders.iter().map(|order| {
-                    let color = if order.buy { RED } else { TEAL };
+                    let color = if order.buy { RED } else { DOWN };
                     div()
-                        .h(px(20.))
+                        .h(px(24.))
                         .px_2()
                         .flex()
                         .items_center()
@@ -2890,7 +2893,7 @@ fn order_detail_table(
 fn book_row(label: String, price: f64, quantity: u64, max: f32, color: u32) -> Div {
     div()
         .relative()
-        .h(px(20.))
+        .h(px(24.))
         .mx_2()
         .flex()
         .items_center()
