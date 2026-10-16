@@ -12,9 +12,9 @@ use gpui_kit::{
 };
 
 const INK: u32 = 0x233348;
-const MUTED: u32 = 0x85909f;
+const MUTED: u32 = 0x586879;
 const TEAL: u32 = 0x009b9a;
-const RED: u32 = 0xef4770;
+const RED: u32 = 0xc92f57;
 
 #[derive(Clone, Copy)]
 enum Edit {
@@ -151,7 +151,12 @@ impl BoardBar {
 
     fn editor(&self, edit: Edit, cx: &mut Context<Self>) -> AnyElement {
         let deleting = matches!(edit, Edit::Delete(_));
-        let mut row = div().h(px(28.)).flex().items_center().gap_1().min_w_0();
+        let mut row = div()
+            .h(px(if self.error.is_some() { 24. } else { 32. }))
+            .flex()
+            .items_center()
+            .gap_1()
+            .min_w_0();
         if deleting {
             row = row.child(
                 div()
@@ -226,7 +231,7 @@ impl Render for BoardBar {
             let add_owner = owner.clone();
             let manage_owner = owner.clone();
             div()
-                .h(px(28.))
+                .h(px(if self.error.is_some() { 24. } else { 32. }))
                 .flex()
                 .items_center()
                 .min_w_0()
@@ -248,14 +253,19 @@ impl Render for BoardBar {
                                 .id(SharedString::from(format!("board-tab-{id}")))
                                 .h_full()
                                 .px_3()
-                                .max_w(px(164.))
+                                .max_w(px(184.))
                                 .flex_shrink_0()
                                 .flex()
                                 .items_center()
                                 .border_b_2()
                                 .border_color(rgb(if id == active { TEAL } else { 0xffffff }))
                                 .bg(rgb(if id == active { 0xe8f7f6 } else { 0xffffff }))
-                                .text_color(rgb(if id == active { TEAL } else { INK }))
+                                .text_color(rgb(if id == active { 0x007d78 } else { INK }))
+                                .font_weight(if id == active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
                                 .cursor_pointer()
                                 .hover(|style| style.bg(rgb(0xeef4f7)))
                                 .child(div().truncate().child(name.clone()))
@@ -371,7 +381,7 @@ impl Render for BoardBar {
             .flex()
             .flex_col()
             .justify_center()
-            .text_size(px(12.))
+            .text_size(px(13.))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.editing.is_some() && event.keystroke.key == "escape" {
                     this.cancel(cx);
@@ -382,10 +392,10 @@ impl Render for BoardBar {
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     div()
-                        .h(px(12.))
+                        .h(px(16.))
                         .min_w_0()
                         .truncate()
-                        .text_size(px(10.))
+                        .text_size(px(12.))
                         .text_color(rgb(RED))
                         .child(error),
                 )

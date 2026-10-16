@@ -191,9 +191,7 @@ fn known(symbol: Symbol, is_name: bool) -> Candidate {
 
 fn canonical_code(key: String) -> Candidate {
     let symbol = key.split_once(':').and_then(|(market, code)| {
-        Symbol::ALL
-            .into_iter()
-            .find(|symbol| symbol.market() == market && symbol.code() == code)
+        Symbol::from_code(code).filter(|symbol| symbol.market() == market)
     });
     Candidate {
         key,
@@ -203,11 +201,11 @@ fn canonical_code(key: String) -> Candidate {
 }
 
 fn identify(raw: &str) -> Option<Candidate> {
+    if let Some(symbol) = Symbol::from_code(raw) {
+        return Some(known(symbol, false));
+    }
     let upper = raw.to_ascii_uppercase();
     for symbol in Symbol::ALL {
-        if upper == symbol.code() {
-            return Some(known(symbol, false));
-        }
         if raw == symbol.name()
             || aliases(symbol)
                 .iter()
@@ -269,6 +267,16 @@ fn aliases(symbol: Symbol) -> &'static [&'static str] {
         Symbol::Alibaba => &["阿里", "阿里巴巴集团", "阿里巴巴-SW", "Alibaba"],
         Symbol::Yinli => &["引力传媒股份有限公司"],
         Symbol::Yangguang => &["江西阳光乳业股份有限公司"],
+        Symbol::Catl => &["CATL"],
+        Symbol::Moutai => &["茅台"],
+        Symbol::Seres => &["赛力斯集团"],
+        Symbol::Byd => &["BYD"],
+        Symbol::Eastmoney => &["东财"],
+        Symbol::Smic => &["SMIC"],
+        Symbol::Midea => &["美的"],
+        Symbol::Luxshare => &["立讯"],
+        Symbol::Cmb => &["招行"],
+        Symbol::Wuliangye => &["五粮液集团"],
     }
 }
 
@@ -366,7 +374,7 @@ mod tests {
     #[test]
     fn copied_table_pairs_names_with_codes_and_ignores_quote_columns() {
         let result = parse(
-            "CODE\tNAME\tPRICE\t涨跌幅\t成交量\r\nAAPL\t苹果\t340.30\t-0.28%\t123456\r\n00700\t腾讯控股\t645\t1.23%\t10000\nMSFT 微软 10000.00 600519\nAAPL 苹果 123.45 00700",
+            "CODE\tNAME\tPRICE\t涨跌幅\t成交量\r\nAAPL\t苹果\t340.30\t-0.28%\t123456\r\n00700\t腾讯控股\t645\t1.23%\t10000\nMSFT 微软 10000.00 600520\nAAPL 苹果 123.45 00700",
             &[Symbol::Aapl],
         )
         .unwrap();
@@ -382,45 +390,45 @@ mod tests {
     #[test]
     fn code_name_pairs_do_not_hide_later_codes_in_mixed_lists() {
         for text in [
-            "AAPL 苹果,600519,00700",
-            "AAPL 苹果;600519;00700",
-            "AAPL 苹果 600519 00700",
+            "AAPL 苹果,600520,00700",
+            "AAPL 苹果;600520;00700",
+            "AAPL 苹果 600520 00700",
         ] {
             let result = parse(text, &[]).unwrap();
             assert_eq!(result.recognized, [Symbol::Aapl, Symbol::Tencent]);
-            assert_eq!(result.unknown, ["SH:600519"]);
+            assert_eq!(result.unknown, ["SH:600520"]);
             assert_eq!(result.duplicates, 0);
         }
-        let result = parse("AAPL 苹果,MSFT,600519", &[]).unwrap();
+        let result = parse("AAPL 苹果,MSFT,600520", &[]).unwrap();
         assert_eq!(result.recognized, [Symbol::Aapl, Symbol::Msft]);
-        assert_eq!(result.unknown, ["SH:600519"]);
+        assert_eq!(result.unknown, ["SH:600520"]);
     }
 
     #[test]
     fn known_codes_survive_quote_columns_but_unknown_integers_need_clear_boundaries() {
-        let result = parse("AAPL,340.30,00700,09988,700,600519", &[]).unwrap();
+        let result = parse("AAPL,340.30,00700,09988,700,600520", &[]).unwrap();
         assert_eq!(
             result.recognized,
             [Symbol::Aapl, Symbol::Tencent, Symbol::Alibaba]
         );
         assert!(result.unknown.is_empty());
 
-        let result = parse("AAPL,340.30,SH600519;000001\n01234", &[]).unwrap();
+        let result = parse("AAPL,340.30,SH600520;000001\n01234", &[]).unwrap();
         assert_eq!(result.recognized, [Symbol::Aapl]);
-        assert_eq!(result.unknown, ["SH:600519", "SZ:000001", "HK:01234"]);
+        assert_eq!(result.unknown, ["SH:600520", "SZ:000001", "HK:01234"]);
     }
 
     #[test]
     fn unknown_identifiers_are_visible_deduplicated_and_market_sensitive() {
         let result = parse(
-            "SH00700 00700.SH HK00700 600519 SH600519 600519.SH 1600519\n0000001 000001.SZ GOOG US:goog 01234.HK HK01234",
+            "SH00700 00700.SH HK00700 600520 SH600520 600520.SH 1600520\n0000001 000001.SZ GOOG US:goog 01234.HK HK01234",
             &[],
         )
         .unwrap();
         assert_eq!(result.recognized, [Symbol::Tencent]);
         assert_eq!(
             result.unknown,
-            ["SH:00700", "SH:600519", "SZ:000001", "US:GOOG", "HK:01234"]
+            ["SH:00700", "SH:600520", "SZ:000001", "US:GOOG", "HK:01234"]
         );
         assert_eq!(result.duplicates, 7);
     }
@@ -449,9 +457,48 @@ mod tests {
     }
 
     #[test]
+    fn expanded_mainland_directory_matches_tables_and_keeps_exchange_identity() {
+        let table = Symbol::A_SHARES
+            .into_iter()
+            .map(|symbol| {
+                format!(
+                    "{}\t{}\t123.45\t+1.23%\t123456\n{}:{}\n{}.{}",
+                    symbol.code(),
+                    symbol.name(),
+                    symbol.market(),
+                    symbol.code(),
+                    symbol.code(),
+                    symbol.market(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = parse(&table, &[Symbol::Midea]).unwrap();
+        assert_eq!(preview.recognized, Symbol::A_SHARES);
+        assert_eq!(preview.additions.len(), 11);
+        assert!(!preview.additions.contains(&Symbol::Midea));
+        assert_eq!(preview.already_present, 1);
+        assert_eq!(preview.duplicates, 24);
+        assert!(preview.unknown.is_empty());
+
+        let leading_zeroes = parse("000333 333 000858 858", &[]).unwrap();
+        assert_eq!(
+            leading_zeroes.recognized,
+            [Symbol::Midea, Symbol::Wuliangye]
+        );
+        assert!(leading_zeroes.unknown.is_empty());
+        let wrong_exchange = parse("SZ600519 SH000333 HK300750", &[]).unwrap();
+        assert!(wrong_exchange.recognized.is_empty());
+        assert_eq!(
+            wrong_exchange.unknown,
+            ["SZ:600519", "SH:000333", "HK:300750"]
+        );
+    }
+
+    #[test]
     fn mainland_market_qualifiers_do_not_match_a_different_exchange() {
         let result = parse(
-            "SH001318 SZ603598 603598.HK US:001318 1001318 0603598 600519",
+            "SH001318 SZ603598 603598.HK US:001318 1001318 0603598 600520",
             &[],
         )
         .unwrap();
@@ -463,7 +510,7 @@ mod tests {
                 "SZ:603598",
                 "HK:603598",
                 "US:001318",
-                "SH:600519"
+                "SH:600520"
             ]
         );
         assert_eq!(result.duplicates, 2);

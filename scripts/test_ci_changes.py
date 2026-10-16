@@ -9,7 +9,8 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from ci_changes import (
-    changes_require_build, documentation_only, matching_open_pull_request, select_build,
+    changes_require_build, documentation_only, matching_open_pull_request,
+    native_build_exempt, select_build,
 )
 
 
@@ -29,6 +30,36 @@ class ChangePolicyTests(unittest.TestCase):
 
     def test_empty_change_set_requires_build(self):
         self.assertFalse(documentation_only([]))
+        self.assertFalse(native_build_exempt([]))
+
+    def test_isolated_preview_and_documentation_skip_native_build(self):
+        self.assertTrue(native_build_exempt([
+            "design-preview/src/App.tsx", "design-preview/package-lock.json",
+            "design-preview/scripts/smoke.mjs", ".github/workflows/design-preview.yml",
+            "README.md", "docs/design-preview.md",
+        ]))
+
+    def test_preview_does_not_exempt_native_or_unknown_paths(self):
+        for path in (
+            "src/chart.rs", "Cargo.lock", "scripts/ci_changes.py",
+            ".github/workflows/build.yml", ".github/workflows/new-preview.yml",
+            "design-preview-other/app.tsx", "design-preview", "docs/generator.py",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(native_build_exempt(["design-preview/src/App.tsx", path]))
+
+    @patch("ci_changes.subprocess.check_output")
+    def test_preview_only_diff_skips_native_build_for_push_and_pr(self, git):
+        git.return_value = b"design-preview/src/App.tsx\0.github/workflows/design-preview.yml\0"
+        self.assertFalse(changes_require_build("push", {"before": "a" * 40}))
+        self.assertFalse(changes_require_build("pull_request", {
+            "pull_request": {"base": {"sha": "a" * 40}},
+        }))
+
+    @patch("ci_changes.subprocess.check_output")
+    def test_moving_native_source_into_preview_still_builds(self, git):
+        git.return_value = b"src/chart.rs\0design-preview/chart.rs\0"
+        self.assertTrue(changes_require_build("push", {"before": "a" * 40}))
 
     def test_manual_run_requires_build(self):
         self.assertTrue(changes_require_build("workflow_dispatch", {}))

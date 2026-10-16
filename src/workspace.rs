@@ -9,7 +9,7 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        Disableable, Placement, Sizable, Theme, ThemeMode,
+        Disableable, Placement, Sizable, Theme, ThemeMode, WindowExt,
         button::{Button, ButtonVariants},
         dock::*,
         input::{Input, InputEvent, InputState},
@@ -88,6 +88,9 @@ fn panel(id: u64, cx: &App) -> Option<Entity<StockPanel>> {
 fn status(message: impl Into<String>, cx: &mut App) {
     cx.global_mut::<Session>().status = message.into();
     cx.refresh_windows();
+}
+pub(crate) fn status_message(cx: &App) -> String {
+    cx.global::<Session>().status.clone()
 }
 fn changed(cx: &mut App) {
     if !cx.global::<Session>().loading {
@@ -694,7 +697,7 @@ pub(crate) struct Workspace {
     pub(crate) handle: AnyWindowHandle,
     pub(crate) dock: Entity<DockArea>,
     bounds: [f32; 4],
-    board_bar: Option<Entity<BoardBar>>,
+    desktop: Option<Entity<crate::desktop::Desktop>>,
     _subscriptions: Vec<Subscription>,
 }
 impl Workspace {
@@ -731,8 +734,45 @@ impl Workspace {
             }
         });
         let entity_id = cx.entity_id();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             if id == 0 {
+                if !crate::desktop_state::save_now(cx) {
+                    let detail = cx
+                        .global::<crate::desktop_state::DesktopState>()
+                        .save_status
+                        .clone();
+                    window.open_dialog(cx, move |dialog, _, _| {
+                        dialog.title("部分修改尚未保存").width(px(480.)).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_4()
+                                .child(detail.clone())
+                                .child("继续编辑可保留内存中的修改。仍然退出将丢弃尚未保存的修改。")
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("desktop-quit-cancel")
+                                                .label("继续编辑")
+                                                .primary()
+                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                        )
+                                        .child(
+                                            Button::new("desktop-quit-discard")
+                                                .label("仍然退出")
+                                                .on_click(|_, _, cx| {
+                                                    save_now(cx);
+                                                    cx.quit();
+                                                }),
+                                        ),
+                                ),
+                        )
+                    });
+                    return false;
+                }
                 save_now(cx);
                 cx.quit();
                 true
@@ -748,12 +788,16 @@ impl Workspace {
                 false
             }
         });
+        let board_bar = (id == 0).then(|| cx.new(|cx| BoardBar::new(window, cx)));
+        let desktop = (id == 0).then(|| {
+            cx.new(|cx| crate::desktop::Desktop::new(dock.clone(), board_bar, window, cx))
+        });
         Self {
             id,
             handle: window.window_handle(),
             dock,
             bounds: window_bounds(window),
-            board_bar: (id == 0).then(|| cx.new(|cx| BoardBar::new(window, cx))),
+            desktop,
             _subscriptions: vec![sub, bounds_sub, active],
         }
     }
@@ -1264,6 +1308,7 @@ pub(crate) fn dismiss_window(id: u64, cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn return_window(id: u64, cx: &mut App) -> anyhow::Result<()> {
     if id == 0 {
         return Ok(());
@@ -2202,11 +2247,147 @@ pub(crate) fn verify_workspace_persistence(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn market_toolbar(
+    board_bar: &Option<Entity<BoardBar>>,
+    dock: &Entity<DockArea>,
+    cx: &App,
+) -> AnyElement {
+    let id = 0;
+    let paused = cx.global::<Session>().paused;
+    let locked = dock.read(cx).is_locked();
+    div()
+        .h(px(46.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .px_4()
+        .gap_3()
+        .border_b_1()
+        .border_color(rgb(0xe8ecf0))
+        .bg(rgb(0xffffff))
+        .child(div().flex_1().min_w_0().children(board_bar.clone()))
+        .child(
+            Button::new("add-component")
+                .label("＋ 添加组件")
+                .disabled(locked)
+                .small()
+                .ghost()
+                .dropdown_menu(move |mut menu, _, _| {
+                    for kind in PanelKind::ALL {
+                        menu = menu.item(PopupMenuItem::new(kind.title()).on_click(
+                            move |_, _, cx| {
+                                cx.defer(move |cx| {
+                                    let r = add_panel(id, kind, cx);
+                                    report(r, cx);
+                                });
+                            },
+                        ));
+                    }
+                    menu
+                }),
+        )
+        .child(
+            Button::new("layout-menu")
+                .label("布局 ▾")
+                .small()
+                .ghost()
+                .dropdown_menu(move |menu, _, _| {
+                    menu.item(
+                        PopupMenuItem::new("默认行情布局")
+                            .on_click(|_, _, cx| cx.defer(|cx| reset(false, cx))),
+                    )
+                    .item(
+                        PopupMenuItem::new("双图对比布局")
+                            .on_click(|_, _, cx| cx.defer(|cx| reset(true, cx))),
+                    )
+                    .item(
+                        PopupMenuItem::new("保存为我的模板")
+                            .on_click(|_, _, cx| cx.defer(|cx| template(true, cx))),
+                    )
+                    .item(
+                        PopupMenuItem::new("加载我的模板")
+                            .on_click(|_, _, cx| cx.defer(|cx| template(false, cx))),
+                    )
+                    .item(PopupMenuItem::new("撤销布局修改").on_click(|_, _, cx| cx.defer(undo)))
+                    .item(
+                        PopupMenuItem::new(if locked {
+                            "解锁布局"
+                        } else {
+                            "锁定布局"
+                        })
+                        .on_click(move |_, window, cx| {
+                            if let Some(w) = workspace(id, cx) {
+                                let dock = w.read(cx).dock.clone();
+                                dock.update(cx, |d, cx| d.set_locked(!locked, window, cx));
+                            }
+                            changed(cx);
+                        }),
+                    )
+                }),
+        )
+        .child(
+            Button::new("pause-market")
+                .label(if paused {
+                    "▶ 继续演示"
+                } else {
+                    "Ⅱ 暂停演示"
+                })
+                .small()
+                .ghost()
+                .on_click(|_, _, cx| {
+                    let s = cx.global_mut::<Session>();
+                    s.paused = !s.paused;
+                    changed(cx);
+                }),
+        )
+        .into_any_element()
+}
+
+pub(crate) fn market_tick(cx: &App) -> u64 {
+    cx.global::<Session>().tick
+}
+pub(crate) fn register_main_dock(bounds: Bounds<Pixels>, window: &Window, cx: &mut App) {
+    let rect = transfer::screen_rect(window, bounds);
+    cx.global_mut::<Session>().drag.register_window(0, rect);
+}
+pub(crate) fn open_market_symbol(symbol: crate::market::Symbol, cx: &mut App) {
+    let id = cx
+        .global::<Session>()
+        .panels
+        .values()
+        .filter_map(WeakEntity::upgrade)
+        .filter_map(|p| {
+            let p = p.read(cx);
+            (p.owner == 0 && p.model.kind == PanelKind::Chart).then_some(p.model.id)
+        })
+        .min();
+    if let Some(id) = id {
+        select_symbol(id, symbol, cx);
+    } else {
+        match add_panel(0, PanelKind::Chart, cx) {
+            Ok(()) => {
+                let newest = cx
+                    .global::<Session>()
+                    .panels
+                    .values()
+                    .filter_map(WeakEntity::upgrade)
+                    .filter_map(|p| {
+                        let p = p.read(cx);
+                        (p.model.kind == PanelKind::Chart).then_some(p.model.id)
+                    })
+                    .max();
+                if let Some(id) = newest {
+                    select_symbol(id, symbol, cx);
+                }
+            }
+            Err(error) => status(format!("打开行情失败：{error}"), cx),
+        }
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let id = self.id;
-        let paused = cx.global::<Session>().paused;
-        let tick = cx.global::<Session>().tick;
         let message = cx.global::<Session>().status.clone();
         let board_name = active_board_name(cx);
         let locked = self.dock.read(cx).is_locked();
@@ -2215,100 +2396,6 @@ impl Render for Workspace {
             .drag
             .target
             .filter(|t| t.window == id && !locked);
-        let full_header = div()
-            .h(px(46.))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .px_4()
-            .gap_3()
-            .border_b_1()
-            .border_color(rgb(0xe8ecf0))
-            .bg(rgb(0xffffff))
-            .child(
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_size(px(19.))
-                    .text_color(rgb(0x172736))
-                    .child("▥ TYDARO"),
-            )
-            .child(div().flex_1().min_w_0().children(self.board_bar.clone()))
-            .child(
-                Button::new("add-component")
-                    .label("＋ 添加组件")
-                    .disabled(locked)
-                    .small()
-                    .ghost()
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for kind in PanelKind::ALL {
-                            menu = menu.item(PopupMenuItem::new(kind.title()).on_click(
-                                move |_, _, cx| {
-                                    cx.defer(move |cx| {
-                                        let r = add_panel(id, kind, cx);
-                                        report(r, cx);
-                                    });
-                                },
-                            ));
-                        }
-                        menu
-                    }),
-            )
-            .child(
-                Button::new("layout-menu")
-                    .label("布局 ▾")
-                    .small()
-                    .ghost()
-                    .dropdown_menu(move |menu, _, _| {
-                        menu.item(
-                            PopupMenuItem::new("默认行情布局")
-                                .on_click(|_, _, cx| cx.defer(|cx| reset(false, cx))),
-                        )
-                        .item(
-                            PopupMenuItem::new("双图对比布局")
-                                .on_click(|_, _, cx| cx.defer(|cx| reset(true, cx))),
-                        )
-                        .item(
-                            PopupMenuItem::new("保存为我的模板")
-                                .on_click(|_, _, cx| cx.defer(|cx| template(true, cx))),
-                        )
-                        .item(
-                            PopupMenuItem::new("加载我的模板")
-                                .on_click(|_, _, cx| cx.defer(|cx| template(false, cx))),
-                        )
-                        .item(
-                            PopupMenuItem::new("撤销布局修改").on_click(|_, _, cx| cx.defer(undo)),
-                        )
-                        .item(
-                            PopupMenuItem::new(if locked {
-                                "解锁布局"
-                            } else {
-                                "锁定布局"
-                            })
-                            .on_click(move |_, window, cx| {
-                                if let Some(w) = workspace(id, cx) {
-                                    let dock = w.read(cx).dock.clone();
-                                    dock.update(cx, |d, cx| d.set_locked(!locked, window, cx));
-                                }
-                                changed(cx);
-                            }),
-                        )
-                    }),
-            )
-            .child(
-                Button::new("pause-market")
-                    .label(if paused {
-                        "▶ 继续演示"
-                    } else {
-                        "Ⅱ 暂停演示"
-                    })
-                    .small()
-                    .ghost()
-                    .on_click(|_, _, cx| {
-                        let s = cx.global_mut::<Session>();
-                        s.paused = !s.paused;
-                        changed(cx);
-                    }),
-            );
         let floating_header = div()
             .h(px(30.))
             .flex_shrink_0()
@@ -2388,65 +2475,17 @@ impl Render for Workspace {
             };
             window.set_window_title(&title);
         }
-        let nav = div()
-            .w(px(120.))
-            .flex_shrink_0()
-            .h_full()
-            .bg(rgb(0xf5f6f8))
-            .border_r_1()
-            .border_color(rgb(0xe8ecf0))
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .mt_2()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(0xe1e7ec))
-                    .text_color(rgb(0x203243))
-                    .child("▣  个股行情"),
-            )
-            .child(
-                Button::new("nav-watch")
-                    .label("≡  股票列表")
-                    .ghost()
-                    .on_click(move |_, _, cx| {
-                        cx.defer(move |cx| {
-                            let r = add_panel(id, PanelKind::Watchlist, cx);
-                            report(r, cx);
-                        })
-                    }),
-            )
-            .child(
-                Button::new("nav-charts")
-                    .label("◷  多图分析")
-                    .ghost()
-                    .on_click(|_, _, cx| cx.defer(|cx| reset(true, cx))),
-            )
-            .child(
-                Button::new("nav-trade")
-                    .label("⇄  模拟交易")
-                    .ghost()
-                    .on_click(move |_, _, cx| {
-                        cx.defer(move |cx| {
-                            let r = add_panel(id, PanelKind::OrderEntry, cx);
-                            report(r, cx);
-                        })
-                    }),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .p_2()
-                    .text_xs()
-                    .text_color(rgb(0x929ba5))
-                    .child("FRONTEND PREVIEW\n本地模拟数据\nv0.1.0"),
-            );
         let pre = canvas(
             move |_, _, cx| {
+                if id == 0
+                    && cx
+                        .global::<crate::desktop_state::DesktopState>()
+                        .active_page
+                        != crate::desktop_state::PageId::Market
+                {
+                    cx.global_mut::<Session>().drag.remove_window(0);
+                    return;
+                }
                 cx.global_mut::<Session>().drag.clear_window_panels(id);
                 cx.global_mut::<Session>()
                     .drag
@@ -2500,19 +2539,13 @@ impl Render for Workspace {
             })
             .child(pre)
             .child(listener)
-            .when(id == 0, |d| d.child(full_header))
-            .when(id != 0, |d| d.child(floating_header))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .when(id == 0, |d| d.child(nav))
+            .when_some(self.desktop.clone(), |d, desktop| d.child(desktop))
+            .when(id != 0, |d| {
+                d.child(floating_header)
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
-                            .h_full()
+                            .min_h_0()
                             .relative()
                             .child(
                                 canvas(
@@ -2523,60 +2556,26 @@ impl Render for Workspace {
                                     |_, _, _, _| {},
                                 )
                                 .absolute()
-                                .top_0()
-                                .left_0()
+                                .inset_0()
                                 .size_full(),
                             )
-                            .child(self.dock.clone())
-                            .when(id == 0 && panel_count == 0, |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .inset_0()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap_2()
-                                        .text_color(rgb(0x86929f))
-                                        .child(div().text_size(px(16.)).child("自由搭配你的看板"))
-                                        .child("从右上角「添加组件」开始，拖动组件标题插入此处"),
-                                )
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(if id == 0 { 27. } else { 22. }))
-                    .flex_shrink_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .border_t_1()
-                    .border_color(rgb(0xe4e8ee))
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .gap_3()
-                    .text_size(px(11.))
-                    .when(id == 0, |d| {
-                        d.child(div().text_color(rgb(0x009b9a)).child("● 演示行情"))
-                            .child("恒生指数  24,345.20   +0.30%     纳斯达克  23,642.17   +0.86%")
-                            .child(div().flex_1())
-                    })
+                            .child(self.dock.clone()),
+                    )
                     .child(
                         div()
-                            .when(id != 0, |d| d.flex_1())
-                            .min_w_0()
-                            .truncate()
-                            .child(if !message.is_empty() {
-                                message
-                            } else if id != 0 {
+                            .h(px(22.))
+                            .flex_shrink_0()
+                            .border_t_1()
+                            .border_color(rgb(0xe4e8ee))
+                            .px_2()
+                            .text_size(px(11.))
+                            .child(if message.is_empty() {
                                 "模拟 · 拖动股票标题 / 插入面板".to_owned()
                             } else {
-                                format!("拖动股票标题或 ⠿ 停靠 · 自动保存  |  {tick:04}")
+                                message
                             }),
-                    ),
-            )
+                    )
+            })
             .when_some(target, |d, t| {
                 let b = t.bounds.preview(t.side);
                 d.child(
@@ -2616,7 +2615,23 @@ pub(crate) fn init(cx: &mut App, persistent: bool) {
     gpui_kit::init(cx);
     gpui_kit::component::set_locale("zh-CN");
     Theme::change(ThemeMode::Light, None, cx);
-    Theme::global_mut(cx).font_size = px(13.);
+    Theme::global_mut(cx).font_size = px(14.);
+    {
+        let theme = Theme::global_mut(cx);
+        theme.primary = rgb(0x008e8c).into();
+        theme.primary_hover = rgb(0x007c7a).into();
+        theme.primary_active = rgb(0x006c6a).into();
+        theme.primary_foreground = rgb(0xffffff).into();
+        theme.button_primary_foreground = rgb(0xffffff).into();
+        theme.accent = rgb(0xe7f5f3).into();
+        theme.accent_foreground = rgb(0x007d78).into();
+        theme.ring = rgb(0x008e8c).into();
+        theme.tokens.button_primary = Hsla::from(rgb(0x008e8c)).into();
+        theme.tokens.button_primary_hover = Hsla::from(rgb(0x007c7a)).into();
+        theme.tokens.button_primary_active = Hsla::from(rgb(0x006c6a)).into();
+        theme.tokens.secondary_active = Hsla::from(rgb(0xe7f5f3)).into();
+    }
+    crate::desktop_state::init(persistent, cx);
     Theme::global_mut(cx).font_family = if cfg!(target_os = "windows") {
         "Microsoft YaHei UI".into()
     } else {
@@ -2660,7 +2675,7 @@ pub fn run() {
         return;
     }
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(crate::desktop_ui::AppAssets)
         .run(|cx| {
             init(cx, true);
             let path = cx.global::<Session>().path.clone().unwrap();
