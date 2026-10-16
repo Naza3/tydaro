@@ -18,7 +18,7 @@
 
 统一导航保持五个业务页面；行情看板继续属于行情页。`Ctrl+K` 搜索本地股票或页面，个股速览可查看原生分时/日 K，再打开行情、加入盯盘或引用复盘。编辑期间不以全局搜索跳离尚未关闭的编辑界面。
 
-视觉参数集中在 `src/desktop_ui.rs`。主正文以 14 px 为基准，说明和代码通常为 12 px；白色内容面板、淡灰背景、低对比边界区分层级。青绿色用于主要操作及选中状态，红涨绿跌使用更深的文字颜色。页面按各自任务组织，不要求五页都使用同一种分栏。中文字体、不同 DPI 的点击区域与真实窗口行为仍需原生平台验收。
+视觉参数集中在 `src/app/ui.rs`。主正文以 14 px 为基准，说明和代码通常为 12 px；白色内容面板、淡灰背景、低对比边界区分层级。青绿色用于主要操作及选中状态，红涨绿跌使用更深的文字颜色。页面按各自任务组织，不要求五页都使用同一种分栏。中文字体、不同 DPI 的点击区域与真实窗口行为仍需原生平台验收。
 
 ## 跨页操作的边界
 
@@ -61,15 +61,17 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/desktop.rs` | 统一外壳、五页导航、全局搜索、个股速览及跨页确认 |
-| `src/desktop_ui.rs` | 共用颜色、标题、面板和标签样式 |
+| `src/app/shell.rs` | 统一外壳、五页导航、全局搜索、个股速览及跨页确认 |
+| `src/app/ui.rs` | 共用颜色、标题、面板和标签样式 |
 | `crates/tydaro-core` | 独立业务模型、输入约束、原子命令与模拟候选链 |
-| `src/desktop_state.rs`、`src/desktop_repository.rs` | GPUI 业务适配、后台保存与版本化文档 IO |
-| `crates/tydaro-ui`、`src/app.rs` | 共享基础组件及应用启动装配 |
-| `src/watch_page.rs` | 分组、规则、演示异动及监控界面 |
-| `src/research_page.rs` | 涨停资料与题材研究页面 |
-| `src/journal_page.rs` | 复盘编辑、历史、方法词库及原生阅读窗口 |
-| `src/desktop_smoke.rs` | 五页实际绘制、指针/键盘输入和生产状态断言 |
+| `src/app/state/`、`src/adapters/desktop/` | GPUI 业务适配、后台保存与版本化文档 IO |
+| `crates/tydaro-ui`、`src/app/mod.rs` | 共享基础组件及应用启动装配 |
+| `src/pages/watch/` | 分组、规则、演示异动及监控界面 |
+| `src/pages/limit/`、`src/pages/theme/` | 独立的涨停资料和题材研究页面，私有 `src/pages/research/` 提供共享样例 |
+| `src/pages/journal/` | 复盘编辑、历史、方法词库及原生阅读窗口 |
+| `src/test_support/desktop.rs` | 五页实际绘制、指针/键盘输入和生产状态断言 |
+
+页面内部按编辑、查询与绘制职责组织私有模块；复盘阅读窗口由 `src/pages/journal/reading/` 单独创建输入、焦点和订阅。模块整理保留页面实体、原生 ElementId 与跨页事件协议，不改变现有页面布局或持久化格式。
 
 沿用 Rust 1.96.0、锁文件及 [开发检查矩阵](development.md)。原生 smoke 入口保持不变：
 
@@ -83,7 +85,7 @@ cargo run --locked --features test-support --bin tydaro -- --smoke-test artifact
 
 Windows 人工验收重点：100%、125%、150%、200% 字体/DPI，中文 IME 候选确认和取消，编辑抽屉滚动，阅读窗口的输入/焦点及固定日期，行情浮窗跨屏回插，以及业务文件写入失败/重启恢复。当前文档不将尚未执行的 Windows 实机检查记为通过。
 
-## 本阶段本地验证（2026-10-16）
+## 五页初版交付验证记录（2026-10-16）
 
 - `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --features test-support -- -D warnings` 和默认功能的 `cargo check --locked` 通过。
 - `cargo test --locked --all-targets --features test-support`：103 项通过，0 项失败。

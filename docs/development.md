@@ -51,7 +51,7 @@ cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test 
 
 ### 五页工作台的原生回归
 
-五页 GPUI 实现及数据范围见 [native-design.md](native-design.md)。`--smoke-test` 在既有行情、图表与布局回归之后继续执行 `src/desktop_smoke.rs`，通过生产页面的 ElementId 派发真实点击、键盘和文本输入，再读取生产 `DesktopState` 及 DockArea 快照断言结果。
+五页 GPUI 实现及数据范围见 [native-design.md](native-design.md)。`--smoke-test` 在既有行情、图表与布局回归之后继续执行 `src/test_support/desktop.rs`，通过生产页面的 ElementId 派发真实点击、键盘和文本输入，再读取生产 `DesktopState` 及 DockArea 快照断言结果。
 
 局部迭代可用 `cargo run --locked --features test-support --bin tydaro -- --desktop-smoke-test artifacts/tydaro-desktop.png` 单独运行五页场景，复用相同初始化；最终仍需完整 smoke。
 
@@ -71,7 +71,11 @@ cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test 
 - 主窗口笔记真实输入并同步到已打开的同日期阅读窗口；主页面随后切日期，阅读窗口笔记仍写入打开时的固定日期；关闭阅读窗口不删除记录。
 - 五页在 1536×960 和 1280×800 的实际原生绘制，以及独立复盘阅读窗口，共十一张新增截图。截图位于同一输出目录，后缀为 `-desktop-{page}-{width}.png` 和 `-desktop-journal-reading.png`。
 
-业务模型和命令测试位于 `tydaro-core`，文档 IO、revision 与失败保护由应用适配层测试；单纯把测试编译进应用不等于执行独立 CLI 场景。测试初始化使用 `persistent = false`，不会读写个人 `desktop.json`；磁盘场景使用独立临时目录。原生截图和自动输入回归不能代替 Windows 字体、中文 IME、DPI、多屏窗口行为及真实磁盘故障的人工验收。
+业务模型和命令测试位于 `tydaro-core`，应用层不重复维护相同业务断言。公共文档身份/日期契约位于 `crates/tydaro-core/tests/document_contract.rs`；桌面文件 IO、备份、外部修改和写入版本测试位于 `src/adapters/desktop/tests.rs`，业务适配状态测试位于 `src/app/state/tests.rs`。较长的私有单测放所属模块的 `tests.rs`，不为测试公开内部状态。
+
+原生回归驱动在 `src/test_support/`，内部控件断言在所属模块的 `test_support.rs`，由 `test-support` feature 控制。工作区场景按窗口、看板、股票列表、导入、图表和分时拆分；各 CLI 标志与验收范围保持不变。去除六个重复的应用业务测试后，应按测试覆盖的契约评价结果，不能单凭总数减少认定覆盖退步。
+
+单纯把测试编译进应用不等于执行独立 CLI 场景。测试初始化使用 `persistent = false`，不会读写个人 `desktop.json`；磁盘场景使用 `src/test_support/temp_dir.rs` 提供的独立临时目录。原生截图和自动输入回归不能代替 Windows 字体、中文 IME、DPI、多屏窗口行为及真实磁盘故障的人工验收。
 
 ### 架构迁移的回归边界
 
@@ -83,13 +87,15 @@ cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test 
 - 视图资源：只读面板不创建输入/图表；每种面板只拥有所需实体；跨窗恢复重建控件，坏内容在任何 live 控件变更前失败。旧快照未使用字段仍被保留。
 - 图表投影：注入数据源保持日 K/历史分时及均线前缀一致，后续 tick 不改变已打开的冻结历史；不能在同步投影查询中执行网络 IO。
 
-CI 配置包括无原生 SDK 的 core 作业、Windows/Linux workspace 测试和 Linux 的完整 smoke 与 Gallery smoke。配置存在不代表某次提交已通过；交接分别给出实际运行结果。`check_architecture.py --self-test` 验证 guard 的源码扫描行为，但 guard 不证明所有跨模块语义均正确。
+CI 配置包括无原生 SDK 的 core 作业、Windows/Linux workspace 测试和 Linux 的完整 smoke 与 Gallery smoke。配置存在不代表某次提交已通过；交接分别给出实际运行结果。`check_architecture.py --self-test` 验证 guard 的源码扫描行为；检查递归覆盖 `src/workspace/` 生产模块及相对路径、导入引用，拆分文件后仍受相同边界约束，但 guard 不证明所有跨模块语义均正确。
 
 ### 人工验收清单
 
 基础组件实验室有独立的 `--gallery-smoke-test artifacts/gallery.png` 入口（同样开启 `test-support`），在 Linux CI 显式执行。它覆盖三十个样例的输入与点击、焦点、状态保留和返回行情的 Dock 一致性；运行方式及 Windows 离屏截图限制见 [组件实验室](component-gallery.md)。五页回归另外检查侧栏进入 Gallery、返回行情和重新打开后的类别保留；这几个导航断言不替代完整 Gallery 场景。
 
 使用独立 `TYDARO_DATA_DIR`，避免覆盖自己的布局；示例中 Bash 使用 `export TYDARO_DATA_DIR=/tmp/tydaro-acceptance`，PowerShell 使用 `$env:TYDARO_DATA_DIR = "$env:TEMP\tydaro-acceptance"`。验收记录应包含提交、系统、显示器缩放和结果。
+
+临时截图与回归输出放在 `artifacts/`，构建和打包产物分别放在 `target/`、`dist/`。`.gitignore` 也排除 `.tydaro/`、仓库根目录下的个人布局/业务文档及其备份、根目录日志和本地工具缓存；有意提交的文档截图、测试 JSON/日志样本、锁文件和 `.env.example` 保持可跟踪。自定义数据目录应放仓库外或已忽略的临时目录，不能依赖忽略规则覆盖任意 `TYDARO_DATA_DIR`。
 
 按改动选择有关操作：
 

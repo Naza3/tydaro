@@ -2,7 +2,7 @@
 
 当前应用由一个 Cargo workspace 中的三个 crate 组成，最终仍交付一个 Rust 二进制，使用 GPUI Kit 的原生窗口、控件及 DockArea。Windows x64 是首要交付平台；Linux 用于开发与持续验证。主窗口提供行情、盯盘、涨停、题材、复盘五个页面：行情继续使用可移动业务面板，其他页面采用各自任务布局，共用固定导航和应用外壳。全部使用 GPUI 原生元素和控件，不嵌入 React/WebView。后端、真实行情连接、面向用户的 CLI 和插件系统尚未实现。
 
-后续的盯盘组件组合、题材指标、模式候选及 AlphaDeck 接入见 [产品方案](product-plan.md) 和 [实施计划](delivery-plan.md)。完整指标、真实数据源和页面重组仍属规划；本轮先建立下述核心边界、版本迁移及固定模拟候选链，不代表这些产品方案已经全部实现。
+后续的盯盘组件组合、题材指标、模式候选及 AlphaDeck 接入见 [产品方案](product-plan.md) 和 [实施计划](delivery-plan.md)。完整指标、真实数据源和页面重组仍属规划；已实现的核心边界、文档兼容读取及固定模拟候选链不代表这些产品方案已经全部实现。
 
 ## 依赖与组成边界
 
@@ -14,41 +14,30 @@ tydaro（应用组成根、页面、运行时与适配器）
 
 `tydaro-core` 不依赖 GPUI、应用或组件 crate，不读写文件、不启动窗口或请求网络；它可以用 `cargo test --locked -p tydaro-core` 独立构建与测试。`tydaro-ui` 依赖 GPUI，但不认识股票业务、工作区、存储或 `tydaro-core`；调用者提供稳定 ElementId、原生输入实体和回调。应用同时依赖两者，承担组装与副作用。新增 SDK、数据库或真实行情协议应进入应用适配层，不能通过核心规则或基础组件反向引入。
 
-`app.rs` 是组成根，初始化主题、业务存储、共享模拟账户、图表数据源、Gallery 偏好和运行时，再向行情工作区注入 `WorkspaceHost`。Host 提供主窗口内容构造、主窗关闭和行情可见性查询；`workspace.rs` 不直接依赖 `desktop`、`desktop_state`、Gallery、BoardBar 或 `app`。Desktop 的 Gallery 实体按需创建；独立 Gallery 入口只初始化 UI 与设计偏好，不加载个人行情布局或业务文档。组成根不是业务规则容器，页面仍通过明确业务命令处理修改。
+`src/app/mod.rs` 是组成根，初始化主题、业务存储、共享模拟账户、图表数据源、Gallery 偏好和运行时，再向行情工作区注入 `WorkspaceHost`。Host 提供主窗口内容构造、主窗关闭和行情可见性查询；`workspace` 不直接依赖 `app`、业务页面或 Gallery。看板栏属于 `workspace/board_bar`，由组成根创建后交给外壳。Desktop 的 Gallery 实体按需创建；独立 Gallery 入口只初始化 UI 与设计偏好，不加载个人行情布局或业务文档。组成根不是业务规则容器，页面仍通过明确业务命令处理修改。
 
-`scripts/check_architecture.py` 在 CI 检查核心/组件依赖方向和工作区对组成层的禁止引用。它检查 Cargo 清单及显式 Rust 模块路径，有扫描器自测；不是完整的 Rust 静态分析器，也不能替代状态、持久化和 UI 回归。
+`scripts/check_architecture.py` 在 CI 检查核心/组件依赖方向和工作区对组成层的禁止引用。检查递归覆盖 `src/workspace/` 的生产模块，识别显式路径、相对路径与导入；测试专用模块按配置排除，并有扫描器自测。它检查 Cargo 清单与源码路径，不是完整的 Rust 静态分析器，也不能替代状态、持久化和 UI 回归。
 
 ## 模块职责
 
 | 模块 | 职责 |
 | --- | --- |
-| `main.rs` | 程序入口与 Windows GUI 子系统声明 |
-| `app.rs`、`app_runtime.rs` | 组成根、服务初始化、主窗关闭协议与受拥有的行情/布局维护任务 |
+| `src/main.rs` | 程序入口、Windows GUI 子系统声明及核心类型导入 |
 | `crates/tydaro-core` | 私有业务聚合与 Command、文档校验/迁移、typed 研究记录、确定性行情/证券目录和纯文本导入 |
 | `crates/tydaro-ui` | 可复用的按钮、输入容器、选择、表面、文本、反馈和主题；不拥有应用数据或持久化 |
-| `workspace.rs` | Session、原生窗口及面板注册、DockArea、联动、模板、撤销、布局保存调度及 WorkspaceHost 接口 |
-| `desktop.rs` | 主窗口五页外壳、全局搜索、个股速览与显式跨页操作 |
-| `desktop_ui.rs` | 原生页面、卡片、标题、标签及文字/数据色等共用视觉规则 |
-| `ui_foundation.rs`、`component_gallery.rs` | 实验性基础样式、十类三方案对照与独立原生入口 |
-| `gallery_controls.rs`、`gallery_selection.rs`、`gallery_display.rs` | Gallery 的原生输入、选择与显示样例，各实例独立状态 |
-| `gallery_preferences.rs` | Gallery 设计选择的独立文档、即时保存恢复、复制摘要与失败保护 |
-| `desktop_state.rs`、`desktop_repository.rs` | GPUI 业务适配、命令分发与保存任务；独立文档 IO、版本写入和失败保护 |
-| `watch_page.rs` | 独立盯盘分组、表格、规则编辑与手动演示异动 |
-| `research_page.rs` | 涨停资料矩阵/AND 搜索/编辑，以及题材周期和证据样例 |
-| `journal_page.rs` | 按日预案/草稿/笔记、人工记录与原生阅读窗口 |
-| `boards.rs` | 看板集合与顺序、活动看板、名称/身份约束与旧工作区包装 |
-| `board_bar.rs` | 顶部看板栏及新建、命名、复制、排序、删除交互 |
-| `model.rs`、`market.rs`、`stock_import.rs` | 核心 crate 的兼容导出，保留既有类型路径与序列化名称 |
-| `contents.rs`、`panel_snapshot.rs` | 按面板类型创建原生控件、模拟账户交互；独立内容快照及恢复前校验 |
-| `chart.rs` | GPUI 原生绘图、图表视口、十字线、缩放和平移 |
-| `market_data.rs` | ChartDataProvider、可注入图表投影及冻结历史查询；当前实现只有模拟数据源 |
-| `history.rs` | 源图表所属的临时历史分时窗口、固定快照和交易日导航 |
-| `transfer.rs` | 屏幕坐标转换、拖动会话、停靠命中及迁移意图 |
-| `workspace_snapshot.rs`、`storage.rs` | 工作区快照与结构校验；磁盘编码、文件替换和旧文件保护，消除 boards/storage 互相依赖 |
-| `layout_persistence.rs` | 布局串行写入会话及保存版本，供后台保存与关闭 flush 共享 |
-| `smoke.rs`、`desktop_smoke.rs`、`gallery_smoke.rs` | `test-support` 下的工作区、五页和 Gallery 原生事件及渲染回归 |
+| `src/app/` | 组成根；`runtime.rs` 管理后台任务，`shell.rs` 管理五页外壳和跨页动作，`state/` 适配业务命令与保存，`ui.rs` 提供页面视觉规则 |
+| `src/workspace/` | 唯一 Session、窗口/面板注册、DockArea、联动、迁移、模板和撤销；`boards/` 与 `board_bar/` 管理看板，`snapshot.rs` 定义布局快照，`persistence.rs` 调度保存 |
+| `src/panels/` | 面板实例与按类型创建的控件；股票列表、报价、盘口、成交、市场委托、资讯和模拟交易各有私有模块；`broker/` 管理模拟账本，`snapshot/` 校验内容快照，`chart/` 管理绘图、交互及历史窗口 |
+| `src/pages/` | `watch/`、`limit/`、`theme/`、`journal/` 四个页面入口；编辑、查询和绘制分离，私有 `research/` 只共享明确的研究样例与展示辅助函数 |
+| `src/adapters/` | `desktop/` 负责业务文档 IO 与失败保护，`layout/` 负责布局文件及串行写入，`src/adapters/market_data.rs` 提供可注入图表投影和冻结历史查询；当前只有模拟行情实现 |
+| `src/gallery/` | 十类组件三方案展示、样例状态及独立入口视图；`foundation.rs` 定义实验方案，`preferences/` 保存设计选择 |
+| `src/test_support/` | 测试临时目录；`test-support` 下的原生工作区、五页和 Gallery 回归驱动，工作区场景按窗口、看板、列表、导入、图表和分时拆分 |
 
-工作区运行时通过注入的 Host 构造主窗口内容，Desktop 持有页面实体并继续渲染行情 DockArea；transfer 返回迁移意图，由 workspace 执行。boards 只依赖工作区快照类型，storage 依赖快照和看板模型；快照中仍保留 GPUI Dock DTO，因此属于桌面适配层，不应为了移入 core 而重造现有停靠协议。扩展功能不在绘制回调中引入网络请求、磁盘扫描或长时间阻塞操作。
+七个应用目录按职责组织，不新增 crate。各模块通过少量 `pub(crate)` 入口或重新导出供应用调用，实现子模块默认私有，协作方法使用 `pub(super)` 限定范围。`workspace/mod.rs` 仍拥有唯一的私有 Session，拆分后的窗口、布局和保存模块不各自建立注册表；外部模块不能直接修改 Session。面板、页面与阅读窗口仍各自创建输入、焦点及订阅，拆文件不改变原生实体的所有者。
+
+短单元测试可留在实现旁，较长单测放所属模块的 `tests.rs`；原生内部断言放对应模块的 `test_support.rs`，只公开回归所需入口。业务规则测试保留在 core，重复的六个应用层业务测试已移除；公共文档约束由 `crates/tydaro-core/tests/document_contract.rs` 验证。文件 IO 测试位于 `src/adapters/desktop/tests.rs`，GPUI 业务适配状态测试留在 `src/app/state/tests.rs`。目录调整不新增持久化迁移，现有 schema、身份、字段及兼容规则保持下文约定。
+
+工作区运行时通过注入的 Host 构造主窗口内容，Desktop 持有页面实体并继续渲染行情 DockArea；`workspace::transfer` 返回迁移意图，由工作区操作模块执行。`workspace::boards` 只依赖工作区快照类型，`adapters::layout` 依赖快照和看板模型；快照中仍保留 GPUI Dock DTO，因此属于桌面适配层，不应为了移入 core 而重造现有停靠协议。扩展功能不在绘制回调中引入网络请求、磁盘扫描或长时间阻塞操作。
 
 `AppRuntime` 拥有行情推进和布局维护两个 Task，启动时避免重复任务，退出前停止。业务防抖保存任务由 `DesktopState` 拥有，布局保存任务由 Session 拥有；取消调度不代表已经开始的阻塞 IO 被中断，因此存储写入还需串行化和版本保护。异步文本导入继续由源视图的弱引用、请求编号及编辑版本拒绝迟到结果。未来连接重试、订阅与关闭必须明确任务所有者，不能在页面 render 中启动无归属循环。
 
@@ -84,7 +73,7 @@ tydaro（应用组成根、页面、运行时与适配器）
 
 `PanelModel.custom_name` 是可选显示名，缺省为组件类型名称。组件标签、独立窗口标题及插入目标使用同一有效标题；组件类型和持久 ID 不因改名改变。名称去除首尾空白，空值恢复默认，最多 32 个字符且不含控制字符。旧模型缺字段时仍可读取，复制和移动保留名字，布局撤销保留存活组件的当前名字。
 
-`PanelContent` 按 `PanelKind` 构造 `PanelView`：股票列表只拥有搜索/导入输入，图表只拥有图表实体，模拟委托与委托明细分别拥有所需字段，只读面板不创建无关输入或图表。`panel_snapshot` 保留旧内容字段及缺省值，包括当前类型未使用的旧字段，避免保存时丢弃历史内容。恢复先完整解码校验，再修改 live 控件；坏的已知内容显式失败，不能被当成“没有保存内容”。缺失/null 的旧内容仍按原有缺省规则创建。
+`PanelContent` 按 `PanelKind` 构造 `PanelView`：股票列表只拥有搜索/导入输入，图表只拥有图表实体，模拟委托与委托明细分别拥有所需字段，只读面板不创建无关输入或图表。`panels::snapshot` 保留旧内容字段及缺省值，包括当前类型未使用的旧字段，避免保存时丢弃历史内容。恢复先完整解码校验，再修改 live 控件；坏的已知内容显式失败，不能被当成“没有保存内容”。缺失/null 的旧内容仍按原有缺省规则创建。
 
 每个持久面板在一次完成的操作后只能属于一个窗口。跨窗口迁移先在目标窗口重建内容、输入、焦点与订阅，成功后移除源面板；失败必须撤销目标并恢复源注册。不能把绑定原窗口的 InputState 或 FocusHandle 直接挂到另一窗口。旧实体移除时不得清除已经由新实体接管的同一持久 ID。
 
@@ -102,7 +91,7 @@ tydaro（应用组成根、页面、运行时与适配器）
 
 新默认面板选中 `Yinli`，旧面板沿用序列化股票；`Symbol::ALL` 包含 18 只样例，其中 12 只 A 股、4 只美股、2 只港股；`LEGACY_DEFAULTS` 保留原六只供旧快照缺省恢复。新建行情列表使用当前全部目录，不向已有列表自动追加；扩充目录不改写旧股票枚举的序列化名称。
 
-图表通过 `market_data::ChartSource` 查询 `ChartDataProvider` 的投影，绘制层不直接选择模拟数据生成器。投影包含可见 Bar、均线所需前缀、参考价、时轴、交易阶段和竞价参考；历史投影保留固定时点。现有接口同步读取已可用数据，不能放入网络等待；真实数据适配应先异步更新缓存，再由投影提供一致快照。当前只是图表查询边界，其他报价面板及模拟账户并未因此变为真实后端客户端。
+图表通过 `adapters::market_data::ChartSource` 查询 `ChartDataProvider` 的投影，绘制层不直接选择模拟数据生成器。投影包含可见 Bar、均线所需前缀、参考价、时轴、交易阶段和竞价参考；历史投影保留固定时点。现有接口同步读取已可用数据，不能放入网络等待；真实数据适配应先异步更新缓存，再由投影提供一致快照。当前只是图表查询边界，其他报价面板及模拟账户并未因此变为真实后端客户端。
 
 Session 管理统一行情 tick；各面板对同一股票和 tick 应得到一致数据。联动组 `0` 表示独立，`1` 至 `3` 的同组面板同步选股。图表周期和视口属于具体实例，不应因新开另一个图表而被覆盖。
 
@@ -146,9 +135,9 @@ Session 最多拥有一个布局后台保存任务：UI 捕获完整 `BoardSetFi
 
 ## 桌面业务持久化
 
-业务使用同一平台配置目录下独立的 **`desktop.json` schema `2`**，由核心文档契约、`desktop_state.rs` 适配与 `desktop_repository.rs` IO 共同负责，不复用或迁移 `workspace.json`。保存内容包括活动页面、盯盘分组及成员、监控/静音开关、规则与最多 100 条异动、按日预案/草稿/笔记、人工热点、手法、手工收益及已确认的涨停资料修改。研究筛选、选中、对话框位置和阅读窗口布局为临时视图状态。题材演示证据不因保存涨停资料而被重新计算。
+业务使用同一平台配置目录下独立的 **`desktop.json` schema `2`**，由核心文档契约、`src/app/state/` 适配与 `src/adapters/desktop/` IO 共同负责，不复用或迁移 `workspace.json`。保存内容包括活动页面、盯盘分组及成员、监控/静音开关、规则与最多 100 条异动、按日预案/草稿/笔记、人工热点、手法、手工收益及已确认的涨停资料修改。研究筛选、选中、对话框位置和阅读窗口布局为临时视图状态。题材演示证据不因保存涨停资料而被重新计算。
 
-`desktop_state::dispatch` 仅在命令成功后推进 revision、刷新视图并安排 700 ms 防抖保存。适配器拥有可替换的 Task；捕获文档副本后，在后台执行编码、验证、备份与磁盘替换。所有写入通过同一写会话串行化；旧请求不能覆盖较新的已保存版本，过期完成回调不能把新修改标为已保存。主窗口关闭时调用 `save_now`，取消防抖、等待已开始的写入并同步提交最新版本；关闭是明确的持久化边界，并非声称所有 IO 都不等待。桌面业务保存失败会阻止直接关闭，并显示“继续编辑 / 仍然退出”选择；继续编辑保留内存，只有显式选择仍然退出才丢弃未保存的业务修改。测试模式 `persistent = false` 不读取或写入用户配置目录。新文件不存在时使用演示初值；现有行情看板和股票列表不会被新业务默认分组替换。
+`app::state::dispatch` 仅在命令成功后推进 revision、刷新视图并安排 700 ms 防抖保存。适配器拥有可替换的 Task；捕获文档副本后，在后台执行编码、验证、备份与磁盘替换。所有写入通过同一写会话串行化；旧请求不能覆盖较新的已保存版本，过期完成回调不能把新修改标为已保存。主窗口关闭时调用 `save_now`，取消防抖、等待已开始的写入并同步提交最新版本；关闭是明确的持久化边界，并非声称所有 IO 都不等待。桌面业务保存失败会阻止直接关闭，并显示“继续编辑 / 仍然退出”选择；继续编辑保留内存，只有显式选择仍然退出才丢弃未保存的业务修改。测试模式 `persistent = false` 不读取或写入用户配置目录。新文件不存在时使用演示初值；现有行情看板和股票列表不会被新业务默认分组替换。
 
 schema `1` 文档先按旧格式校验，再经 `Desktop::try_from` 显式转为 schema `2`；旧预案没有 `research_evidence` 时保持 `None`，原 ID、业务日及 source 文字原样保留，不能从文字猜测新证据。首次成功保存写入 schema `2`，有效旧文件原字节进入 `.bak`。旧版应用会拒绝未知 schema `2`，避免读后丢弃证据字段。未来版本拒绝读取和覆盖；`workspace.json` 的看板 schema `2`、内层工作区 schema `1` 以及 Gallery schema `1` 均不改变。
 

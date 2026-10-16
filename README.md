@@ -119,20 +119,17 @@ cargo test --locked --workspace --all-targets
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/desktop.rs` / `src/desktop_ui.rs` | 五页外壳、搜索、跨页确认及视觉样式 |
-| `src/desktop_state.rs` | 独立业务文档、校验、备份与保存保护 |
-| `src/watch_page.rs` / `src/research_page.rs` / `src/journal_page.rs` | 盯盘、涨停、题材及复盘原生界面 |
-| `src/workspace.rs` | 窗口、Dock、面板实例和联动、工作区操作 |
-| `src/board_bar.rs` | 顶部看板选择、命名和管理交互 |
-| `src/boards.rs` | 看板集合、名称与身份校验、旧布局包装 |
-| `src/transfer.rs` | 跨窗口坐标、停靠目标和拖拽迁移决策 |
-| `src/storage.rs` | 工作区序列化、校验和文件备份 |
-| `src/contents.rs` | 股票列表、报价、盘口、资讯和模拟交易面板 |
-| `src/chart.rs` | GPUI 原生行情图表、交互和独立视口 |
-| `src/history.rs` | 临时历史分时窗口、交易日导航与冻结快照 |
-| `src/market.rs` | 一致、可重复的本地模拟行情 |
-| `src/stock_import.rs` | 股票文本识别、导入预览与文本编码解析 |
-| `src/model.rs` | 面板类型、股票、周期和联动状态 |
+| `crates/tydaro-core/` | 独立业务模型、命令、文档契约、研究规则、模拟行情与文本解析 |
+| `crates/tydaro-ui/` | 业务页和 Gallery 共用的原生基础组件与主题 |
+| `src/app/` | 应用组装、运行时、五页外壳、业务状态适配及页面视觉规则 |
+| `src/workspace/` | 唯一 Session、窗口、Dock、看板、联动、迁移及保存调度 |
+| `src/panels/` | 各类行情面板、模拟账本、内容快照、图表及历史窗口 |
+| `src/pages/` | 盯盘、涨停、题材和复盘；页面内分离编辑、查询、绘制与阅读窗口 |
+| `src/adapters/` | 桌面业务与布局文件 IO、串行写入、图表数据源适配 |
+| `src/gallery/` | 原生基础组件的三方案展示、样例状态及设计选择保存 |
+| `src/test_support/` | 测试临时目录和按功能组织的原生交互回归驱动 |
+
+根 `src/main.rs` 保留程序入口。模块只导出调用所需接口，内部状态与实现子模块保持私有；单测和原生内部断言分别放在所属模块的 `tests.rs`、`test_support.rs`。具体边界与测试归属见[架构说明](docs/architecture.md#模块职责)。目录调整不改变现有文件格式或窗口身份规则。
 
 当前重点是前端工作区。真实数据源、后端服务、命令行工具、更多图表指标、签名安装包等按后续阶段推进。
 

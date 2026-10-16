@@ -73,7 +73,7 @@
 
 ## 原生版本实际保存什么
 
-原生使用平台配置目录中的 `desktop.json` schema `1`，也可用 `TYDARO_DATA_DIR` 隔离数据；它与浏览器 `localStorage` 不同步，也不迁移浏览器内容。详情见 [架构与状态约束](architecture.md#桌面业务持久化)。
+原生使用平台配置目录中的 `desktop.json` schema `2`，兼容读取 schema `1` 并在首次成功保存时保留原文备份，也可用 `TYDARO_DATA_DIR` 隔离数据；它与浏览器 `localStorage` 不同步，也不迁移浏览器内容。源码目录整理不新增格式迁移。详情见 [架构与状态约束](architecture.md#桌面业务持久化)。
 
 | 内容 | 原生保存方式 |
 | --- | --- |
@@ -96,7 +96,7 @@
 
 盯盘的走势、月热点和异动为样例；演示按钮根据当前启用规则生成一条演示事件，暂停阻止新增，静音只改变界面状态。没有真实行情轮询、15 秒采样计算、有效性检查、冷却/每日计次、声音队列或 Windows SAPI。附件中的完整规则及月热点统计仍需独立对齐，当前原生复刻同样保留演示边界，不能按 UI 文案反推已经具备业务实现。
 
-React 预览拥有独立的 **12 只 A 股**目录；原生目录现为 **18 只，其中 12 只 A 股**，保留原有 4 只美股和 2 只港股，已有行情列表不自动追加股票。React 的行情关键摘要、盘口、图表分别使用演示数据，未校准量额聚合；浏览器历史分时只展示日 K 双击链路，不对应所选蜡烛的 OHLC、量额。原生继续使用 `market.rs` / `history.rs` 的统一行情及选中日聚合逻辑。预览按看板共享选股和图表周期；原生每组件周期、联动组和身份约束保持有效。行情附加列表只展示自己的成员快照，完整管理集中在主列表。
+React 预览拥有独立的 **12 只 A 股**目录；原生目录现为 **18 只，其中 12 只 A 股**，保留原有 4 只美股和 2 只港股，已有行情列表不自动追加股票。React 的行情关键摘要、盘口、图表分别使用演示数据，未校准量额聚合；浏览器历史分时只展示日 K 双击链路，不对应所选蜡烛的 OHLC、量额。原生继续使用 `crates/tydaro-core/src/market.rs` / `src/panels/chart/history.rs` 的统一行情及选中日聚合逻辑。预览按看板共享选股和图表周期；原生每组件周期、联动组和身份约束保持有效。行情附加列表只展示自己的成员快照，完整管理集中在主列表。
 
 浏览器浮窗是同页面元素，支持标题拖动和 CSS `resize`。四向插入只拆分主图区域，没有系统置顶、完整 DockArea、任意目标命中、标签合并、跨显示器坐标或原生焦点迁移。两版新研究页面都使用稳定任务布局，没有任意面板停靠。React 复盘阅读浮窗是页面内元素；原生复盘阅读窗口是真实 GPUI 窗口，同进程共享业务文档并分别创建输入与焦点。
 
@@ -104,18 +104,18 @@ React 预览拥有独立的 **12 只 A 股**目录；原生目录现为 **18 只
 
 | 设计部分 | 当前原生模块与边界 |
 | --- | --- |
-| 统一外壳、导航、搜索与视觉 | `desktop.rs`、`desktop_ui.rs` 使用 GPUI Flex、尺寸约束和原生控件，不嵌入 WebView |
-| 看板和自由布局 | 继续使用 `board_bar.rs`、`boards.rs`、DockArea；`transfer.rs` 保留迁移意图和窗口重建协议 |
-| 股票列表、盘口与成交 | 延续 `contents.rs`，调整浅色表格与文字层级；保留原有内容身份及列表管理 |
-| 股票、组件与联动 | `model.rs` 继续保存持久 ID、`custom_name`、每组件周期和联动组；盯盘分组不合并用户旧列表 |
-| 图表、左右数据卡 | `chart.rs` 使用原生绘图和 GPUI 数据卡，保留命中与 A 股全天时间映射 |
-| 历史分时 | `history.rs` 与 `market.rs` 保留冻结快照及按所选日一致聚合的实现 |
-| 盯盘 | `watch_page.rs` 提供分组、规则与演示异动；全局状态放在 `DesktopState`，没有真实监控或系统声音 |
-| 涨停与题材 | `research_page.rs` 提供资料矩阵、AND 条件、编辑和证据展示；固定题材样例不等于已对齐完整旧算法 |
-| 复盘及多窗口 | `journal_page.rs` 提供按日预案/草稿、输入校验、人工记录和独立阅读窗口；共享文档由 `desktop_state.rs` 管理 |
-| 跨页动作 | `DesktopEvent` / `SourceContext` 携带来源、日期、股票与依据；`desktop.rs` 在显式确认后创建草稿或追加分组 |
-| 新业务保存 | `desktop_state.rs` 保存独立 `desktop.json`，有 revision 防抖、字段校验、有效备份与失败保护；不是浏览器存储或 SQLite 迁移 |
-| 文件导入与旧布局 | 股票文本继续由 `stock_import.rs` 有界处理；涨停旧格式兼容尚未实现，`storage.rs` 现有布局协议保持不变 |
+| 统一外壳、导航、搜索与视觉 | `src/app/shell.rs`、`src/app/ui.rs` 使用 GPUI Flex、尺寸约束和原生控件，不嵌入 WebView |
+| 看板和自由布局 | 继续使用 `src/workspace/board_bar/`、`src/workspace/boards/`、DockArea；`src/workspace/transfer/` 保留迁移意图和窗口重建协议 |
+| 股票列表、盘口与成交 | 延续 `src/panels/`，调整浅色表格与文字层级；保留原有内容身份及列表管理 |
+| 股票、组件与联动 | `crates/tydaro-core/src/model.rs` 继续保存持久 ID、`custom_name`、每组件周期和联动组；盯盘分组不合并用户旧列表 |
+| 图表、左右数据卡 | `src/panels/chart/` 使用原生绘图和 GPUI 数据卡，保留命中与 A 股全天时间映射 |
+| 历史分时 | `src/panels/chart/history.rs` 与 `crates/tydaro-core/src/market.rs` 保留冻结快照及按所选日一致聚合的实现 |
+| 盯盘 | `src/pages/watch/` 提供分组、规则与演示异动；全局状态放在 `DesktopState`，没有真实监控或系统声音 |
+| 涨停与题材 | `src/pages/limit/`、`src/pages/theme/` 分别提供资料矩阵/AND 条件/编辑与题材证据展示；固定题材样例不等于已对齐完整旧算法 |
+| 复盘及多窗口 | `src/pages/journal/` 提供按日预案/草稿、输入校验、人工记录和独立阅读窗口；共享文档由 `src/app/state/` 管理 |
+| 跨页动作 | `DesktopEvent` / `SourceContext` 携带来源、日期、股票与依据；`src/app/shell.rs` 在显式确认后创建草稿或追加分组 |
+| 新业务保存 | `src/app/state/` 调度保存，`src/adapters/desktop/` 写入独立 `desktop.json`，保留 revision 防抖、字段校验、有效备份与失败保护；不是浏览器存储或 SQLite 迁移 |
+| 文件导入与旧布局 | 股票文本继续由 `crates/tydaro-core/src/stock_import.rs` 有界处理；涨停旧格式兼容尚未实现，`src/adapters/layout/` 现有布局协议保持不变 |
 
 共享业务状态不意味着跨原生窗口共享 InputState、FocusHandle 或布局实体。窗口独立创建输入与焦点，由应用命令更新同一文档；保存按文档 ID 与 revision，不按当时可见日期写入。
 

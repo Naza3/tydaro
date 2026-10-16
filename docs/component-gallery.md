@@ -60,17 +60,17 @@ cargo run --locked --bin tydaro -- --gallery
 
 ## 模块与状态边界
 
-- `src/ui_foundation.rs`：语义颜色、候选方案、组件类别与公共按钮 / 容器 / 文字包装。
-- `src/gallery_controls.rs`：按钮、文本和数值样例。
-- `src/gallery_selection.rs`：单选、开关、导航和标签样例。
-- `src/gallery_display.rs`：列表、详情和反馈样例。
-- `src/component_gallery.rs`：分类导航、三栏比较、单案查看与选择结果复制。
-- `src/gallery_preferences.rs`：独立的选择文档、自动保存、恢复及失败保护。
-- `src/gallery_smoke.rs`：使用生产原生元素派发真实输入 / 点击的回归入口。
+- `src/gallery/foundation.rs`：语义颜色、候选方案、组件类别与公共按钮 / 容器 / 文字包装。
+- `src/gallery/controls.rs`：按钮、文本和数值样例。
+- `src/gallery/selection.rs`：单选、开关、导航和标签样例。
+- `src/gallery/display.rs`：列表、详情和反馈样例。
+- `src/gallery/mod.rs`：分类导航、三栏比较、单案查看与选择结果复制。
+- `src/gallery/preferences/`：独立的选择文档、自动保存、恢复及失败保护。
+- `src/test_support/gallery.rs`：使用生产原生元素派发真实输入 / 点击的回归入口。
 
 组件继续复用 GPUI Kit 的输入、焦点、按钮和对话框机制。每个方案实例拥有自己的输入实体和状态；切换类别或退出 Gallery 后再返回，当前主窗口中的实体继续保留。新窗口必须新建实体，不跨窗口共享焦点或输入订阅。
 
-Gallery 首次打开时创建实体，后续保留样例状态；使用 `Desktop` 的临时展示状态，没有向 `PageId` 添加持久化值。进入时遵守现有业务编辑门禁；回到行情使用原来的 Dock 实体。样例不调用业务状态更新或模拟账户操作。Gallery 本身不迁移业务文档；本轮架构调整的 `desktop.json` schema 1→2 兼容读取、冻结研究依据和后台保存规则见 [架构](architecture.md)。行情布局和 Gallery 偏好格式保持兼容。
+Gallery 首次打开时创建实体，后续保留样例状态；使用 `Desktop` 的临时展示状态，没有向 `PageId` 添加持久化值。进入时遵守现有业务编辑门禁；回到行情使用原来的 Dock 实体。样例不调用业务状态更新或模拟账户操作。目录整理只调整模块归属，不新增文档迁移；既有 `desktop.json` schema 1→2 兼容读取、冻结研究依据和后台保存规则见 [架构](architecture.md)。行情布局和 Gallery 偏好格式保持兼容。
 
 十类倾向单独保存到数据目录下的 `gallery-preferences.json`（schema `1`），遵循 `TYDARO_DATA_DIR`。键使用组件的稳定名称，不依赖侧栏顺序。旧版没有此文件时从未选状态开始；旧版已关闭进程的内存选择无法自动恢复。损坏、未知版本或外部修改的原文件不会被自动覆盖；成功写入前保留上次有效文件为 `.bak`。独立 `--gallery` 入口只持久保存这些设计选择，不读取业务布局；自动回归使用内存模式或独立临时目录。
 
