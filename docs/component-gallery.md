@@ -78,19 +78,19 @@ Gallery 首次打开时创建实体，后续保留样例状态；使用 `Desktop
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --features test-support -- -D warnings
-cargo test --locked --all-targets --features test-support
+cargo clippy --locked --workspace --all-targets --features test-support -- -D warnings
+cargo test --locked --workspace --all-targets --features test-support
 cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test artifacts/gallery.png
-cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro.png
+cargo run --locked --features test-support --bin tydaro -- --architecture-smoke-test artifacts/architecture
 ```
 
 Gallery 检查覆盖十类三方案的原生布局、真实输入与点击、保存 / 取消、重试 / 撤销 / 确认、隐藏输入框的焦点释放、切换类别后的状态保留、倾向选择，以及 1536×960 / 1280×800 两种逻辑窗口尺寸；也检查进入 Gallery 后返回行情时原 Dock 身份与内容不变。
 
-锁定版本 GPUI 的 Windows 后端没有 `PlatformHeadlessRenderer`。Windows 上的 Gallery smoke 运行布局与事件断言并明确报告跳过离屏截图；视觉效果需另用实际桌面窗口检查。在提供离屏渲染器的 Linux/macOS 上，该入口同时输出二十张分类对照图和一张单案图。现有完整 `--smoke-test` 依赖离屏截图，应在对应支持平台执行，不能将 Windows 事件回归写成完整渲染回归通过。
+当前只要求 Windows 验证。CI 使用 `scripts/test-windows-smoke.ps1` 执行 architecture 和 Gallery 两组回归并保留日志。锁定 GPUI 的 Windows 后端没有 `PlatformHeadlessRenderer`；Gallery smoke 运行布局与事件断言并明确报告跳过离屏截图，视觉效果另用实际桌面窗口检查。提供离屏渲染器的平台可输出二十张分类对照图和一张单案图，但 Linux/macOS 验证现阶段暂停；依赖像素截图的完整 `--smoke-test` 保留为后续参考，不作为当前交付要求。
 
 截图和编译结果不能代替 Windows 多屏 DPI、中文输入法候选窗和长时间使用的人工验收。具体执行结果以当前交接记录为准。先逐类确认方案或提出组合要求，再把认可的基础样式逐步应用到业务页面。
 
-## 本次验收记录（2026-10-16）
+## 组件选择交付验证记录（2026-10-16）
 
 开发分支为 `codex/dev`。用户完成十类组件选择后授权提交；以下为提交前已执行的本地验收，不代替后续远端 CI 结果。
 

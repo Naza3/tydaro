@@ -155,7 +155,7 @@ def select_build(event_name: str, event: dict) -> tuple[bool, str]:
             f"This codex/dev push is covered by open PR #{number} at the same "
             "head commit; its pull_request run validates the merge commit."
         )
-    return True, "Native Windows and Linux verification required."
+    return True, "Native Windows verification required."
 
 
 def main() -> None:

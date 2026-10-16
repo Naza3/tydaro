@@ -18,10 +18,14 @@ env:
   CARGO_BUILD_JOBS: 3
   CARGO_INCREMENTAL: 0
 
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   checks:
     name: Repository checks
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     timeout-minutes: 15
     permissions:
       contents: read
@@ -37,19 +41,20 @@ jobs:
         id: changes
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci_changes.py
+        run: python scripts/ci_changes.py
       - name: Require a development branch for pull requests
         if: github.event_name == 'pull_request'
         env:
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
-          case "$HEAD_BRANCH" in
-            main|master) echo 'Create a development branch before opening a pull request.' >&2; exit 1 ;;
-          esac
-      - name: Check Git hooks and build selection
-        run: |
-          bash scripts/test-git-hooks.sh
-          python3 scripts/test_ci_changes.py
+          if ($env:HEAD_BRANCH -in @('main', 'master')) {
+            throw 'Create a development branch before opening a pull request.'
+          }
+      - name: Check Git hooks
+        shell: bash
+        run: bash scripts/test-git-hooks.sh
+      - name: Check build selection
+        run: python scripts/test_ci_changes.py
       - name: Install the repository toolchain
         if: steps.changes.outputs.build == 'true'
         run: rustup show active-toolchain
@@ -58,10 +63,10 @@ jobs:
         run: cargo fmt --all -- --check
 
   core:
-    name: Core / no native SDK
+    name: Core / no GUI dependencies
     needs: checks
     if: needs.checks.outputs.build == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -70,7 +75,10 @@ jobs:
       - name: Install the repository toolchain
         run: rustup show active-toolchain
       - name: Verify architecture boundaries
-        run: python3 scripts/check_architecture.py
+        run: |
+          python scripts/check_architecture.py --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/check_architecture.py
       - name: Test core without GUI or platform libraries
         run: cargo test --locked -p tydaro-core
 
@@ -80,9 +88,6 @@ jobs:
     if: needs.checks.outputs.build == 'true'
     runs-on: windows-2022
     timeout-minutes: 90
-    defaults:
-      run:
-        shell: pwsh
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -111,8 +116,24 @@ jobs:
             rust-v2-windows-2022-msvc-release-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Find the Windows SDK shader compiler
         run: ./scripts/windows-sdk.ps1
+      - name: Check Rust lints in the Release profile
+        run: cargo clippy --locked --workspace --release --all-targets --target x86_64-pc-windows-msvc --features test-support -- -D warnings
       - name: Run model and workspace tests in the Release profile
-        run: cargo test --locked --workspace --release --all-targets --target x86_64-pc-windows-msvc
+        run: cargo test --locked --workspace --release --all-targets --target x86_64-pc-windows-msvc --features test-support
+      - name: Build native interaction regressions
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --features test-support --bin tydaro
+      - name: Verify workspace and Gallery interactions
+        timeout-minutes: 15
+        run: ./scripts/test-windows-smoke.ps1
+      - name: Upload Windows interaction logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tydaro-windows-smoke-${{ github.sha }}
+          path: artifacts/windows-smoke/*.log
+          if-no-files-found: warn
+          retention-days: 14
+      # Rebuild without test-support before packaging the distributable.
       - name: Build the distributable application
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin tydaro
       - name: Package executable and SHA-256 checksum
@@ -128,72 +149,11 @@ jobs:
           retention-days: 14
           compression-level: 0 # The distributable is already a ZIP archive.
 
-  linux:
-    name: Linux / build, tests and software rendering
-    needs: checks
-    if: needs.checks.outputs.build == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    env:
-      XDG_RUNTIME_DIR: /tmp/tydaro-runtime
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          persist-credentials: false
-      - name: Install Linux development and rendering packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            build-essential clang cmake pkg-config libfontconfig1-dev \
-            libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libvulkan-dev \
-            libasound2-dev libssl-dev libzstd-dev mesa-vulkan-drivers \
-            fonts-dejavu-core fonts-noto-cjk
-          mkdir -p "$XDG_RUNTIME_DIR"
-          chmod 700 "$XDG_RUNTIME_DIR"
-      - name: Install the repository toolchain
-        run: |
-          rustup show active-toolchain
-          rustc --version --verbose
-      - name: Cache Rust dependencies and build outputs
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target/debug
-          key: rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'src/**', 'crates/**', 'assets/**', 'build.rs', '.cargo/**', 'scripts/**', '.github/workflows/**') }}
-          restore-keys: |
-            rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
-            rust-v2-ubuntu-24.04-test-support-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: Check Rust lints
-        run: cargo clippy --locked --workspace --all-targets --features test-support -- -D warnings
-      - name: Run model and workspace tests
-        run: cargo test --locked --workspace --all-targets --features test-support
-      - name: Build and render the application offscreen
-        run: |
-          driver=$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)
-          test -n "$driver"
-          export VK_DRIVER_FILES="$driver"
-          mkdir -p artifacts
-          cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
-          test -s artifacts/tydaro-linux.png
-          cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test artifacts/tydaro-gallery.png
-          test -n "$(find artifacts -name 'tydaro-gallery*.png' -size +0c -print -quit)"
-      - name: Upload Linux rendering evidence
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: tydaro-linux-smoke-${{ github.sha }}
-          path: artifacts/tydaro-*.png
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0 # PNG compression has already done the work.
-
   ci:
     name: CI
     if: always()
-    needs: [checks, core, windows, linux]
-    runs-on: ubuntu-24.04
+    needs: [checks, core, windows]
+    runs-on: windows-2022
     timeout-minutes: 5
     steps:
       - name: Require all applicable checks
@@ -202,18 +162,18 @@ jobs:
           BUILD_REQUIRED: ${{ needs.checks.outputs.build }}
           CORE_RESULT: ${{ needs.core.result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
-          LINUX_RESULT: ${{ needs.linux.result }}
         run: |
-          test "$CHECKS_RESULT" = success
-          if [ "$BUILD_REQUIRED" = true ]; then
-            test "$CORE_RESULT" = success
-            test "$WINDOWS_RESULT" = success
-            test "$LINUX_RESULT" = success
-          else
+          if ($env:CHECKS_RESULT -ne 'success') { throw 'Repository checks failed.' }
+          if ($env:BUILD_REQUIRED -eq 'true') {
+            if ($env:CORE_RESULT -ne 'success' -or $env:WINDOWS_RESULT -ne 'success') {
+              throw 'Required Windows verification did not succeed.'
+            }
+          } elseif ($env:BUILD_REQUIRED -eq 'false') {
             # Known documentation, or a codex/dev push covered by the matching
             # open PR. PR runs always validate their own merge commit normally.
-            test "$BUILD_REQUIRED" = false
-            test "$CORE_RESULT" = skipped
-            test "$WINDOWS_RESULT" = skipped
-            test "$LINUX_RESULT" = skipped
-          fi
+            if ($env:CORE_RESULT -ne 'skipped' -or $env:WINDOWS_RESULT -ne 'skipped') {
+              throw 'Unexpected build results for an exempt change.'
+            }
+          } else {
+            throw 'Missing or invalid build selection.'
+          }

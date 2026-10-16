@@ -1,6 +1,6 @@
 # Tydaro
 
-使用 **Rust + GPUI** 构建的原生股票工作台。第一版以 Windows 为主要交付平台，参考专业行情终端的信息密度，通过可组合面板实现自定义布局；Linux 保持开发构建和自动验证，后续完善发行与桌面适配。
+使用 **Rust + GPUI** 构建的原生股票工作台。当前集中开发和验收 Windows 版本，参考专业行情终端的信息密度，通过可组合面板实现自定义布局。功能完善后再处理跨平台；已有 Linux 代码和构建资料保留，相关 CI 与验收暂停。
 
 当前是前端预览版：启动直接进入工作区，行情、资讯、订单和持仓均使用本地模拟数据，无需登录。没有行情后端、券商连接或真实交易功能，CLI 与后端接入留待后续阶段。
 
@@ -66,11 +66,11 @@
 
 看板的使用、保存和迁移说明见 [自定义看板](docs/boards.md)。旧布局会自动成为“默认看板”，重启后恢复全部看板及最后选中的看板。行情演示时钟、暂停状态和模拟账户由所有看板共享。
 
-跨窗口自由拖拽面向 Windows 和 Linux X11。Wayland 不提供应用所需的全局窗口坐标，可使用“插入面板”精确选择目标和方向，或返回当前看板的主窗口；窗口内的分割与标签停靠仍可使用。
+当前跨窗口自由拖拽在 Windows 上开发和验收。保留的 Linux X11/Wayland 实现留待跨平台阶段重新验证；Wayland 不提供所需全局坐标，现有设计通过“插入面板”、弹出/返回和窗口内停靠完成布局调整。
 
 布局存放在 Windows 的 `%LOCALAPPDATA%\Tydaro`，或 Linux 的 `$XDG_CONFIG_HOME/tydaro`（默认 `~/.config/tydaro`）。可通过 `TYDARO_DATA_DIR` 指定独立目录，方便测试不同工作区。存储包含版本和校验，保留之前的有效备份及无法读取的旧文件。
 
-跨窗口坐标和停靠逻辑有模型测试；Linux X11 已验证原生窗口间拖动；多显示器、混合 DPI、Windows 输入法和真实桌面拖拽仍需在 Windows 上进行人工验收，不能由 Linux 交叉编译或离屏截图代替。
+跨窗口坐标和停靠逻辑有模型测试；多显示器、混合 DPI、Windows 输入法和真实桌面拖拽仍需在 Windows 上进行人工验收，不能由自动交互测试或其他平台的旧验证结果代替。
 
 ## 下载 Windows 构建
 
@@ -98,11 +98,7 @@ rustup show active-toolchain
 cargo run --locked --bin tydaro
 ```
 
-Linux 先按 [构建文档](docs/build.md#linux-开发与验证) 安装系统依赖，在 X11/Wayland 桌面会话中运行：
-
-```bash
-cargo run --locked --bin tydaro
-```
+Linux 构建说明保留在[后续跨平台参考](docs/build.md#linux-开发与验证)，当前不作为开发或交付要求。
 
 验证命令：
 
@@ -111,11 +107,11 @@ cargo fmt --all -- --check
 cargo test --locked --workspace --all-targets
 ```
 
-无桌面的 Linux 环境可通过 `test-support` 功能进行真实离屏渲染。SDK、完整发行构建、软件 Vulkan 驱动、交叉编译和打包命令见 [docs/build.md](docs/build.md)。
+Windows 通过 `--architecture-smoke-test` 和 `--gallery-smoke-test` 验证原生状态与交互。锁定 GPUI 后端不支持 Windows 离屏像素渲染，画面、DPI 和输入法需实机检查。SDK、完整验证与打包命令见 [docs/build.md](docs/build.md)。
 
 ## CI 与目录
 
-`codex/dev` 和 `main` 推送、Pull Request、手动触发均运行 [Desktop build](.github/workflows/build.yml)，无需先创建 PR。已有对应开放 PR 且可合并时，由 PR 的合并提交验证承担原生构建，避免同时重复编译；具体条件见[构建说明](docs/build.md#触发与加速策略)。纯文档修改只运行仓库检查；代码、构建配置或脚本修改会运行格式检查，再并行执行 Windows Release 测试和打包、Linux Clippy、测试和离屏渲染。手动触发始终完整构建。最终 `CI` 检查汇总结果，可作为合并所需状态检查。所有正式编译使用锁文件，工作流没有自动发布 GitHub Release 的步骤。
+`codex/dev` 和 `main` 推送、Pull Request、手动触发均运行 [Desktop build](.github/workflows/build.yml)，无需先创建 PR。已有对应开放 PR 且可合并时，由 PR 的合并提交验证承担原生构建，避免同时重复编译；具体条件见[构建说明](docs/build.md#触发与加速策略)。所有原生工作流任务使用 Windows runner：仓库检查后并行执行独立 core 检查，以及 Release Clippy、完整 workspace 测试、原生状态/交互回归和生产构建打包。纯文档修改只运行仓库检查，手动触发始终完整构建。最终 `CI` 汇总 `checks`、`core`、`windows`，可作为合并所需状态检查。正式编译使用锁文件，发行程序不启用 `test-support`，工作流不自动发布 GitHub Release。
 
 | 路径 | 职责 |
 | --- | --- |

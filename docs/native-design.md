@@ -1,6 +1,6 @@
 # 五页工作台的 GPUI 实现
 
-本阶段将 [React 设计预览](design-preview.md) 的五页任务结构、浅色与青绿色视觉和主要操作链路实现为 Rust + GPUI 原生界面。应用不嵌入网页；行情继续使用原生图表、DockArea、看板及跨窗口组件能力。Windows 是首要交付平台，Linux 用于构建和离屏交互验证。
+本阶段将 [React 设计预览](design-preview.md) 的五页任务结构、浅色与青绿色视觉和主要操作链路实现为 Rust + GPUI 原生界面。应用不嵌入网页；行情继续使用原生图表、DockArea、看板及跨窗口组件能力。当前只开发和验收 Windows，Linux 构建与离屏回归暂停，功能完善后再恢复跨平台。
 
 原生离屏截图：[行情](native-design/market.png) · [盯盘](native-design/watch.png) · [涨停](native-design/limit.png) · [题材](native-design/theme.png) · [复盘](native-design/journal.png)。截图使用本地模拟数据，窗口逻辑尺寸为 1536×960，按测试显示器的 2× DPI 绘制。
 
@@ -73,15 +73,16 @@
 
 页面内部按编辑、查询与绘制职责组织私有模块；复盘阅读窗口由 `src/pages/journal/reading/` 单独创建输入、焦点和订阅。模块整理保留页面实体、原生 ElementId 与跨页事件协议，不改变现有页面布局或持久化格式。
 
-沿用 Rust 1.96.0、锁文件及 [开发检查矩阵](development.md)。原生 smoke 入口保持不变：
+沿用 Rust 1.96.0、锁文件及 [开发检查矩阵](development.md)。当前 Windows 执行状态与事件回归：
 
 ```bash
-cargo run --locked --features test-support --bin tydaro -- --smoke-test artifacts/tydaro-linux.png
+cargo run --locked --features test-support --bin tydaro -- --architecture-smoke-test artifacts/architecture
+cargo run --locked --features test-support --bin tydaro -- --gallery-smoke-test artifacts/gallery.png
 ```
 
-只迭代五页交互时可运行 `--desktop-smoke-test artifacts/tydaro-desktop.png`，它使用同一个真实原生初始化和五页回归，省去前置的旧行情/布局场景。最终交付仍运行完整 `--smoke-test`，不能用专用入口替代既有回归。
+锁定 GPUI 的 Windows headless 后端不提供像素渲染，以上检查不代表页面画面、DPI 或输入法验收通过。`--desktop-smoke-test artifacts/tydaro-desktop.png` 和完整 `--smoke-test` 的渲染入口保留为后续跨平台参考，当前不要求执行。
 
-新回归在旧行情/布局回归之后运行，实际点击导航、输入框、分组和研究操作，不以一套测试页面替代生产 UI。输出五页的 1536×960、1280×800 逻辑像素窗口截图及独立阅读窗口截图；PNG 像素尺寸随实际 DPI 比例放大。文件后缀为 `-desktop-{page}-{width}.png` 和 `-desktop-journal-reading.png`。验证结果应以当次命令和 CI 日志为准；截图、自动交互、Windows 构建和 Windows 实机验收须分别记录。
+五页回归实际点击生产页面的导航、输入框、分组和研究操作。保留的渲染分支可输出 1536×960、1280×800 逻辑尺寸的页面及独立阅读窗口截图；当前 Windows CI 只运行状态/事件分支，不生成这些 PNG。已有截图属于对应历史版本的证据。验证结果以当次命令和 CI 日志为准，自动交互、Windows 构建和实机画面验收分别记录。
 
 Windows 人工验收重点：100%、125%、150%、200% 字体/DPI，中文 IME 候选确认和取消，编辑抽屉滚动，阅读窗口的输入/焦点及固定日期，行情浮窗跨屏回插，以及业务文件写入失败/重启恢复。当前文档不将尚未执行的 Windows 实机检查记为通过。
 
