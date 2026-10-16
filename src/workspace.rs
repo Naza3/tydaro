@@ -2632,6 +2632,7 @@ pub(crate) fn init(cx: &mut App, persistent: bool) {
         theme.tokens.secondary_active = Hsla::from(rgb(0xe7f5f3)).into();
     }
     crate::desktop_state::init(persistent, cx);
+    crate::gallery_preferences::init(persistent, cx);
     Theme::global_mut(cx).font_family = if cfg!(target_os = "windows") {
         "Microsoft YaHei UI".into()
     } else {

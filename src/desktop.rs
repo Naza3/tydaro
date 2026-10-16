@@ -2,6 +2,7 @@
 use crate::{
     board_bar::BoardBar,
     chart::MarketChart,
+    component_gallery::ComponentGallery,
     desktop_state::{self, DEMO_DATE, DesktopEvent, DesktopState, PageId, SourceContext},
     desktop_ui::*,
     journal_page::JournalPage,
@@ -39,6 +40,8 @@ pub struct Desktop {
     limit: Entity<LimitPage>,
     theme: Entity<ThemePage>,
     journal: Entity<JournalPage>,
+    gallery: Entity<ComponentGallery>,
+    gallery_open: bool,
     search: Entity<InputState>,
     draft_date: Entity<InputState>,
     chart: Entity<MarketChart>,
@@ -60,6 +63,7 @@ impl Desktop {
         let limit = cx.new(|cx| LimitPage::new(window, cx));
         let theme = cx.new(|cx| ThemePage::new(window, cx));
         let journal = cx.new(|cx| JournalPage::new(window, cx));
+        let gallery = cx.new(|cx| ComponentGallery::new(window, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索股票、代码或页面"));
         let draft_date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD"));
         let mut subscriptions = vec![
@@ -112,6 +116,8 @@ impl Desktop {
             limit,
             theme,
             journal,
+            gallery,
+            gallery_open: false,
             search,
             draft_date,
             chart: cx.new(|cx| MarketChart::new(Symbol::Yinli, Period::Intraday, cx)),
@@ -142,6 +148,18 @@ impl Desktop {
             return;
         }
         desktop_state::update(cx, |state| state.active_page = page);
+        self.gallery_open = false;
+        self.notice.clear();
+        cx.notify();
+    }
+    fn open_gallery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing(cx) || self.overlay.is_some() {
+            self.notice = "请先保存或取消当前编辑，再打开组件实验室".into();
+            cx.notify();
+            return;
+        }
+        window.focus(&self.focus, cx);
+        self.gallery_open = true;
         self.notice.clear();
         cx.notify();
     }
@@ -424,8 +442,10 @@ impl Render for Desktop {
                         .ghost()
                         .h(px(64.))
                         .w_full()
-                        .selected(page == target)
-                        .when(page == target, |this| this.text_color(rgb(TEAL)))
+                        .selected(page == target && !self.gallery_open)
+                        .when(page == target && !self.gallery_open, |this| {
+                            this.text_color(rgb(TEAL))
+                        })
                         .child(
                             div()
                                 .flex()
@@ -443,6 +463,14 @@ impl Render for Desktop {
                         }))
                 }))
                 .child(div().flex_1())
+                .child(
+                    Button::new("desktop-gallery")
+                        .ghost()
+                        .selected(self.gallery_open)
+                        .h(px(48.))
+                        .label("组件库")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_gallery(window, cx))),
+                )
                 .child(Button::new("desktop-help").ghost().label("帮助").on_click(
                     cx.listener(|this, _, window, cx| this.open(Overlay::Help, window, cx)),
                 ))
@@ -467,7 +495,15 @@ impl Render for Desktop {
                     .child(div().text_color(rgb(TEAL)).child(".")),
             )
             .child(muted("│"))
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(page.label()))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(if self.gallery_open {
+                        "组件实验室"
+                    } else {
+                        page.label()
+                    }),
+            )
             .child(div().flex_1())
             .child(
                 Button::new("desktop-search-trigger")
@@ -483,87 +519,96 @@ impl Render for Desktop {
                     .ghost()
                     .icon(IconName::Bell)
                     .label(unread.to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.navigate(PageId::Watch, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.gallery_open {
+                            window.focus(&this.focus, cx);
+                        }
+                        this.navigate(PageId::Watch, cx);
+                    })),
             );
-        let content = match page {
-            PageId::Market => div()
-                .size_full()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .child(workspace::market_toolbar(&self.board_bar, &self.dock, cx))
-                .child(
-                    div()
-                        .h(px(46.))
-                        .flex_shrink_0()
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .gap_6()
-                        .border_b_1()
-                        .border_color(rgb(LINE))
-                        .children(
-                            [
-                                ("上证指数", "3,962.84", "+0.38%"),
-                                ("深证成指", "13,184.72", "+0.72%"),
-                                ("创业板指", "3,067.18", "+1.26%"),
-                                ("科创 50", "1,426.35", "−0.21%"),
-                            ]
-                            .map(|(name, value, change)| {
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(
-                                        div().flex().flex_col().child(muted(name)).child(
+        let content = if self.gallery_open {
+            self.gallery.clone().into_any_element()
+        } else {
+            match page {
+                PageId::Market => div()
+                    .size_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(workspace::market_toolbar(&self.board_bar, &self.dock, cx))
+                    .child(
+                        div()
+                            .h(px(46.))
+                            .flex_shrink_0()
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .gap_6()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                            .children(
+                                [
+                                    ("上证指数", "3,962.84", "+0.38%"),
+                                    ("深证成指", "13,184.72", "+0.72%"),
+                                    ("创业板指", "3,067.18", "+1.26%"),
+                                    ("科创 50", "1,426.35", "−0.21%"),
+                                ]
+                                .map(|(name, value, change)| {
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div().flex().flex_col().child(muted(name)).child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(if change.starts_with('−') {
+                                                        DOWN
+                                                    } else {
+                                                        UP
+                                                    }))
+                                                    .child(value),
+                                            ),
+                                        )
+                                        .child(
                                             div()
-                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(12.))
                                                 .text_color(rgb(if change.starts_with('−') {
                                                     DOWN
                                                 } else {
                                                     UP
                                                 }))
-                                                .child(value),
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(rgb(if change.starts_with('−') {
-                                                DOWN
-                                            } else {
-                                                UP
-                                            }))
-                                            .child(change),
-                                    )
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .relative()
-                        .child(
-                            canvas(
-                                |bounds, window, cx| {
-                                    workspace::register_main_dock(bounds, window, cx)
-                                },
-                                |_, _, _, _| {},
+                                                .child(change),
+                                        )
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .child(
+                                canvas(
+                                    |bounds, window, cx| {
+                                        workspace::register_main_dock(bounds, window, cx)
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .inset_0()
+                                .size_full(),
                             )
-                            .absolute()
-                            .inset_0()
-                            .size_full(),
-                        )
-                        .child(self.dock.clone()),
-                )
-                .into_any_element(),
-            PageId::Watch => self.watch.clone().into_any_element(),
-            PageId::Limit => self.limit.clone().into_any_element(),
-            PageId::Theme => self.theme.clone().into_any_element(),
-            PageId::Journal => self.journal.clone().into_any_element(),
+                            .child(self.dock.clone()),
+                    )
+                    .into_any_element(),
+                PageId::Watch => self.watch.clone().into_any_element(),
+                PageId::Limit => self.limit.clone().into_any_element(),
+                PageId::Theme => self.theme.clone().into_any_element(),
+                PageId::Journal => self.journal.clone().into_any_element(),
+            }
         };
         div()
             .id("native-desktop")

@@ -64,6 +64,8 @@ cargo run --locked --features test-support --bin tydaro -- --smoke-test artifact
 
 ### 人工验收清单
 
+基础组件实验室有独立的 `--gallery-smoke-test artifacts/gallery.png` 入口（同样开启 `test-support`）。它覆盖三十个样例的输入与点击、焦点、状态保留和返回行情的 Dock 一致性；运行方式及 Windows 离屏截图限制见 [组件实验室](component-gallery.md)。五页回归另外检查侧栏进入 Gallery、返回行情和重新打开后的类别保留。
+
 使用独立 `TYDARO_DATA_DIR`，避免覆盖自己的布局；示例中 Bash 使用 `export TYDARO_DATA_DIR=/tmp/tydaro-acceptance`，PowerShell 使用 `$env:TYDARO_DATA_DIR = "$env:TEMP\tydaro-acceptance"`。验收记录应包含提交、系统、显示器缩放和结果。
 
 按改动选择有关操作：

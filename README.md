@@ -16,6 +16,8 @@
 
 另有独立的 [React 交互样机](design-preview/README.md)，保留五页设计对照；原生应用已使用 GPUI 复刻主要页面与操作。构建后可下载并离线打开 `design-preview/dist/tydaro-preview.html`。设计依据和原生映射见 [GPUI 设计交接](docs/design-preview.md)。
 
+基础样式在 [GPUI 原生组件实验室](docs/component-gallery.md) 中比较：十类基础组件，每类提供三种结构与交互方案，可在主窗口左侧「组件库」中打开，也可用 `cargo run --locked --bin tydaro -- --gallery` 独立启动。各方案保持同色系，先确认形态与操作，再决定整体风格；尚未替换业务页面控件。
+
 ![React 设计对照](docs/design-unified/watch.png)
 
 ## 第一版工作区
@@ -81,6 +83,8 @@ ZIP 包含程序、构建信息和使用说明，旁边提供 SHA-256 校验文�
 这是由 AI 与维护者持续协作的项目。开始任务先读 [AGENTS.md](AGENTS.md) 和 [贡献规范](CONTRIBUTING.md)，持续使用 **`codex/dev`** 开发。日常小功能和修复按项提交、推送后自动构建，累积一批相关功能再按用户要求创建阶段 PR，无需每次构建都开 PR 或新建分支。经用户授权后通过 merge commit 合入 `main`，保留开发分支及提交历史；禁止在 `main` 直接开发、提交或推送。首次克隆后运行 `git config --local core.hooksPath .githooks` 启用本地分支保护（已有自定义 hooks 时先整合）。
 
 开发入口：[开发与交接](docs/development.md) · [架构与状态约束](docs/architecture.md) · [构建与 CI](docs/build.md)。
+
+后续产品设计：[五页研究工作台方案](docs/product-plan.md) · [题材赚钱效应与候选规则](docs/theme-research-spec.md) · [实施与验收计划](docs/delivery-plan.md)。当前为待确认方案，新增研究、候选和行情接入能力尚未实现。
 
 仓库固定使用 **Rust 1.96.0 stable** 和 `Cargo.lock`，不需要最新 Rust。rustup 会根据 `rust-toolchain.toml` 选择工具链，不影响机器的全局默认版本。
 

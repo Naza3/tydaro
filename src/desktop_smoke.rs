@@ -30,6 +30,29 @@ pub(crate) fn verify(
     resize(cx, handle, 1536, 960)?;
     verify_search(cx, handle, workspace)?;
     let market_before = cx.update(|cx| workspace.read(cx).dock.read(cx).dump(cx));
+    click(cx, handle, "desktop-gallery")?;
+    cx.update_window(handle, |_, window, _| {
+        ensure!(
+            window.find("component-gallery").visible(),
+            "Native component gallery did not open"
+        );
+        Ok::<_, anyhow::Error>(())
+    })??;
+    ensure!(
+        cx.update(|cx| cx.global::<DesktopState>().active_page) == PageId::Market,
+        "Opening the component gallery wrote a persistent business page"
+    );
+    click(cx, handle, "gallery-family-input")?;
+    click(cx, handle, "desktop-nav-market")?;
+    click(cx, handle, "desktop-gallery")?;
+    cx.update_window(handle, |_, window, _| {
+        ensure!(
+            window.find("gallery-a-name-input").visible(),
+            "Gallery navigation did not retain its category"
+        );
+        Ok::<_, anyhow::Error>(())
+    })??;
+    click(cx, handle, "desktop-nav-market")?;
     capture_pages(cx, handle, output, 1536, 960)?;
     click(cx, handle, "desktop-nav-market")?;
     let market_after = cx.update(|cx| workspace.read(cx).dock.read(cx).dump(cx));

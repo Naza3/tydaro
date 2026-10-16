@@ -2,6 +2,8 @@
 
 当前应用是一个 Rust 二进制，使用 GPUI Kit 的原生窗口、控件及 DockArea。Windows x64 是首要交付平台；Linux 用于开发与持续验证。主窗口提供行情、盯盘、涨停、题材、复盘五个页面：行情继续使用可移动业务面板，其他页面采用各自任务布局，共用固定导航和应用外壳。全部使用 GPUI 原生元素和控件，不嵌入 React/WebView。后端、真实行情连接、CLI 和插件系统尚未实现。
 
+后续的盯盘组件组合、题材指标、模式候选及 AlphaDeck 接入见 [产品方案](product-plan.md) 和 [实施计划](delivery-plan.md)。它们属于规划，尚未改变下述运行时约束或持久化格式；实施时需补充对应协议、迁移与验证。
+
 ## 模块边界
 
 | 模块 | 职责 |
@@ -10,6 +12,9 @@
 | `workspace.rs` | Session、原生窗口及面板注册、DockArea、联动、模板、撤销与布局保存调度 |
 | `desktop.rs` | 主窗口五页外壳、全局搜索、个股速览与显式跨页操作 |
 | `desktop_ui.rs` | 原生页面、卡片、标题、标签及文字/数据色等共用视觉规则 |
+| `ui_foundation.rs`、`component_gallery.rs` | 实验性基础样式、十类三方案对照与独立原生入口 |
+| `gallery_controls.rs`、`gallery_selection.rs`、`gallery_display.rs` | Gallery 的原生输入、选择与显示样例，各实例独立状态 |
+| `gallery_preferences.rs` | Gallery 设计选择的独立文档、即时保存恢复、复制摘要与失败保护 |
 | `desktop_state.rs` | 应用级业务 Global、分组/复盘模型、校验与独立桌面数据保存 |
 | `watch_page.rs` | 独立盯盘分组、表格、规则编辑与手动演示异动 |
 | `research_page.rs` | 涨停资料矩阵/AND 搜索/编辑，以及题材周期和证据样例 |
@@ -29,6 +34,8 @@
 依赖方向以模型与数据为基础：workspace 组织窗口和内容，主窗口持有 desktop；desktop 持有四个新页面实体并继续渲染既有 DockArea，contents 使用 market 和 chart。storage 保存模型及 Dock 树，transfer 返回迁移意图后由 workspace 执行。desktop_state 保存独立业务数据，页面通过事件通知 desktop 执行跨页操作。扩展功能应放在相应模块，不在绘制回调中引入网络请求、磁盘扫描或长时间阻塞操作。
 
 ## 页面与跨页状态
+
+基础组件实验室是 `Desktop` 内的临时展示模式，入口位于侧栏底部，不属于持久化 `PageId`。三套方案共用语义色，通过结构、信息层级和操作方式对照；输入和样例状态存于 Gallery 实体，不操作 `DesktopState` 或行情 Dock。十类设计倾向由进程级 `GalleryPreferences` 共享，并即时保存到独立的 `gallery-preferences.json` schema `1`，按稳定组件键恢复；缺失文件从未选开始，损坏/未知版本/外部修改时拒绝覆盖并保留内存选择，可复制结果。进入时遵守业务编辑门禁；返回业务页保留原页面和 Gallery 实体。独立 `--gallery` 入口只保存设计选择，不读取个人布局。自动回归关闭个人配置读写，业务两份存储格式不变，详见 [组件实验室](component-gallery.md)。
 
 `PageId` 区分五个业务页面；切页保留页面实体以及各自的选中项、筛选、输入和滚动状态。行情内部看板继续由 BoardSet 管理，与业务页面导航分开。新研究页面不支持任意面板停靠；行情新增组件、关闭、撤销、插入和跨窗迁移仍走原有协议。
 
